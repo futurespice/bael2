@@ -1,135 +1,139 @@
-# apps/reports/views.py
+# apps/reports/views.py - ПОЛНАЯ ВЕРСИЯ v2.0
+"""
+Views для reports согласно ТЗ v2.0.
 
-from datetime import datetime
+API ENDPOINTS:
+- GET /api/reports/statistics/ - Статистика с круговой диаграммой
+- GET /api/reports/store-history/{store_id}/ - История магазина
+"""
 
-from django.shortcuts import get_object_or_404
-from django.utils.dateparse import parse_date
-from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
 from rest_framework.response import Response
 
-from .filters import ReportFilter
-from .models import Report, ReportType
-from .serializers import ReportGenerateSerializer, ReportSerializer
-from .services import ReportContext, ReportGeneratorService
+from stores.models import Store
+from .serializers import ReportFiltersSerializer, StoreHistoryFiltersSerializer
+from .services import ReportService, ReportFilters, TimePeriod
 
 
-class IsAdminOrOwner(permissions.BasePermission):
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_statistics(request: Request) -> Response:
     """
-    Доступ к отчётам:
-    - admin видит все
-    - остальные только свои (generated_by == request.user)
+    Получить статистику с круговой диаграммой (ТЗ v2.0).
+
+    GET /api/reports/statistics/
+
+    Query параметры:
+    - period: day, week, month, half_year, year, all_time (default: all_time)
+    - start_date: YYYY-MM-DD (опционально)
+    - end_date: YYYY-MM-DD (опционально)
+    - store_id: int (опционально)
+    - partner_id: int (опционально)
+    - region_id: int (опционально)
+    - city_id: int (опционально)
+
+    Ответ:
+    {
+        "period": {
+            "type": "month",
+            "start_date": "2024-12-01",
+            "end_date": "2024-12-31"
+        },
+        "filters": {...},
+        "statistics": {
+            "income": 150000.00,
+            "debt": 20000.00,
+            "paid_debt": 10000.00,
+            "defect_amount": 5000.00,
+            "expenses": 15000.00,
+            "bonus_count": 50,
+            "orders_count": 30,
+            "products_count": 500,
+            "total_balance": 110000.00,
+            "profit": 130000.00
+        },
+        "chart_data": {
+            "income": 150000.00,
+            "debt": 20000.00,
+            "defect": 5000.00,
+            "expenses": 15000.00
+        }
+    }
     """
+    # Валидация параметров
+    serializer = ReportFiltersSerializer(data=request.query_params)
+    serializer.is_valid(raise_exception=True)
 
-    def has_object_permission(self, request, view, obj: Report) -> bool:
-        user = request.user
-        if not user or not user.is_authenticated:
-            return False
-        if getattr(user, "role", None) == "admin" or user.is_superuser:
-            return True
-        return obj.generated_by_id == user.id
-
-    def has_permission(self, request, view) -> bool:
-        return request.user and request.user.is_authenticated
-
-
-class ReportViewSet(viewsets.ModelViewSet):
-    """
-    CRUD + генерация отчётов.
-
-    Доп. endpoints:
-    - POST /reports/generate/
-    - GET  /reports/{id}/diagram/
-    - GET  /reports/{id}/download_pdf/
-    """
-
-    queryset = Report.objects.all().select_related("generated_by")
-    serializer_class = ReportSerializer
-    permission_classes = [IsAdminOrOwner]
-    filterset_class = ReportFilter
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        user = self.request.user
-        if not user.is_authenticated:
-            return qs.none()
-        if getattr(user, "role", None) == "admin" or user.is_superuser:
-            return qs
-        return qs.filter(generated_by=user)
-
-    def perform_create(self, serializer):
-        serializer.save(generated_by=self.request.user)
-
-    # ---- кастомные действия ----
-
-    @action(
-        detail=False,
-        methods=["post"],
-        url_path="generate",
-        serializer_class=ReportGenerateSerializer,
-        permission_classes=[permissions.IsAuthenticated],
+    # Формируем фильтры
+    filters = ReportFilters(
+        period=TimePeriod(serializer.validated_data['period']),
+        start_date=serializer.validated_data.get('start_date'),
+        end_date=serializer.validated_data.get('end_date'),
+        store_id=serializer.validated_data.get('store_id'),
+        partner_id=serializer.validated_data.get('partner_id'),
+        region_id=serializer.validated_data.get('region_id'),
+        city_id=serializer.validated_data.get('city_id'),
     )
-    def generate(self, request, *args, **kwargs):
-        """
-        Сгенерировать новый отчёт и сохранить в БД.
 
-        Вход: ReportGenerateSerializer.
-        """
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+    # Получаем статистику
+    result = ReportService.get_statistics_summary(filters)
 
-        ctx = ReportContext(
-            date_from=serializer.validated_data["date_from"],
-            date_to=serializer.validated_data["date_to"],
-            city_id=serializer.validated_data.get("city_id"),
-            partner_id=serializer.validated_data.get("partner_id"),
-            store_id=serializer.validated_data.get("store_id"),
+    return Response(result)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_store_history(request: Request, store_id: int) -> Response:
+    """
+    История магазина с фильтрацией по дате (ТЗ v2.0).
+
+    GET /api/reports/store-history/{store_id}/
+
+    Query параметры:
+    - start_date: YYYY-MM-DD (обязательно)
+    - end_date: YYYY-MM-DD (обязательно)
+
+    Ответ:
+    [
+        {
+            "date": "2024-12-01",
+            "order_id": 123,
+            "products": [
+                {"name": "Пельмени", "quantity": 10, "price": 100, "total": 1000}
+            ],
+            "bonus_products": [
+                {"name": "Курица", "quantity": 1, "price": 200, "total": 0}
+            ],
+            "defective_products": [
+                {"name": "Хлеб", "quantity": 2, "amount": 50, "reason": "Плесень"}
+            ],
+            "debt": 1000.00,
+            "paid": 500.00,
+            "outstanding_debt": 500.00
+        }
+    ]
+    """
+    # Валидация магазина
+    try:
+        store = Store.objects.get(pk=store_id)
+    except Store.DoesNotExist:
+        return Response(
+            {'error': 'Магазин не найден'},
+            status=status.HTTP_404_NOT_FOUND
         )
-        report_type = serializer.validated_data["type"]
 
-        data = ReportGeneratorService.generate_report(report_type, ctx)
-        report = Report.objects.create(
-            type=report_type,
-            date_from=ctx.date_from,
-            date_to=ctx.date_to,
-            generated_by=request.user,
-            data=data,
-        )
-        ReportGeneratorService.attach_pdf(report)
+    # Валидация дат
+    serializer = StoreHistoryFiltersSerializer(data=request.query_params)
+    serializer.is_valid(raise_exception=True)
 
-        return Response(ReportSerializer(report).data, status=status.HTTP_201_CREATED)
-
-    @action(
-        detail=True,
-        methods=["get"],
-        url_path="diagram",
-        permission_classes=[permissions.IsAuthenticated, IsAdminOrOwner],
+    # Получаем историю
+    history = ReportService.get_store_history(
+        store=store,
+        start_date=serializer.validated_data['start_date'],
+        end_date=serializer.validated_data['end_date']
     )
-    def diagram(self, request, pk=None, *args, **kwargs):
-        """Вернуть только данные для диаграммы."""
-        report = self.get_object()
-        return Response(report.diagram)
 
-    @action(
-        detail=True,
-        methods=["get"],
-        url_path="download_pdf",
-        permission_classes=[permissions.IsAuthenticated, IsAdminOrOwner],
-    )
-    def download_pdf(self, request, pk=None, *args, **kwargs):
-        """Скачать PDF отчёт."""
-        from django.http import FileResponse
-
-        report = self.get_object()
-        if not report.pdf_file:
-            return Response(
-                {"detail": "Для этого отчёта нет PDF-файла"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        response = FileResponse(
-            report.pdf_file.open("rb"),
-            as_attachment=True,
-            filename=report.pdf_file.name.split("/")[-1],
-        )
-        return response
+    return Response(history)

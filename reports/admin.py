@@ -1,20 +1,37 @@
 # apps/reports/admin.py
+"""Django Admin для reports."""
 
 from django.contrib import admin
+from .models import DailyReport
 
-from .models import Report
 
+@admin.register(DailyReport)
+class DailyReportAdmin(admin.ModelAdmin):
+    list_display = [
+        'date', 'store', 'partner', 'region', 'city',
+        'income', 'debt', 'defect_amount', 'expenses',
+        'total_balance'
+    ]
+    list_filter = ['date', 'region', 'city']
+    search_fields = ['store__name', 'partner__email']
+    readonly_fields = ['total_balance', 'profit', 'created_at', 'updated_at']
 
-@admin.register(Report)
-class ReportAdmin(admin.ModelAdmin):
-    list_display = (
-        "id",
-        "type",
-        "date_from",
-        "date_to",
-        "generated_by",
-        "created_at",
-    )
-    list_filter = ("type", "date_from", "date_to", "created_at")
-    search_fields = ("id", "generated_by__phone", "generated_by__email")
-    readonly_fields = ("created_at", "pdf_file")
+    fieldsets = [
+        ('Фильтры', {
+            'fields': ['date', 'store', 'partner', 'region', 'city']
+        }),
+        ('Финансы', {
+            'fields': [
+                'income', 'debt', 'paid_debt',
+                'defect_amount', 'expenses',
+                'total_balance', 'profit'
+            ]
+        }),
+        ('Количество', {
+            'fields': ['bonus_count', 'orders_count', 'products_sold_count']
+        }),
+        ('Системное', {
+            'fields': ['created_at', 'updated_at'],
+            'classes': ['collapse']
+        }),
+    ]

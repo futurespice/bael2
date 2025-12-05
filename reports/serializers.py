@@ -1,68 +1,70 @@
-# apps/reports/serializers.py
+# apps/reports/serializers.py - ПОЛНАЯ ВЕРСИЯ v2.0
+"""Сериализаторы для reports."""
 
 from datetime import date
-
-from django.utils import timezone
 from rest_framework import serializers
-
-from .models import Report, ReportType
-
-
-class ReportSerializer(serializers.ModelSerializer):
-    """Базовый сериализатор отчёта для чтения/списка."""
-
-    class Meta:
-        model = Report
-        fields = [
-            "id",
-            "type",
-            "date_from",
-            "date_to",
-            "generated_by",
-            "data",
-            "pdf_file",
-            "created_at",
-        ]
-        read_only_fields = ["generated_by", "data", "pdf_file", "created_at"]
+from .services import TimePeriod
 
 
-class ReportGenerateSerializer(serializers.Serializer):
-    """
-    Входные данные для генерации отчёта.
+class ReportFiltersSerializer(serializers.Serializer):
+    """Сериализатор фильтров отчёта (ТЗ v2.0)."""
 
-    Пример:
-    {
-      "type": "sales",
-      "date_from": "2025-01-01",
-      "date_to": "2025-01-31",
-      "city_id": 1,
-      "partner_id": 10,
-      "store_id": 5
-    }
-    """
+    period = serializers.ChoiceField(
+        choices=[(p.value, p.value) for p in TimePeriod],
+        default=TimePeriod.ALL_TIME.value,
+        help_text='Период: day, week, month, half_year, year, all_time'
+    )
 
-    type = serializers.ChoiceField(choices=ReportType.choices)
-    date_from = serializers.DateField()
-    date_to = serializers.DateField()
+    start_date = serializers.DateField(
+        required=False,
+        allow_null=True,
+        help_text='Начальная дата (если нужен кастомный период)'
+    )
 
-    city_id = serializers.IntegerField(required=False, allow_null=True)
-    partner_id = serializers.IntegerField(required=False, allow_null=True)
-    store_id = serializers.IntegerField(required=False, allow_null=True)
+    end_date = serializers.DateField(
+        required=False,
+        allow_null=True,
+        help_text='Конечная дата'
+    )
+
+    store_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+        help_text='ID магазина для фильтрации'
+    )
+
+    partner_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+        help_text='ID партнёра для фильтрации'
+    )
+
+    region_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+        help_text='ID области для фильтрации'
+    )
+
+    city_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+        help_text='ID города для фильтрации'
+    )
+
+
+class StoreHistoryFiltersSerializer(serializers.Serializer):
+    """Фильтры для истории магазина."""
+
+    start_date = serializers.DateField(required=True)
+    end_date = serializers.DateField(required=True)
 
     def validate(self, attrs):
-        date_from: date = attrs["date_from"]
-        date_to: date = attrs["date_to"]
-        if date_from > date_to:
-            raise serializers.ValidationError("date_from не может быть больше date_to")
-        # лёгкая защита от совсем абсурдных дат
-        if date_to > timezone.now().date() + timezone.timedelta(days=1):
-            raise serializers.ValidationError("date_to не может быть в далёком будущем")
+        if attrs['start_date'] > attrs['end_date']:
+            raise serializers.ValidationError(
+                'start_date должна быть меньше end_date'
+            )
         return attrs
-
-    def get_filters(self) -> dict:
-        """Преобразовать входные фильтры в dict для сервисного слоя."""
-        return {
-            "city_id": self.validated_data.get("city_id"),
-            "partner_id": self.validated_data.get("partner_id"),
-            "store_id": self.validated_data.get("store_id"),
-        }

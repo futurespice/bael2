@@ -1,13 +1,16 @@
 # apps/orders/urls.py
+"""URL маршруты для orders."""
+
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import StoreOrderViewSet, OrderReturnViewSet, PartnerOrderViewSet, OrderHistoryViewSet
+
+from . import views
+
+app_name = 'orders'
 
 router = DefaultRouter()
-router.register(r'partner-orders', PartnerOrderViewSet, basename='partner-order')
-router.register(r'store-orders', StoreOrderViewSet, basename='store-order')
-router.register(r'order-returns', OrderReturnViewSet, basename='order-return')
-router.register(r'order-history', OrderHistoryViewSet, basename='order-history')
+router.register(r'store-orders', views.StoreOrderViewSet, basename='store-order')
+router.register(r'defects', views.DefectiveProductViewSet, basename='defect')
 
 urlpatterns = [
     path('', include(router.urls)),

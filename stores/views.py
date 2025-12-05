@@ -1,752 +1,649 @@
-# apps/stores/views.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
-from rest_framework import viewsets, status, mixins
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import filters
-from django.db.models import Q, Sum, F
-from django.db import transaction
+# apps/stores/views.py - ПОЛНАЯ ВЕРСИЯ v2.0 (ЧАСТЬ 1/2)
+"""
+Views для stores согласно ТЗ v2.0.
+
+API ENDPOINTS:
+1. Регионы и города (админ):
+   - GET /api/regions/ - список регионов
+   - POST /api/regions/ - создать регион
+   - GET /api/cities/ - список городов
+   - POST /api/cities/ - создать город
+
+2. Магазины:
+   - GET /api/stores/ - список магазинов (с поиском и фильтрацией)
+   - POST /api/stores/ - регистрация магазина
+   - GET /api/stores/{id}/ - детальная информация
+   - PATCH /api/stores/{id}/ - обновление профиля
+   - POST /api/stores/{id}/approve/ - одобрить (админ)
+   - POST /api/stores/{id}/reject/ - отклонить (админ)
+   - POST /api/stores/{id}/freeze/ - заморозить (админ)
+   - POST /api/stores/{id}/unfreeze/ - разморозить (админ)
+
+3. Выбор магазина:
+   - GET /api/stores/available/ - доступные магазины для выбора
+   - POST /api/stores/select/ - выбрать магазин
+   - POST /api/stores/deselect/ - отменить выбор
+   - GET /api/stores/current/ - текущий выбранный магазин
+
+4. Инвентарь:
+   - GET /api/stores/{id}/inventory/ - инвентарь магазина
+"""
+
 from decimal import Decimal
-from datetime import datetime, date
-import uuid
-from django.core.exceptions import ValidationError
-from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
-from drf_spectacular.types import OpenApiTypes
+from typing import Any, Dict
+
+from django.db.models import QuerySet
+from rest_framework import viewsets, status, generics
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from .models import (
-    Region, City, Store, StoreSelection,
-    StoreProductRequest, StoreRequest, StoreRequestItem,
-    StoreInventory, PartnerInventory, ReturnRequest, ReturnRequestItem
+    Region,
+    City,
+    Store,
+    StoreSelection,
+    StoreInventory,
 )
 from .serializers import (
-    RegionSerializer, CitySerializer, StoreSerializer, StoreSelectionSerializer,
-    StoreProductRequestSerializer, CreateStoreRequestSerializer,
-    StoreRequestSerializer, StoreInventorySerializer,
-    PartnerInventorySerializer, ReturnRequestSerializer,
-    # Новые сериализаторы для профиля
-    StoreProfileSerializer, StoreProfileUpdateSerializer,
-    AddToWishlistSerializer, RemoveFromWishlistSerializer, StoreDebtSerializer
+    RegionSerializer,
+    CitySerializer,
+    StoreSerializer,
+    StoreListSerializer,
+    StoreCreateSerializer,
+    StoreUpdateSerializer,
+    StoreSelectionSerializer,
+    StoreSelectionCreateSerializer,
+    StoreInventorySerializer,
+    StoreInventoryListSerializer,
+    StoreSearchSerializer,
+    StoreApproveSerializer,
+    StoreRejectSerializer,
+    StoreFreezeSerializer,
 )
-from .services import StoreRequestService, InventoryService, StoreProfileService
-from users.permissions import IsAdminUser, IsPartnerUser, IsStoreUser
-from products.models import Product, BonusHistory, DefectiveProduct
-from products.serializers import BonusHistorySerializer, DefectiveProductSerializer
-from .filters import StoreFilter
+from .services import (
+    StoreService,
+    StoreSelectionService,
+    StoreInventoryService,
+    GeographyService,
+    StoreCreateData,
+    StoreUpdateData,
+    StoreSearchFilters,
+)
+from .permissions import IsAdmin, IsStore, IsAdminOrReadOnly
 
 
-# ============= REGION & CITY =============
+# =============================================================================
+# ГЕОГРАФИЯ (РЕГИОНЫ И ГОРОДА)
+# =============================================================================
 
-class RegionViewSet(viewsets.ReadOnlyModelViewSet):
+class RegionViewSet(viewsets.ModelViewSet):
     """
-    Регионы Кыргызстана.
+    ViewSet для управления регионами (только админ).
 
-    GET /regions/ - список регионов с городами
-    GET /regions/{id}/ - детали региона
+    ТЗ v2.0: "Области и города управляются админом (добавление,
+    редактирование, удаление)"
     """
-    queryset = Region.objects.all().prefetch_related('cities')
+
+    queryset = Region.objects.all()
     serializer_class = RegionSerializer
-    permission_classes = [IsAuthenticated]
-
-
-class CityViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Города с фильтрацией по регионам.
-
-    GET /cities/ - все города
-    GET /cities/?region={region_id} - города региона
-    """
-    queryset = City.objects.select_related('region')
-    serializer_class = CitySerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['region']
-    search_fields = ['name']
-
-
-# ============= STORE (ADMIN CRUD) =============
-
-@extend_schema_view(
-    list=extend_schema(summary="Список магазинов"),
-    retrieve=extend_schema(summary="Детали магазина"),
-    create=extend_schema(summary="Создать магазин"),
-    update=extend_schema(summary="Обновить магазин"),
-    partial_update=extend_schema(summary="Частично обновить магазин"),
-    destroy=extend_schema(summary="Удалить магазин"),
-)
-class StoreViewSet(viewsets.ModelViewSet):
-    """
-    Магазины (полный CRUD для админа).
-
-    - Админ видит все магазины
-    - Партнёр видит только одобренные активные
-    - Store-пользователь видит свои выбранные + одобренные
-    """
-    queryset = Store.objects.select_related('region', 'city', 'created_by')
-    serializer_class = StoreSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_class = StoreFilter
-    search_fields = ['name', 'inn', 'owner_name', 'phone']
-    ordering_fields = ['created_at', 'name', 'debt']
-    ordering = ['-created_at']
-
-    def get_permissions(self):
-        if self.action == 'create':
-            return [IsAuthenticated(), IsStoreUser()]
-        elif self.action in ['update', 'partial_update', 'destroy', 'approve', 'reject', 'freeze', 'unfreeze']:
-            return [IsAuthenticated(), IsAdminUser()]
-        return [IsAuthenticated()]
-
-    def get_queryset(self):
-        user = self.request.user
-        queryset = super().get_queryset()
-
-        if user.role == 'admin':
-            return queryset
-        elif user.role == 'store':
-            base_qs = queryset.filter(approval_status='approved', is_active=True)
-            selected_stores = StoreSelection.objects.filter(user=user).values_list('store_id', flat=True)
-            return base_qs | queryset.filter(id__in=selected_stores)
-        elif user.role == 'partner':
-            return queryset.filter(approval_status='approved', is_active=True)
-        return queryset.none()
+    permission_classes = [IsAdminOrReadOnly]
 
     def perform_create(self, serializer):
-        user = self.request.user
-        if user.role != 'store':
-            raise ValidationError('Только пользователи с ролью STORE могут создавать магазины')
-
-        store = serializer.save(
-            created_by=user,
-            approval_status='pending'
+        """Создание региона через сервис."""
+        region = GeographyService.create_region(
+            name=serializer.validated_data['name'],
+            created_by=self.request.user
         )
-        StoreSelection.objects.create(user=user, store=store)
+        serializer.instance = region
 
-    @extend_schema(summary="Одобрить магазин")
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
-    def approve(self, request, pk=None):
-        """Одобрить магазин (только админ)"""
-        store = self.get_object()
-        store.approval_status = 'approved'
-        store.is_active = True
-        store.save(update_fields=['approval_status', 'is_active'])
-        return Response({'status': 'approved', 'store_id': store.id})
 
-    @extend_schema(summary="Отклонить магазин")
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
-    def reject(self, request, pk=None):
-        """Отклонить магазин (только админ)"""
-        store = self.get_object()
-        store.approval_status = 'rejected'
-        store.is_active = False
-        store.save(update_fields=['approval_status', 'is_active'])
-        return Response({'status': 'rejected', 'store_id': store.id})
+class CityViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet для управления городами (только админ).
 
-    @extend_schema(summary="Заморозить магазин")
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
-    def freeze(self, request, pk=None):
+    ТЗ v2.0: "Города управляются админом"
+    """
+
+    queryset = City.objects.select_related('region').all()
+    serializer_class = CitySerializer
+    permission_classes = [IsAdminOrReadOnly]
+    filterset_fields = ['region']
+
+    def perform_create(self, serializer):
+        """Создание города через сервис."""
+        city = GeographyService.create_city(
+            region_id=serializer.validated_data['region'].id,
+            name=serializer.validated_data['name'],
+            created_by=self.request.user
+        )
+        serializer.instance = city
+
+
+# =============================================================================
+# МАГАЗИНЫ
+# =============================================================================
+
+class StoreViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet для работы с магазинами.
+
+    ДОСТУП:
+    - Админ: все операции
+    - Партнёр: чтение, поиск, фильтрация
+    - Магазин: регистрация, обновление своего профиля, чтение
+
+    ENDPOINTS:
+    - GET /api/stores/ - список магазинов
+    - POST /api/stores/ - регистрация магазина
+    - GET /api/stores/{id}/ - детальная информация
+    - PATCH /api/stores/{id}/ - обновление профиля
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self) -> QuerySet[Store]:
         """
-        Заморозить магазин (деактивировать).
-        После заморозки партнёры не могут взаимодействовать с магазином.
-        """
-        store = self.get_object()
-        store.is_active = False
-        store.save(update_fields=['is_active'])
-        return Response({
-            'status': 'frozen',
-            'store_id': store.id,
-            'message': 'Магазин заморожен. Взаимодействие недоступно.'
-        })
+        Получение списка магазинов в зависимости от роли.
 
-    @extend_schema(summary="Разморозить магазин")
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
-    def unfreeze(self, request, pk=None):
-        """Разморозить магазин (активировать)"""
-        store = self.get_object()
-        if store.approval_status != 'approved':
-            return Response(
-                {'error': 'Нельзя разморозить неодобренный магазин'},
-                status=status.HTTP_400_BAD_REQUEST
+        - Админ: все магазины
+        - Партнёр: только одобренные и активные
+        - Магазин: только свой выбранный магазин
+        """
+        user = self.request.user
+
+        if user.role == 'admin':
+            # Админ видит все магазины
+            queryset = Store.objects.all()
+
+        elif user.role == 'partner':
+            # Партнёр видит только одобренные и активные
+            queryset = Store.objects.filter(
+                approval_status=Store.ApprovalStatus.APPROVED,
+                is_active=True
             )
-        store.is_active = True
-        store.save(update_fields=['is_active'])
-        return Response({
-            'status': 'active',
-            'store_id': store.id,
-            'message': 'Магазин активен.'
-        })
 
-    @extend_schema(summary="Магазины ожидающие одобрения")
-    @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
-    def pending(self, request):
-        """Список магазинов ожидающих одобрения"""
-        queryset = Store.objects.filter(approval_status='pending')
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        elif user.role == 'store':
+            # Магазин видит только свой текущий магазин
+            current_store = StoreSelectionService.get_current_store(user)
+            if current_store:
+                queryset = Store.objects.filter(pk=current_store.pk)
+            else:
+                queryset = Store.objects.none()
 
-    @extend_schema(summary="Статистика по магазинам")
-    @action(detail=False, methods=['get'])
-    def stats(self, request):
-        """Общая статистика по магазинам"""
-        queryset = self.get_queryset()
-        return Response({
-            'total_stores': queryset.count(),
-            'active_stores': queryset.filter(is_active=True).count(),
-            'pending_stores': queryset.filter(approval_status='pending').count(),
-            'total_debt': queryset.aggregate(Sum('debt'))['debt__sum'] or 0
-        })
+        else:
+            queryset = Store.objects.none()
 
-
-# ============= STORE PROFILE (для роли STORE после selection) =============
-
-@extend_schema_view(
-    retrieve=extend_schema(summary="Получить профиль текущего магазина"),
-    update=extend_schema(summary="Обновить профиль магазина"),
-    partial_update=extend_schema(summary="Частично обновить профиль"),
-)
-class StoreProfileViewSet(mixins.RetrieveModelMixin,
-                          mixins.UpdateModelMixin,
-                          viewsets.GenericViewSet):
-    """
-    Профиль текущего выбранного магазина.
-
-    Endpoints:
-    - GET /stores/profile/ - получить профиль
-    - PUT /stores/profile/ - полное обновление
-    - PATCH /stores/profile/ - частичное обновление
-    - GET /stores/profile/debt/ - информация о долге
-    - GET /stores/profile/statistics/ - статистика магазина
-    - GET /stores/profile/wishlist/ - wishlist магазина
-    - POST /stores/profile/wishlist/add/ - добавить в wishlist
-    - DELETE /stores/profile/wishlist/remove/ - удалить из wishlist
-    - DELETE /stores/profile/wishlist/clear/ - очистить wishlist
-    """
-    permission_classes = [IsAuthenticated, IsStoreUser]
+        return queryset.select_related('region', 'city').order_by('-created_at')
 
     def get_serializer_class(self):
-        if self.action in ['update', 'partial_update']:
-            return StoreProfileUpdateSerializer
-        return StoreProfileSerializer
+        """Выбор сериализатора в зависимости от action."""
+        if self.action == 'list':
+            return StoreListSerializer
+        elif self.action == 'create':
+            return StoreCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return StoreUpdateSerializer
+        return StoreSerializer
 
-    def get_object(self):
-        """Получить текущий выбранный магазин"""
-        store = StoreProfileService.get_current_store(self.request.user)
-        if not store:
-            raise ValidationError('Магазин не выбран. Сначала выберите магазин через /selection/')
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        """
+        Регистрация нового магазина (ТЗ v2.0, раздел 1.4).
 
-        # Проверяем permissions
-        self.check_object_permissions(self.request, store)
-        return store
+        POST /api/stores/
 
-    @extend_schema(summary="Получить профиль магазина")
-    def retrieve(self, request, *args, **kwargs):
-        """GET /stores/profile/ - профиль текущего магазина"""
+        Body:
+        {
+            "name": "Мой магазин",
+            "inn": "123456789012",
+            "owner_name": "Иванов Иван",
+            "phone": "+996700000001",
+            "region": 1,
+            "city": 1,
+            "address": "ул. Ленина, 1"
+        }
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Создаём магазин через сервис
+        data = StoreCreateData(
+            name=serializer.validated_data['name'],
+            inn=serializer.validated_data['inn'],
+            owner_name=serializer.validated_data['owner_name'],
+            phone=serializer.validated_data['phone'],
+            region_id=serializer.validated_data['region'].id,
+            city_id=serializer.validated_data['city'].id,
+            address=serializer.validated_data['address'],
+            latitude=serializer.validated_data.get('latitude'),
+            longitude=serializer.validated_data.get('longitude'),
+        )
+
+        store = StoreService.create_store(
+            data=data,
+            created_by=request.user
+        )
+
+        # Возвращаем полную информацию
+        output_serializer = StoreSerializer(store)
+        return Response(output_serializer.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request: Request, *args, **kwargs) -> Response:
+        """
+        Обновление профиля магазина.
+
+        PATCH /api/stores/{id}/
+
+        Доступ:
+        - Админ: любой магазин
+        - Магазин: только свой профиль
+        """
         store = self.get_object()
-        serializer = self.get_serializer(store)
-        return Response(serializer.data)
+        user = request.user
 
-    @extend_schema(summary="Обновить профиль магазина")
-    def update(self, request, *args, **kwargs):
-        """PUT /stores/profile/ - полное обновление профиля"""
+        # Проверка доступа
+        if user.role == 'store':
+            current_store = StoreSelectionService.get_current_store(user)
+            if not current_store or current_store.id != store.id:
+                return Response(
+                    {'error': 'Вы можете редактировать только свой магазин'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
         partial = kwargs.pop('partial', False)
-        store = self.get_object()
-
-        # Проверка заморозки
-        if not store.is_active:
-            return Response(
-                {'error': 'Магазин заморожен. Редактирование недоступно.'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
         serializer = self.get_serializer(store, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
 
-        try:
-            updated_store = StoreProfileService.update_store_profile(
-                request.user, serializer.validated_data
-            )
-            return Response(StoreProfileSerializer(updated_store).data)
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # Обновляем через сервис
+        data = StoreUpdateData(
+            name=serializer.validated_data.get('name'),
+            owner_name=serializer.validated_data.get('owner_name'),
+            phone=serializer.validated_data.get('phone'),
+            region_id=serializer.validated_data.get('region').id if 'region' in serializer.validated_data else None,
+            city_id=serializer.validated_data.get('city').id if 'city' in serializer.validated_data else None,
+            address=serializer.validated_data.get('address'),
+            latitude=serializer.validated_data.get('latitude'),
+            longitude=serializer.validated_data.get('longitude'),
+        )
 
-    def partial_update(self, request, *args, **kwargs):
-        """PATCH /stores/profile/ - частичное обновление"""
-        kwargs['partial'] = True
-        return self.update(request, *args, **kwargs)
-
-    # === DEBT INFO ===
-
-    @extend_schema(summary="Информация о долге магазина")
-    @action(detail=False, methods=['get'])
-    def debt(self, request):
-        """GET /stores/profile/debt/ - текущий долг магазина"""
-        store = self.get_object()
-
-        from orders.models import StoreOrder, DebtPayment
-
-        # Получаем историю долгов по заказам
-        orders_with_debt = StoreOrder.objects.filter(
+        store = StoreService.update_store(
             store=store,
-            debt_amount__gt=0
-        ).select_related('partner').order_by('-created_at')
+            data=data,
+            updated_by=request.user
+        )
 
-        orders_data = []
-        for order in orders_with_debt[:10]:  # Последние 10
-            orders_data.append({
-                'order_id': order.id,
-                'total_amount': str(order.total_amount),
-                'debt_amount': str(order.debt_amount),
-                'paid_amount': str(order.paid_amount),
-                'outstanding': str(order.outstanding_debt),
-                'created_at': order.created_at.isoformat()
-            })
+        output_serializer = StoreSerializer(store)
+        return Response(output_serializer.data)
 
-        return Response({
-            'store_id': store.id,
-            'store_name': store.name,
-            'total_debt': str(store.debt),
-            'recent_orders_with_debt': orders_data
-        })
+    @action(detail=False, methods=['get'], url_path='search')
+    def search(self, request: Request) -> Response:
+        """
+        Поиск и фильтрация магазинов (ТЗ v2.0).
 
-    # === STATISTICS ===
+        GET /api/stores/search/?search=123&region_id=1&has_debt=true
 
-    @extend_schema(
-        summary="Статистика магазина",
-        parameters=[
-            OpenApiParameter('date_from', OpenApiTypes.DATE, description='Дата начала периода'),
-            OpenApiParameter('date_to', OpenApiTypes.DATE, description='Дата окончания периода'),
-        ]
-    )
-    @action(detail=False, methods=['get'])
-    def statistics(self, request):
-        """GET /stores/profile/statistics/ - статистика магазина за период"""
+        Параметры:
+        - search: Поиск по ИНН, названию, городу
+        - region_id: Фильтр по региону
+        - city_id: Фильтр по городу
+        - has_debt: Только с долгом / без долга
+        - is_active: Только активные / заблокированные
+        - approval_status: Статус одобрения
+        - min_debt: Минимальный долг
+        - max_debt: Максимальный долг
+        """
+        # Валидация параметров
+        search_serializer = StoreSearchSerializer(data=request.query_params)
+        search_serializer.is_valid(raise_exception=True)
+
+        # Формируем фильтры
+        filters = StoreSearchFilters(
+            search_query=search_serializer.validated_data.get('search'),
+            region_id=search_serializer.validated_data.get('region_id'),
+            city_id=search_serializer.validated_data.get('city_id'),
+            has_debt=search_serializer.validated_data.get('has_debt'),
+            is_active=search_serializer.validated_data.get('is_active'),
+            approval_status=search_serializer.validated_data.get('approval_status'),
+            min_debt=search_serializer.validated_data.get('min_debt'),
+            max_debt=search_serializer.validated_data.get('max_debt'),
+        )
+
+        # Поиск через сервис
+        stores = StoreService.search_stores(filters)
+
+        # Пагинация
+        page = self.paginate_queryset(stores)
+        if page is not None:
+            serializer = StoreListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreListSerializer(stores, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='debtors')
+    def debtors(self, request: Request) -> Response:
+        """
+        Список магазинов с долгом (от большего к меньшему).
+
+        GET /api/stores/debtors/
+
+        ТЗ: "Сортировка должников от большего к меньшему"
+        """
+        stores = StoreService.get_stores_by_debt_desc()
+
+        page = self.paginate_queryset(stores)
+        if page is not None:
+            serializer = StoreListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreListSerializer(stores, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='approve', permission_classes=[IsAdmin])
+    def approve(self, request: Request, pk=None) -> Response:
+        """
+        Одобрить магазин (только админ).
+
+        POST /api/stores/{id}/approve/
+
+        Body (опционально):
+        {
+            "comment": "Магазин одобрен"
+        }
+        """
         store = self.get_object()
 
-        date_from = request.query_params.get('date_from')
-        date_to = request.query_params.get('date_to')
-
-        if date_from:
-            date_from = datetime.strptime(date_from, '%Y-%m-%d').date()
-        if date_to:
-            date_to = datetime.strptime(date_to, '%Y-%m-%d').date()
-
-        stats = StoreProfileService.get_store_statistics(store, date_from, date_to)
-
-        return Response({
-            'store_id': store.id,
-            'store_name': store.name,
-            'period': {
-                'from': date_from.isoformat() if date_from else None,
-                'to': date_to.isoformat() if date_to else None
-            },
-            'statistics': {
-                'total_orders': stats['total_orders'],
-                'total_amount': str(stats['total_amount']),
-                'total_debt': str(stats['total_debt']),
-                'total_paid': str(stats['total_paid']),
-                'outstanding_debt': str(stats['outstanding_debt']),
-                'bonus_count': stats['bonus_count'],
-                'bonus_quantity': str(stats['bonus_quantity']),
-                'wishlist_items': stats['wishlist_items']
-            }
-        })
-
-    # === WISHLIST OPERATIONS ===
-
-    @extend_schema(summary="Получить wishlist магазина")
-    @action(detail=False, methods=['get'])
-    def wishlist(self, request):
-        """GET /stores/profile/wishlist/ - текущий wishlist"""
-        try:
-            wishlist_data = StoreRequestService.get_wishlist(request.user)
-            serializer = StoreProductRequestSerializer(wishlist_data['items'], many=True)
-
-            return Response({
-                'store_id': wishlist_data['store_id'],
-                'store_name': wishlist_data['store_name'],
-                'items': serializer.data,
-                'total_items': wishlist_data['total_items'],
-                'total_amount': str(wishlist_data['total_amount'])
-            })
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    @extend_schema(
-        summary="Добавить товар в wishlist",
-        request=AddToWishlistSerializer
-    )
-    @action(detail=False, methods=['post'], url_path='wishlist/add')
-    def wishlist_add(self, request):
-        """POST /stores/profile/wishlist/add/ - добавить товар"""
-        serializer = AddToWishlistSerializer(data=request.data)
+        serializer = StoreApproveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        try:
-            product_request = StoreRequestService.add_to_wishlist(
-                user=request.user,
-                product=serializer.validated_data['product'],
-                quantity=serializer.validated_data['quantity']
-            )
-            return Response({
-                'status': 'added',
-                'item': StoreProductRequestSerializer(product_request).data
-            }, status=status.HTTP_201_CREATED)
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # Одобряем через сервис
+        store = StoreService.approve_store(
+            store=store,
+            approved_by=request.user
+        )
 
-    @extend_schema(
-        summary="Удалить товар из wishlist",
-        request=RemoveFromWishlistSerializer
-    )
-    @action(detail=False, methods=['delete'], url_path='wishlist/remove')
-    def wishlist_remove(self, request):
-        """DELETE /stores/profile/wishlist/remove/ - удалить товар"""
-        serializer = RemoveFromWishlistSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        output_serializer = StoreSerializer(store)
+        return Response(output_serializer.data)
 
-        try:
-            removed = StoreRequestService.remove_from_wishlist(
-                user=request.user,
-                product=serializer.validated_data['product']
-            )
-            if removed:
-                return Response({'status': 'removed'}, status=status.HTTP_204_NO_CONTENT)
-            return Response({'error': 'Товар не найден в wishlist'}, status=status.HTTP_404_NOT_FOUND)
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    @extend_schema(summary="Очистить весь wishlist")
-    @action(detail=False, methods=['delete'], url_path='wishlist/clear')
-    def wishlist_clear(self, request):
-        """DELETE /stores/profile/wishlist/clear/ - очистить wishlist"""
-        try:
-            count = StoreRequestService.clear_wishlist(request.user)
-            return Response({
-                'status': 'cleared',
-                'deleted_count': count
-            }, status=status.HTTP_204_NO_CONTENT)
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    @extend_schema(
-        summary="Создать запрос из wishlist",
-        request=CreateStoreRequestSerializer
-    )
-    @action(detail=False, methods=['post'], url_path='wishlist/submit')
-    @transaction.atomic
-    def wishlist_submit(self, request):
+    @action(detail=True, methods=['post'], url_path='reject', permission_classes=[IsAdmin])
+    def reject(self, request: Request, pk=None) -> Response:
         """
-        POST /stores/profile/wishlist/submit/ - создать запрос из wishlist.
-        Переносит все товары из wishlist в StoreRequest.
+        Отклонить магазин (только админ).
+
+        POST /api/stores/{id}/reject/
+
+        Body:
+        {
+            "reason": "Неверные данные"
+        }
         """
-        serializer = CreateStoreRequestSerializer(data=request.data)
+        store = self.get_object()
+
+        serializer = StoreRejectSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        idempotency_key = serializer.validated_data.get('idempotency_key') or str(uuid.uuid4())
-        note = serializer.validated_data.get('note', '')
+        # Отклоняем через сервис
+        store = StoreService.reject_store(
+            store=store,
+            rejected_by=request.user,
+            reason=serializer.validated_data['reason']
+        )
 
-        # Проверяем idempotency
-        existing = StoreRequest.objects.filter(idempotency_key=idempotency_key).first()
-        if existing:
+        output_serializer = StoreSerializer(store)
+        return Response(output_serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='freeze', permission_classes=[IsAdmin])
+    def freeze(self, request: Request, pk=None) -> Response:
+        """
+        Заморозить магазин (только админ).
+
+        POST /api/stores/{id}/freeze/
+
+        ТЗ: "При заморозке партнёры не могут с магазином взаимодействовать"
+        """
+        store = self.get_object()
+
+        serializer = StoreFreezeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Замораживаем через сервис
+        store = StoreService.freeze_store(
+            store=store,
+            frozen_by=request.user
+        )
+
+        output_serializer = StoreSerializer(store)
+        return Response(output_serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='unfreeze', permission_classes=[IsAdmin])
+    def unfreeze(self, request: Request, pk=None) -> Response:
+        """
+        Разморозить магазин (только админ).
+
+        POST /api/stores/{id}/unfreeze/
+        """
+        store = self.get_object()
+
+        # Размораживаем через сервис
+        store = StoreService.unfreeze_store(
+            store=store,
+            unfrozen_by=request.user
+        )
+
+        output_serializer = StoreSerializer(store)
+        return Response(output_serializer.data)
+
+    @action(detail=True, methods=['get'], url_path='inventory')
+    def inventory(self, request: Request, pk=None) -> Response:
+        """
+        Инвентарь магазина.
+
+        GET /api/stores/{id}/inventory/
+
+        ТЗ: "Все заказы складываются в один инвентарь"
+        """
+        store = self.get_object()
+
+        inventory = StoreInventoryService.get_inventory(store)
+
+        serializer = StoreInventoryListSerializer(inventory, many=True)
+        return Response(serializer.data)
+
+
+# apps/stores/views.py - ПОЛНАЯ ВЕРСИЯ v2.0 (ЧАСТЬ 2/2)
+"""
+Views для выбора магазина и инвентаря.
+"""
+
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import Store
+from .serializers import (
+    StoreListSerializer,
+    StoreSerializer,
+    StoreSelectionSerializer,
+    StoreSelectionCreateSerializer,
+)
+from .services import StoreSelectionService
+from .permissions import IsStore
+
+
+# =============================================================================
+# ВЫБОР МАГАЗИНА
+# =============================================================================
+
+class AvailableStoresView(APIView):
+    """
+    Список доступных магазинов для выбора (только для role='store').
+
+    GET /api/stores/available/
+
+    ТЗ: "Общая база магазинов для всех пользователей role='store'"
+    """
+
+    permission_classes = [IsAuthenticated, IsStore]
+
+    def get(self, request: Request) -> Response:
+        """Получить все доступные магазины."""
+        stores = StoreSelectionService.get_available_stores(request.user)
+
+        serializer = StoreListSerializer(stores, many=True)
+        return Response(serializer.data)
+
+
+class SelectStoreView(APIView):
+    """
+    Выбрать магазин для работы (только для role='store').
+
+    POST /api/stores/select/
+
+    ТЗ: "Один пользователь может быть только в одном магазине одновременно.
+    Несколько пользователей могут быть в одном магазине."
+
+    Body:
+    {
+        "store_id": 1
+    }
+    """
+
+    permission_classes = [IsAuthenticated, IsStore]
+
+    def post(self, request: Request) -> Response:
+        """Выбрать магазин."""
+        serializer = StoreSelectionCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Выбираем магазин через сервис
+        selection = StoreSelectionService.select_store(
+            user=request.user,
+            store_id=serializer.validated_data['store_id']
+        )
+
+        output_serializer = StoreSelectionSerializer(selection)
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+
+class DeselectStoreView(APIView):
+    """
+    Отменить выбор текущего магазина (только для role='store').
+
+    POST /api/stores/deselect/
+
+    ТЗ: "Пользователь может выйти и переключиться на другой магазин"
+    """
+
+    permission_classes = [IsAuthenticated, IsStore]
+
+    def post(self, request: Request) -> Response:
+        """Отменить выбор магазина."""
+        deselected = StoreSelectionService.deselect_store(request.user)
+
+        if deselected:
             return Response(
-                StoreRequestSerializer(existing).data,
+                {'message': 'Выбор магазина отменён'},
                 status=status.HTTP_200_OK
             )
 
-        store = StoreProfileService.get_current_store(request.user)
-        if not store:
-            return Response(
-                {'error': 'Магазин не выбран.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if not store.is_active:
-            return Response(
-                {'error': 'Магазин заморожен. Операции недоступны.'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        try:
-            store_request = StoreRequestService.create_from_product_requests(
-                store=store,
-                user=request.user,
-                note=note,
-                idempotency_key=idempotency_key
-            )
-            return Response(
-                StoreRequestSerializer(store_request).data,
-                status=status.HTTP_201_CREATED
-            )
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-
-# ============= STORE SELECTION =============
-
-@extend_schema_view(
-    list=extend_schema(summary="Список выбранных магазинов"),
-    create=extend_schema(summary="Выбрать магазин"),
-    destroy=extend_schema(summary="Отменить выбор магазина"),
-)
-class StoreSelectionViewSet(viewsets.ModelViewSet):
-    """
-    Выбор магазина пользователем (роль STORE).
-
-    Поддерживает множественный выбор магазинов.
-    Текущий магазин - последний выбранный.
-    """
-    serializer_class = StoreSelectionSerializer
-    permission_classes = [IsAuthenticated, IsStoreUser]
-    http_method_names = ['get', 'post', 'delete']
-
-    def get_queryset(self):
-        return StoreSelection.objects.filter(
-            user=self.request.user
-        ).select_related('store', 'store__region', 'store__city').order_by('-selected_at')
-
-    def perform_create(self, serializer):
-        store = serializer.validated_data['store']
-        if store.approval_status != 'approved':
-            raise ValidationError({'store': 'Магазин должен быть одобрен для выбора.'})
-        if not store.is_active:
-            raise ValidationError({'store': 'Магазин заморожен.'})
-        serializer.save(user=self.request.user)
-
-    def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.get_queryset())
-        serializer = self.get_serializer(queryset, many=True)
-
-        current = queryset.first()
-        return Response({
-            'count': queryset.count(),
-            'current_store': {
-                'id': current.store.id,
-                'name': current.store.name,
-                'inn': current.store.inn
-            } if current else None,
-            'selections': serializer.data
-        })
-
-    @extend_schema(summary="Текущий выбранный магазин")
-    @action(detail=False, methods=['get'])
-    def current(self, request):
-        """GET /selection/current/ - получить текущий магазин"""
-        selection = self.get_queryset().first()
-        if not selection:
-            return Response(
-                {'error': 'Магазин не выбран'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        return Response({
-            'selection_id': selection.id,
-            'store': StoreSerializer(selection.store).data,
-            'selected_at': selection.selected_at
-        })
-
-    @extend_schema(summary="Выйти из всех магазинов")
-    @action(detail=False, methods=['delete'])
-    def clear(self, request):
-        """DELETE /selection/clear/ - выйти из всех магазинов"""
-        count, _ = self.get_queryset().delete()
-        return Response({
-            'status': 'cleared',
-            'deleted_count': count
-        }, status=status.HTTP_204_NO_CONTENT)
-
-
-# ============= STORE PRODUCT REQUESTS (Legacy) =============
-
-class StoreProductRequestViewSet(viewsets.ModelViewSet):
-    """
-    Запросы на товары магазина (wishlist).
-    DEPRECATED: Используйте /stores/profile/wishlist/ endpoints.
-    """
-    serializer_class = StoreProductRequestSerializer
-    permission_classes = [IsAuthenticated, IsStoreUser]
-
-    def get_queryset(self):
-        user = self.request.user
-        if user.role == 'admin':
-            return StoreProductRequest.objects.all().select_related('product', 'store')
-
-        store = StoreProfileService.get_current_store(user)
-        if store:
-            return StoreProductRequest.objects.filter(store=store).select_related('product')
-        return StoreProductRequest.objects.none()
-
-    @transaction.atomic
-    def perform_create(self, serializer):
-        store = StoreProfileService.get_current_store(self.request.user)
-        if not store:
-            raise ValidationError('Магазин не выбран.')
-        if not store.is_active:
-            raise ValidationError('Магазин заморожен.')
-        serializer.save(store=store)
-
-
-# ============= STORE REQUESTS =============
-
-@extend_schema_view(
-    list=extend_schema(summary="История запросов магазина"),
-    retrieve=extend_schema(summary="Детали запроса"),
-)
-class StoreRequestViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    История запросов магазина (snapshots wishlist).
-    Только чтение. Создание через /stores/profile/wishlist/submit/.
-    """
-    queryset = StoreRequest.objects.select_related(
-        'store', 'created_by'
-    ).prefetch_related('items__product')
-    serializer_class = StoreRequestSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['store', 'created_at']
-    search_fields = ['store__name', 'note']
-    ordering_fields = ['created_at', 'total_amount']
-    ordering = ['-created_at']
-
-    def get_queryset(self):
-        user = self.request.user
-        queryset = super().get_queryset()
-
-        if user.role == 'admin':
-            return queryset
-        elif user.role == 'store':
-            store = StoreProfileService.get_current_store(user)
-            if store:
-                return queryset.filter(store=store)
-            return queryset.none()
-        elif user.role == 'partner':
-            return queryset.filter(
-                store__approval_status='approved',
-                store__is_active=True
-            )
-        return queryset.none()
-
-    @extend_schema(summary="Отменить позицию в запросе")
-    @action(detail=True, methods=['post'], permission_classes=[IsStoreUser])
-    @transaction.atomic
-    def cancel_item(self, request, pk=None):
-        """POST /requests/{id}/cancel_item/ - отменить позицию"""
-        store_request = self.get_object()
-        store = StoreProfileService.get_current_store(request.user)
-
-        if store_request.store != store:
-            return Response({'error': 'Доступ запрещён'}, status=status.HTTP_403_FORBIDDEN)
-
-        item_id = request.data.get('item_id')
-        if not item_id:
-            return Response({'error': 'item_id обязателен'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            StoreRequestService.cancel_item(store_request, item_id)
-            return Response({'status': 'cancelled'})
-        except (ValidationError, StoreRequestItem.DoesNotExist) as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-
-# ============= INVENTORY =============
-
-class StoreInventoryViewSet(viewsets.ReadOnlyModelViewSet):
-    """Инвентарь магазина (только чтение)"""
-    serializer_class = StoreInventorySerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        if user.role == 'admin':
-            return StoreInventory.objects.select_related('store', 'product')
-        elif user.role == 'store':
-            store = StoreProfileService.get_current_store(user)
-            if store:
-                return StoreInventory.objects.filter(store=store).select_related('product')
-        return StoreInventory.objects.none()
-
-
-class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
-    """Инвентарь партнёра (только чтение)"""
-    serializer_class = PartnerInventorySerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        if user.role == 'admin':
-            return PartnerInventory.objects.select_related('partner', 'product')
-        elif user.role == 'partner':
-            return PartnerInventory.objects.filter(partner=user).select_related('product')
-        return PartnerInventory.objects.none()
-
-
-# ============= RETURN REQUESTS =============
-
-class ReturnRequestViewSet(viewsets.ModelViewSet):
-    """Запросы на возврат товаров партнером к админу"""
-    serializer_class = ReturnRequestSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_permissions(self):
-        if self.action in ['approve', 'reject']:
-            return [IsAuthenticated(), IsAdminUser()]
-        return [IsAuthenticated(), IsPartnerUser()]
-
-    def get_queryset(self):
-        user = self.request.user
-        if user.role == 'admin':
-            return ReturnRequest.objects.all().select_related('partner', 'store')
-        return ReturnRequest.objects.filter(partner=user).select_related('store')
-
-    @transaction.atomic
-    def perform_create(self, serializer):
-        idempotency_key = self.request.data.get('idempotency_key') or str(uuid.uuid4())
-        serializer.save(
-            partner=self.request.user,
-            idempotency_key=idempotency_key
+        return Response(
+            {'message': 'Активный магазин не найден'},
+            status=status.HTTP_404_NOT_FOUND
         )
 
-    @extend_schema(summary="Подтвердить возврат")
-    @action(detail=True, methods=['post'])
-    @transaction.atomic
-    def approve(self, request, pk=None):
-        """Подтвердить возврат (только админ)"""
-        return_request = self.get_object()
 
-        if return_request.status != 'pending':
+class CurrentStoreView(APIView):
+    """
+    Получить текущий выбранный магазин (только для role='store').
+
+    GET /api/stores/current/
+
+    Возвращает полную информацию о текущем магазине пользователя.
+    """
+
+    permission_classes = [IsAuthenticated, IsStore]
+
+    def get(self, request: Request) -> Response:
+        """Получить текущий магазин."""
+        store = StoreSelectionService.get_current_store(request.user)
+
+        if not store:
             return Response(
-                {'error': 'Запрос уже обработан'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'message': 'Магазин не выбран. Выберите магазин для работы.'},
+                status=status.HTTP_404_NOT_FOUND
             )
 
-        # Списываем у партнёра и возвращаем на общий склад
-        for item in return_request.items.all():
-            InventoryService.remove_from_inventory(
-                partner=return_request.partner,
-                product=item.product,
-                quantity=item.quantity
-            )
-            # Возвращаем на общий склад
-            item.product.stock_quantity += item.quantity
-            item.product.save(update_fields=['stock_quantity'])
+        serializer = StoreSerializer(store)
+        return Response(serializer.data)
 
-        return_request.status = 'approved'
-        return_request.save(update_fields=['status'])
 
-        return Response({'status': 'approved'})
+# =============================================================================
+# ФУНКЦИОНАЛЬНЫЕ VIEWS (ПРОСТЫЕ)
+# =============================================================================
 
-    @extend_schema(summary="Отклонить возврат")
-    @action(detail=True, methods=['post'])
-    def reject(self, request, pk=None):
-        """Отклонить возврат"""
-        return_request = self.get_object()
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsStore])
+def get_current_store_profile(request: Request) -> Response:
+    """
+    Профиль текущего магазина пользователя.
 
-        if return_request.status != 'pending':
-            return Response(
-                {'error': 'Запрос уже обработан'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    GET /api/stores/profile/
 
-        return_request.status = 'rejected'
-        return_request.save(update_fields=['status'])
+    ТЗ: "После выбора магазина доступен CRUD профиля через /stores/profile/"
 
-        return Response({'status': 'rejected'})
+    Алиас для /api/stores/current/
+    """
+    store = StoreSelectionService.get_current_store(request.user)
+
+    if not store:
+        return Response(
+            {'error': 'Магазин не выбран'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = StoreSerializer(store)
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_users_in_store(request: Request, pk: int) -> Response:
+    """
+    Список пользователей, работающих в магазине.
+
+    GET /api/stores/{id}/users/
+
+    ТЗ: "Несколько пользователей могут быть в одном магазине одновременно"
+    """
+    try:
+        store = Store.objects.get(pk=pk)
+    except Store.DoesNotExist:
+        return Response(
+            {'error': 'Магазин не найден'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    users = StoreSelectionService.get_users_in_store(store)
+
+    # Простой ответ с именами и ID
+    users_data = [
+        {
+            'id': user.id,
+            'full_name': user.get_full_name(),
+            'email': user.email,
+            'phone': user.phone
+        }
+        for user in users
+    ]
+
+    return Response({
+        'store_id': store.id,
+        'store_name': store.name,
+        'users_count': len(users_data),
+        'users': users_data
+    })

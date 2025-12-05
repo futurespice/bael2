@@ -1,20 +1,24 @@
-# apps/stores/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2
+# apps/stores/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ (с default для миграций)
 """
-Модели модуля stores.
+Модели для управления магазинами согласно ТЗ v2.0.
+"""
 
-Изменения:
-- Добавлено поле total_paid в Store для отслеживания погашенного долга
-- StoreSelection с unique_together для предотвращения дублей
-- Улучшенные валидаторы и индексы
-"""
+from __future__ import annotations
 
 from decimal import Decimal
+from typing import Optional, List
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, RegexValidator
-from django.db import models
+from django.db import models, transaction
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
+
+# =============================================================================
+# ГЕОГРАФИЯ
+# =============================================================================
 
 class Region(models.Model):
     """Регион/Область Кыргызстана."""
@@ -22,7 +26,15 @@ class Region(models.Model):
     name = models.CharField(
         max_length=100,
         unique=True,
-        verbose_name='Название'
+        verbose_name='Название области'
+    )
+    created_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name='Дата создания'
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name='Дата обновления'
     )
 
     class Meta:
@@ -36,7 +48,7 @@ class Region(models.Model):
 
 
 class City(models.Model):
-    """Город."""
+    """Город Кыргызстана."""
 
     region = models.ForeignKey(
         Region,
@@ -44,66 +56,101 @@ class City(models.Model):
         related_name='cities',
         verbose_name='Регион'
     )
-    name = models.CharField(max_length=100, verbose_name='Название')
+    name = models.CharField(
+        max_length=100,
+        verbose_name='Название города'
+    )
+    created_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name='Дата создания'
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name='Дата обновления'
+    )
 
     class Meta:
         db_table = 'cities'
         verbose_name = 'Город'
         verbose_name_plural = 'Города'
-        ordering = ['region', 'name']
+        ordering = ['region__name', 'name']
         unique_together = ['region', 'name']
+        indexes = [
+            models.Index(fields=['region', 'name']),
+        ]
 
     def __str__(self) -> str:
         return f"{self.name} ({self.region.name})"
 
 
+# =============================================================================
+# МАГАЗИН
+# =============================================================================
+
 class Store(models.Model):
     """
-    Магазин - общая сущность.
+    Магазин - центральная сущность системы.
 
-    По ТЗ:
-    - База магазинов общая для всех партнёров
-    - Поиск по ИНН (12-14 цифр)
-    - Статусы: активный / деактивированный (заморожен админом)
-    - При заморозке нельзя взаимодействовать, даже погасить долг
+    БИЗНЕС-ЛОГИКА (ТЗ v2.0):
+    1. Общая база магазинов для всех пользователей role='store'
+    2. Пользователь выбирает магазин через StoreSelection
+    3. Магазин может быть активным или заблокированным админом
+    4. Заблокированный магазин не может создавать/получать заказы
+    5. ИНН - уникальный идентификатор (12-14 цифр)
+    6. Поиск по: ИНН, название, город
+    7. Фильтрация по: город, область, долг, погашен
+
+    ФИНАНСЫ:
+    - debt: Текущий непогашенный долг
+    - total_paid: Всего погашено за всё время
+    - Долг создаётся при подтверждении заказа партнёром
+    - Долг может быть отрицательным (переплата)
     """
 
-    # Валидаторы
-    inn_regex = RegexValidator(
+    # === Валидаторы ===
+    inn_validator = RegexValidator(
         regex=r'^\d{12,14}$',
         message='ИНН должен содержать от 12 до 14 цифр'
     )
-    phone_regex = RegexValidator(
+    phone_validator = RegexValidator(
         regex=r'^\+996\d{9}$',
-        message='Формат телефона: +996XXXXXXXXX'
+        message='Формат телефона: +996XXXXXXXXX (9 цифр после +996)'
     )
 
-    APPROVAL_STATUS_CHOICES = [
-        ('pending', 'Ожидает'),
-        ('approved', 'Одобрен'),
-        ('rejected', 'Отклонён'),
-    ]
+    # === Статусы одобрения ===
+    class ApprovalStatus(models.TextChoices):
+        PENDING = 'pending', _('Ожидает одобрения')
+        APPROVED = 'approved', _('Одобрен')
+        REJECTED = 'rejected', _('Отклонён')
 
     # === Основная информация ===
     name = models.CharField(
         max_length=200,
-        verbose_name='Название магазина'
+        verbose_name='Название магазина',
+        db_index=True,
+        help_text='Используется для поиска'
     )
+
     inn = models.CharField(
         max_length=14,
-        validators=[inn_regex],
+        validators=[inn_validator],
         unique=True,
         verbose_name='ИНН',
-        db_index=True
+        db_index=True,
+        help_text='Уникальный идентификатор магазина (12-14 цифр)'
     )
+
     owner_name = models.CharField(
         max_length=200,
-        verbose_name='ФИО владельца'
+        verbose_name='ФИО владельца магазина',
+        db_index=True,
+        help_text='Используется для поиска'
     )
+
     phone = models.CharField(
         max_length=13,
-        validators=[phone_regex],
-        verbose_name='Телефон',
+        validators=[phone_validator],
+        verbose_name='Телефон магазина',
         db_index=True
     )
 
@@ -112,18 +159,24 @@ class Store(models.Model):
         Region,
         on_delete=models.PROTECT,
         related_name='stores',
-        verbose_name='Регион'
+        verbose_name='Область',
+        help_text='Используется для фильтрации'
     )
+
     city = models.ForeignKey(
         City,
         on_delete=models.PROTECT,
         related_name='stores',
-        verbose_name='Город'
+        verbose_name='Город',
+        help_text='Используется для фильтрации и поиска'
     )
+
     address = models.CharField(
         max_length=250,
-        verbose_name='Адрес'
+        verbose_name='Адрес магазина'
     )
+
+    # GPS координаты (опционально)
     latitude = models.FloatField(
         null=True,
         blank=True,
@@ -137,33 +190,38 @@ class Store(models.Model):
 
     # === Финансы ===
     debt = models.DecimalField(
-        max_digits=12,
+        max_digits=14,
         decimal_places=2,
         default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Текущий долг'
+        verbose_name='Текущий долг',
+        help_text='Может быть отрицательным (переплата)',
+        db_index=True
     )
+
     total_paid = models.DecimalField(
-        max_digits=12,
+        max_digits=14,
         decimal_places=2,
         default=Decimal('0'),
         validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Всего погашено'
+        verbose_name='Всего погашено',
+        help_text='Сумма всех погашений за всё время'
     )
 
     # === Статусы ===
     approval_status = models.CharField(
         max_length=20,
-        choices=APPROVAL_STATUS_CHOICES,
-        default='pending',
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.PENDING,
         verbose_name='Статус одобрения',
-        db_index=True
+        db_index=True,
+        help_text='Магазин должен быть одобрен админом для работы'
     )
+
     is_active = models.BooleanField(
         default=True,
-        verbose_name='Активен (не заморожен)',
+        verbose_name='Активен (не заблокирован)',
         db_index=True,
-        help_text='При деактивации партнёры не могут взаимодействовать с магазином'
+        help_text='Заблокированный магазин не может создавать/получать заказы'
     )
 
     # === Системные поля ===
@@ -171,13 +229,16 @@ class Store(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
+        blank=True,
         related_name='created_stores',
-        verbose_name='Создал'
+        verbose_name='Создал (пользователь)'
     )
+
     created_at = models.DateTimeField(
-        auto_now_add=True,
+        default=timezone.now,
         verbose_name='Дата создания'
     )
+
     updated_at = models.DateTimeField(
         auto_now=True,
         verbose_name='Дата обновления'
@@ -190,69 +251,197 @@ class Store(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['inn']),
+            models.Index(fields=['name']),
+            models.Index(fields=['owner_name']),
             models.Index(fields=['phone']),
             models.Index(fields=['region', 'city']),
             models.Index(fields=['debt']),
             models.Index(fields=['is_active', 'approval_status']),
+            models.Index(fields=['created_at']),
         ]
 
     def __str__(self) -> str:
         return f"{self.name} (ИНН: {self.inn})"
 
     def clean(self) -> None:
-        """Валидация: город должен принадлежать выбранному региону."""
+        """
+        Валидация модели.
+
+        Проверки:
+        1. Город принадлежит выбранному региону
+        2. ИНН содержит только цифры
+        3. Телефон в правильном формате
+        """
+        super().clean()
+
+        # Проверка: город принадлежит региону
         if self.city and self.region and self.city.region_id != self.region_id:
             raise ValidationError({
-                'city': 'Город должен принадлежать выбранному региону'
+                'city': f'Город {self.city.name} не принадлежит региону {self.region.name}'
+            })
+
+        # Проверка: ИНН только цифры
+        if self.inn and not self.inn.isdigit():
+            raise ValidationError({
+                'inn': 'ИНН должен содержать только цифры'
             })
 
     def save(self, *args, **kwargs) -> None:
+        """Сохранение с валидацией."""
         self.full_clean()
         super().save(*args, **kwargs)
 
     # === Бизнес-методы ===
 
+    @property
+    def can_interact(self) -> bool:
+        """
+        Проверка: можно ли взаимодействовать с магазином.
+
+        Returns:
+            True если магазин активен И одобрен
+        """
+        return self.is_active and self.approval_status == self.ApprovalStatus.APPROVED
+
     def check_can_interact(self) -> None:
         """
-        Проверка возможности взаимодействия с магазином.
-        Вызывает ValidationError если магазин заморожен или не одобрен.
+        Проверка возможности взаимодействия.
+
+        Raises:
+            ValidationError: Если магазин заблокирован или не одобрен
         """
         if not self.is_active:
             raise ValidationError(
-                'Магазин деактивирован. Взаимодействие невозможно.'
-            )
-        if self.approval_status != 'approved':
-            raise ValidationError(
-                'Магазин не одобрен. Взаимодействие невозможно.'
+                f"Магазин '{self.name}' заблокирован админом. "
+                f"Взаимодействие невозможно."
             )
 
-    def freeze(self) -> None:
-        """Заморозить магазин (деактивировать)."""
+        if self.approval_status != self.ApprovalStatus.APPROVED:
+            raise ValidationError(
+                f"Магазин '{self.name}' не одобрен (статус: {self.get_approval_status_display()}). "
+                f"Взаимодействие невозможно."
+            )
+
+    @transaction.atomic
+    def freeze(self, *, frozen_by: Optional['User'] = None) -> None:
+        """
+        Заморозить магазин (заблокировать).
+
+        ТЗ: "При заморозке магазин не может создавать/получать заказы,
+        партнёры не могут с ним взаимодействовать."
+
+        Args:
+            frozen_by: Кто заблокировал (обычно админ)
+        """
         self.is_active = False
         self.save(update_fields=['is_active', 'updated_at'])
 
-    def unfreeze(self) -> None:
-        """Разморозить магазин (активировать)."""
+        # TODO: Добавить запись в историю
+        # StoreHistory.objects.create(
+        #     store=self,
+        #     action='frozen',
+        #     changed_by=frozen_by,
+        #     comment='Магазин заблокирован'
+        # )
+
+    @transaction.atomic
+    def unfreeze(self, *, unfrozen_by: Optional['User'] = None) -> None:
+        """
+        Разморозить магазин (активировать).
+
+        Args:
+            unfrozen_by: Кто разблокировал (обычно админ)
+        """
         self.is_active = True
         self.save(update_fields=['is_active', 'updated_at'])
 
+        # TODO: Добавить запись в историю
+        # StoreHistory.objects.create(
+        #     store=self,
+        #     action='unfrozen',
+        #     changed_by=unfrozen_by,
+        #     comment='Магазин разблокирован'
+        # )
+
+    @transaction.atomic
+    def approve(self, *, approved_by: Optional['User'] = None) -> None:
+        """
+        Одобрить магазин.
+
+        Args:
+            approved_by: Кто одобрил (админ)
+        """
+        self.approval_status = self.ApprovalStatus.APPROVED
+        self.save(update_fields=['approval_status', 'updated_at'])
+
+    @transaction.atomic
+    def reject(self, *, rejected_by: Optional['User'] = None, reason: str = '') -> None:
+        """
+        Отклонить магазин.
+
+        Args:
+            rejected_by: Кто отклонил (админ)
+            reason: Причина отклонения
+        """
+        self.approval_status = self.ApprovalStatus.REJECTED
+        self.save(update_fields=['approval_status', 'updated_at'])
+
     @property
     def is_frozen(self) -> bool:
-        """Проверка: заморожен ли магазин."""
+        """Проверка: заблокирован ли магазин."""
         return not self.is_active
 
     @property
-    def can_interact(self) -> bool:
-        """Можно ли взаимодействовать с магазином."""
-        return self.is_active and self.approval_status == 'approved'
+    def is_approved(self) -> bool:
+        """Проверка: одобрен ли магазин."""
+        return self.approval_status == self.ApprovalStatus.APPROVED
 
+    @property
+    def outstanding_debt(self) -> Decimal:
+        """Текущий непогашенный долг (алиас для debt)."""
+        return self.debt
+
+    @property
+    def has_debt(self) -> bool:
+        """Проверка: есть ли долг."""
+        return self.debt > Decimal('0')
+
+    def get_total_orders_count(self) -> int:
+        """Общее количество заказов магазина."""
+        return self.orders.count()
+
+    def get_accepted_orders_count(self) -> int:
+        """Количество принятых заказов."""
+        from orders.models import StoreOrderStatus
+        return self.orders.filter(status=StoreOrderStatus.ACCEPTED).count()
+
+    def get_inventory_items_count(self) -> int:
+        """Количество позиций в инвентаре."""
+        return self.inventory.count()
+
+    def get_users_count(self) -> int:
+        """Количество пользователей, работающих в магазине."""
+        return self.selections.filter(is_current=True).count()
+
+
+# =============================================================================
+# ВЫБОР МАГАЗИНА ПОЛЬЗОВАТЕЛЕМ
+# =============================================================================
 
 class StoreSelection(models.Model):
     """
-    Выбор магазина пользователем с ролью STORE.
+    Выбор магазина пользователем с role='store'.
 
-    По ТЗ: пользователь может выбрать магазин для работы от его имени.
-    После выбора доступен CRUD профиля через /stores/profile/
+    БИЗНЕС-ЛОГИКА (ТЗ v2.0):
+    1. Один пользователь может быть только в ОДНОМ магазине одновременно
+    2. Несколько пользователей могут быть в ОДНОМ магазине одновременно
+    3. При выборе нового магазина старый автоматически становится is_current=False
+    4. Пользователь может выйти из магазина и выбрать другой
+
+    ПРИМЕРЫ:
+    - User A выбрал Store 1 → User A.current_store = Store 1
+    - User B выбрал Store 1 → User B.current_store = Store 1 (OK!)
+    - User A выбрал Store 2 → User A.current_store = Store 2, старый выбор → is_current=False
     """
 
     user = models.ForeignKey(
@@ -262,214 +451,215 @@ class StoreSelection(models.Model):
         related_name='store_selections',
         verbose_name='Пользователь'
     )
+
     store = models.ForeignKey(
         Store,
         on_delete=models.CASCADE,
         related_name='selections',
         verbose_name='Магазин'
     )
+
     is_current = models.BooleanField(
         default=True,
         verbose_name='Текущий выбор',
-        help_text='Активный магазин для пользователя'
+        db_index=True,
+        help_text='Активный магазин для пользователя. Только один может быть True.'
     )
+
     selected_at = models.DateTimeField(
         auto_now_add=True,
         verbose_name='Дата выбора'
+    )
+
+    deselected_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Дата отмены выбора'
     )
 
     class Meta:
         db_table = 'store_selections'
         verbose_name = 'Выбор магазина'
         verbose_name_plural = 'Выборы магазинов'
-        # ИСПРАВЛЕНИЕ: unique_together для предотвращения дублей
+        ordering = ['-selected_at']
+        # ВАЖНО: Один user может выбрать один store только один раз
         unique_together = ['user', 'store']
         indexes = [
             models.Index(fields=['user', 'is_current']),
+            models.Index(fields=['store', 'is_current']),
+        ]
+        constraints = [
+            # КРИТИЧНАЯ ПРОВЕРКА: У пользователя только один активный магазин
+            models.UniqueConstraint(
+                fields=['user'],
+                condition=models.Q(is_current=True),
+                name='unique_current_store_per_user'
+            )
         ]
 
     def __str__(self) -> str:
-        current = " [ТЕКУЩИЙ]" if self.is_current else ""
-        return f"{self.user.get_full_name()} → {self.store.name}{current}"
+        status = " [ТЕКУЩИЙ]" if self.is_current else " [НЕАКТИВНЫЙ]"
+        return f"{self.user.get_full_name()} → {self.store.name}{status}"
 
+    def clean(self) -> None:
+        """
+        Валидация выбора магазина.
+
+        Проверки:
+        1. Пользователь имеет роль 'store'
+        2. Магазин одобрен и активен
+        """
+        super().clean()
+
+        # Проверка роли пользователя
+        if self.user.role != 'store':
+            raise ValidationError({
+                'user': 'Только пользователи с ролью "Магазин" могут выбирать магазины'
+            })
+
+        # Проверка: магазин одобрен
+        if self.store.approval_status != Store.ApprovalStatus.APPROVED:
+            raise ValidationError({
+                'store': f'Магазин "{self.store.name}" не одобрен. Выбор невозможен.'
+            })
+
+        # Проверка: магазин активен
+        if not self.store.is_active:
+            raise ValidationError({
+                'store': f'Магазин "{self.store.name}" заблокирован. Выбор невозможен.'
+            })
+
+    @transaction.atomic
     def save(self, *args, **kwargs) -> None:
-        """При установке is_current=True, сбрасываем у других."""
+        """
+        Сохранение с автоматическим сбросом других активных выборов.
+
+        Логика:
+        - Если is_current=True, все другие выборы этого пользователя → is_current=False
+        - Обновляется deselected_at для старых выборов
+        """
+        from django.utils import timezone
+
         if self.is_current:
+            # Находим все активные выборы пользователя кроме текущего
             StoreSelection.objects.filter(
                 user=self.user,
                 is_current=True
-            ).exclude(pk=self.pk).update(is_current=False)
+            ).exclude(pk=self.pk).update(
+                is_current=False,
+                deselected_at=timezone.now()
+            )
+
+        # Валидация перед сохранением
+        self.full_clean()
+
         super().save(*args, **kwargs)
 
+    @classmethod
+    def get_current_store_for_user(cls, user: 'User') -> Optional[Store]:
+        """
+        Получить текущий активный магазин пользователя.
 
-class StoreProductRequest(models.Model):
-    """
-    Wishlist магазина - временный список желаемых товаров.
+        Args:
+            user: Пользователь с role='store'
 
-    По ТЗ:
-    - НЕ влияет на инвентарь, пока партнёр не создаст заказ
-    - НЕ создаёт долг
-    - Магазин может отменить до момента создания заказа
-    """
+        Returns:
+            Store или None
+        """
+        selection = cls.objects.filter(
+            user=user,
+            is_current=True
+        ).select_related('store').first()
 
-    store = models.ForeignKey(
-        Store,
-        on_delete=models.CASCADE,
-        related_name='product_requests',
-        verbose_name='Магазин'
-    )
-    product = models.ForeignKey(
-        'products.Product',
-        on_delete=models.CASCADE,
-        related_name='store_requests',
-        verbose_name='Товар'
-    )
-    quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.1'))],
-        verbose_name='Количество'
-    )
-    note = models.CharField(
-        max_length=255,
-        blank=True,
-        verbose_name='Примечание'
-    )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        verbose_name='Дата создания'
-    )
-    updated_at = models.DateTimeField(
-        auto_now=True,
-        verbose_name='Дата обновления'
-    )
+        return selection.store if selection else None
 
-    class Meta:
-        db_table = 'store_product_requests'
-        verbose_name = 'Wishlist товар'
-        verbose_name_plural = 'Wishlist товары'
-        unique_together = ['store', 'product']
-        ordering = ['-created_at']
+    @classmethod
+    @transaction.atomic
+    def select_store(cls, *, user: 'User', store: Store) -> 'StoreSelection':
+        """
+        Выбрать магазин для пользователя.
 
-    def __str__(self) -> str:
-        return f"{self.store.name} → {self.product.name}: {self.quantity}"
+        Args:
+            user: Пользователь
+            store: Магазин
 
-    @property
-    def total(self) -> Decimal:
-        """Расчётная стоимость позиции."""
-        if self.product and self.product.price:
-            return self.quantity * self.product.price
-        return Decimal('0')
+        Returns:
+            StoreSelection
 
+        Raises:
+            ValidationError: Если пользователь не может выбрать магазин
+        """
+        # Проверка роли
+        if user.role != 'store':
+            raise ValidationError('Только пользователи с ролью "Магазин" могут выбирать магазины')
 
-class StoreRequest(models.Model):
-    """
-    Снимок wishlist'а магазина (история запросов).
+        # Проверка доступности магазина
+        store.check_can_interact()
 
-    Создаётся из StoreProductRequest когда магазин "отправляет" запрос.
-    Партнёр видит этот запрос и может создать заказ на его основе.
-    """
+        # Получаем или создаём выбор
+        selection, created = cls.objects.get_or_create(
+            user=user,
+            store=store,
+            defaults={'is_current': True}
+        )
 
-    store = models.ForeignKey(
-        Store,
-        on_delete=models.CASCADE,
-        related_name='requests',
-        verbose_name='Магазин'
-    )
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        related_name='created_store_requests',
-        verbose_name='Создал'
-    )
-    total_amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Общая сумма'
-    )
-    note = models.TextField(
-        blank=True,
-        verbose_name='Примечание'
-    )
-    idempotency_key = models.CharField(
-        max_length=100,
-        unique=True,
-        null=True,
-        blank=True,
-        verbose_name='Ключ идемпотентности',
-        help_text='Защита от повторной отправки'
-    )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        verbose_name='Дата создания'
-    )
+        if not created and not selection.is_current:
+            # Если выбор уже был, но неактивен - активируем
+            selection.is_current = True
+            selection.save()
 
-    class Meta:
-        db_table = 'store_requests'
-        verbose_name = 'Запрос магазина'
-        verbose_name_plural = 'Запросы магазинов'
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['store', 'created_at']),
-            models.Index(fields=['idempotency_key']),
-        ]
+        return selection
 
-    def __str__(self) -> str:
-        return f"Запрос #{self.id} от {self.store.name} ({self.total_amount} сом)"
+    @classmethod
+    @transaction.atomic
+    def deselect_current_store(cls, user: 'User') -> bool:
+        """
+        Отменить выбор текущего магазина.
+
+        Args:
+            user: Пользователь
+
+        Returns:
+            True если выбор был отменён, False если не было активного выбора
+        """
+        from django.utils import timezone
+
+        updated = cls.objects.filter(
+            user=user,
+            is_current=True
+        ).update(
+            is_current=False,
+            deselected_at=timezone.now()
+        )
+
+        return updated > 0
 
 
-class StoreRequestItem(models.Model):
-    """Позиция в запросе магазина."""
-
-    request = models.ForeignKey(
-        StoreRequest,
-        on_delete=models.CASCADE,
-        related_name='items',
-        verbose_name='Запрос'
-    )
-    product = models.ForeignKey(
-        'products.Product',
-        on_delete=models.CASCADE,
-        related_name='request_items',
-        verbose_name='Товар'
-    )
-    quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.1'))],
-        verbose_name='Количество'
-    )
-    price = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Цена за единицу'
-    )
-    is_cancelled = models.BooleanField(
-        default=False,
-        verbose_name='Отменено'
-    )
-
-    class Meta:
-        db_table = 'store_request_items'
-        verbose_name = 'Позиция запроса'
-        verbose_name_plural = 'Позиции запросов'
-
-    def __str__(self) -> str:
-        status = " [ОТМЕНЕНО]" if self.is_cancelled else ""
-        return f"{self.product.name}: {self.quantity}{status}"
-
-    @property
-    def total(self) -> Decimal:
-        """Общая стоимость позиции."""
-        return self.quantity * self.price
-
+# =============================================================================
+# ИНВЕНТАРЬ МАГАЗИНА
+# =============================================================================
 
 class StoreInventory(models.Model):
-    """Инвентарь магазина (товары на складе магазина)."""
+    """
+    Инвентарь магазина - все товары на складе магазина.
+
+    БИЗНЕС-ЛОГИКА (ТЗ v2.0):
+    1. Товары добавляются при одобрении заказа админом
+    2. Все заказы складываются в ОДИН инвентарь
+    3. Партнёр может удалить товары из инвентаря при подтверждении
+    4. Инвентарь показывает текущее наличие товаров у магазина
+
+    WORKFLOW:
+    1. Магазин создаёт заказ → товары НЕ добавляются в инвентарь
+    2. Админ одобряет → товары добавляются в инвентарь
+    3. Партнёр подтверждает → может удалить товары из инвентаря
+    4. После подтверждения → товары остаются в инвентаре (магазин владеет ими)
+
+    ПРИМЕРЫ:
+    - Заказ #1: 10 кг курицы → Админ одобрил → StoreInventory: курица +10 кг
+    - Заказ #2: 5 кг курицы → Админ одобрил → StoreInventory: курица +5 кг = 15 кг
+    - Партнёр подтверждает заказ #2, удаляет 3 кг → StoreInventory: курица -3 кг = 12 кг
+    """
 
     store = models.ForeignKey(
         Store,
@@ -477,22 +667,30 @@ class StoreInventory(models.Model):
         related_name='inventory',
         verbose_name='Магазин'
     )
+
     product = models.ForeignKey(
         'products.Product',
         on_delete=models.CASCADE,
         related_name='store_inventory',
         verbose_name='Товар'
     )
+
     quantity = models.DecimalField(
         max_digits=10,
-        decimal_places=2,
+        decimal_places=3,  # Для весовых товаров (0.1 кг = 0.100)
         default=Decimal('0'),
         validators=[MinValueValidator(Decimal('0'))],
         verbose_name='Количество'
     )
+
     last_updated = models.DateTimeField(
         auto_now=True,
         verbose_name='Последнее обновление'
+    )
+
+    created_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name='Дата добавления'
     )
 
     class Meta:
@@ -500,169 +698,82 @@ class StoreInventory(models.Model):
         verbose_name = 'Инвентарь магазина'
         verbose_name_plural = 'Инвентарь магазинов'
         unique_together = ['store', 'product']
+        ordering = ['-last_updated']
+        indexes = [
+            models.Index(fields=['store', 'product']),
+            models.Index(fields=['store', 'quantity']),
+        ]
 
     def __str__(self) -> str:
         return f"{self.store.name} - {self.product.name}: {self.quantity}"
 
     @property
     def total_price(self) -> Decimal:
-        """Общая стоимость товара в инвентаре."""
-        if self.product and self.product.price:
-            return self.quantity * self.product.price
+        """
+        Общая стоимость товара в инвентаре.
+
+        Returns:
+            quantity * product.final_price
+        """
+        if self.product and self.product.final_price:
+            return self.quantity * self.product.final_price
         return Decimal('0')
 
-
-class PartnerInventory(models.Model):
-    """Инвентарь партнёра (личный склад партнёра)."""
-
-    partner = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        limit_choices_to={'role': 'partner'},
-        related_name='inventory',
-        verbose_name='Партнёр'
-    )
-    product = models.ForeignKey(
-        'products.Product',
-        on_delete=models.CASCADE,
-        related_name='partner_inventory',
-        verbose_name='Товар'
-    )
-    quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Количество'
-    )
-    last_updated = models.DateTimeField(
-        auto_now=True,
-        verbose_name='Последнее обновление'
-    )
-
-    class Meta:
-        db_table = 'partner_inventory'
-        verbose_name = 'Инвентарь партнёра'
-        verbose_name_plural = 'Инвентарь партнёров'
-        unique_together = ['partner', 'product']
-
-    def __str__(self) -> str:
-        return f"{self.partner.get_full_name()} - {self.product.name}: {self.quantity}"
-
     @property
-    def total_price(self) -> Decimal:
-        """Общая стоимость товара."""
-        if self.product and self.product.price:
-            return self.quantity * self.product.price
-        return Decimal('0')
+    def is_weight_based(self) -> bool:
+        """Проверка: весовой ли товар."""
+        return self.product.is_weight_based if self.product else False
 
+    def clean(self) -> None:
+        """Валидация инвентаря."""
+        super().clean()
 
-class ReturnRequest(models.Model):
-    """
-    Запрос на возврат товаров от партнёра к админу.
+        # Количество не может быть отрицательным
+        if self.quantity < Decimal('0'):
+            raise ValidationError({
+                'quantity': 'Количество не может быть отрицательным'
+            })
 
-    По ТЗ 2.4: Возврат НЕ требует подтверждения от админа.
-    """
+    @transaction.atomic
+    def add_quantity(self, amount: Decimal) -> None:
+        """
+        Добавить количество товара в инвентарь.
 
-    STATUS_CHOICES = [
-        ('pending', 'Ожидает'),
-        ('completed', 'Завершён'),
-        ('cancelled', 'Отменён'),
-    ]
+        Args:
+            amount: Количество для добавления
 
-    partner = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name='return_requests',
-        limit_choices_to={'role': 'partner'},
-        verbose_name='Партнёр'
-    )
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default='pending',
-        verbose_name='Статус'
-    )
-    total_amount = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Сумма возврата'
-    )
-    reason = models.TextField(
-        blank=True,
-        verbose_name='Причина возврата'
-    )
-    idempotency_key = models.CharField(
-        max_length=100,
-        unique=True,
-        null=True,
-        blank=True,
-        verbose_name='Ключ идемпотентности'
-    )
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        verbose_name='Дата создания'
-    )
-    completed_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        verbose_name='Дата завершения'
-    )
+        Raises:
+            ValidationError: Если amount <= 0
+        """
+        if amount <= Decimal('0'):
+            raise ValidationError('Количество для добавления должно быть больше 0')
 
-    class Meta:
-        db_table = 'return_requests'
-        verbose_name = 'Возврат товаров'
-        verbose_name_plural = 'Возвраты товаров'
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['partner', 'created_at']),
-            models.Index(fields=['status']),
-        ]
+        self.quantity += amount
+        self.save(update_fields=['quantity', 'last_updated'])
 
-    def __str__(self) -> str:
-        return f"Возврат #{self.id} от {self.partner.get_full_name()}"
+    @transaction.atomic
+    def subtract_quantity(self, amount: Decimal) -> None:
+        """
+        Вычесть количество товара из инвентаря.
 
+        Args:
+            amount: Количество для вычитания
 
-class ReturnRequestItem(models.Model):
-    """Позиция в запросе на возврат."""
+        Raises:
+            ValidationError: Если amount > quantity или amount <= 0
+        """
+        if amount <= Decimal('0'):
+            raise ValidationError('Количество для вычитания должно быть больше 0')
 
-    request = models.ForeignKey(
-        ReturnRequest,
-        on_delete=models.CASCADE,
-        related_name='items',
-        verbose_name='Запрос'
-    )
-    product = models.ForeignKey(
-        'products.Product',
-        on_delete=models.CASCADE,
-        related_name='return_items',
-        verbose_name='Товар'
-    )
-    quantity = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.1'))],
-        verbose_name='Количество'
-    )
-    price = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Цена за единицу'
-    )
+        if amount > self.quantity:
+            raise ValidationError(
+                f'Недостаточно товара в инвентаре. '
+                f'Доступно: {self.quantity}, запрошено: {amount}'
+            )
 
-    class Meta:
-        db_table = 'return_request_items'
-        verbose_name = 'Позиция возврата'
-        verbose_name_plural = 'Позиции возвратов'
+        self.quantity -= amount
+        self.save(update_fields=['quantity', 'last_updated'])
 
-    def __str__(self) -> str:
-        return f"{self.product.name}: {self.quantity}"
-
-    @property
-    def total(self) -> Decimal:
-        """Общая стоимость позиции."""
-        return self.quantity * self.price
+        # Если количество стало 0, удаляем запись
+        if self.quantity == Decimal('0'):
+            self.delete()

@@ -1,29 +1,36 @@
+# apps/products/permissions.py
+"""Permissions для products."""
+
 from rest_framework import permissions
 
 
-class IsAdminOnly(permissions.BasePermission):
-    """Только админ или суперюзер"""
+class IsAdmin(permissions.BasePermission):
+    """Только админы."""
 
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-
-        # Суперюзер всегда проходит
-        if request.user.is_superuser:
-            return True
-
-        # Или роль ADMIN
-        return hasattr(request.user, 'role') and request.user.role == 'admin'
+        return (
+                request.user and
+                request.user.is_authenticated and
+                request.user.role == 'admin'
+        )
 
 
-class IsPartnerOrAdmin(permissions.BasePermission):
-    """Партнёр или админ"""
+class IsAdminOrReadOnly(permissions.BasePermission):
+    """
+    Админы: полный доступ
+    Партнёры и магазины: только чтение
+    """
 
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
+        if not request.user or not request.user.is_authenticated:
             return False
 
-        if request.user.is_superuser:
+        # Админ: полный доступ
+        if request.user.role == 'admin':
             return True
 
-        return hasattr(request.user, 'role') and request.user.role in ['partner', 'admin']
+        # Партнёры и магазины: только чтение
+        if request.user.role in ['partner', 'store']:
+            return request.method in permissions.SAFE_METHODS
+
+        return False

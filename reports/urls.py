@@ -1,13 +1,15 @@
 # apps/reports/urls.py
+"""URL маршруты для reports."""
 
-from django.urls import include, path
-from rest_framework.routers import DefaultRouter
+from django.urls import path
+from . import views
 
-from .views import ReportViewSet
-
-router = DefaultRouter()
-router.register("reports", ReportViewSet, basename="report")
+app_name = 'reports'
 
 urlpatterns = [
-    path("", include(router.urls)),
+    # Статистика с круговой диаграммой
+    path('statistics/', views.get_statistics, name='statistics'),
+
+    # История магазина
+    path('store-history/<int:store_id>/', views.get_store_history, name='store-history'),
 ]

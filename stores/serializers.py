@@ -1,376 +1,567 @@
-# apps/stores/serializers.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
-from rest_framework import serializers
+# apps/stores/serializers.py - ПОЛНАЯ ВЕРСИЯ v2.0
+"""
+Сериализаторы для stores согласно ТЗ v2.0.
+
+ОСНОВНЫЕ СЕРИАЛИЗАТОРЫ:
+- RegionSerializer: Регионы
+- CitySerializer: Города
+- StoreSerializer: Магазин (полная информация)
+- StoreListSerializer: Магазин (список)
+- StoreCreateSerializer: Создание магазина
+- StoreUpdateSerializer: Обновление профиля
+- StoreSelectionSerializer: Выбор магазина
+- StoreInventorySerializer: Инвентарь
+"""
+
 from decimal import Decimal
-from drf_spectacular.utils import extend_schema_field
-from drf_spectacular.types import OpenApiTypes
+from typing import Dict, Any
+
+from rest_framework import serializers
 
 from .models import (
-    Region, City, Store, StoreSelection,
-    StoreProductRequest, StoreRequest, StoreRequestItem,
-    StoreInventory, PartnerInventory, ReturnRequest, ReturnRequestItem
+    Region,
+    City,
+    Store,
+    StoreSelection,
+    StoreInventory,
 )
-from products.models import Product
 
 
-# ============= REGION & CITY =============
-
-class CitySerializer(serializers.ModelSerializer):
-    """ИСПРАВЛЕНИЕ #4: Сериализатор города"""
-    region_name = serializers.CharField(source='region.name', read_only=True)
-
-    class Meta:
-        model = City
-        fields = ['id', 'name', 'region', 'region_name']
-
+# =============================================================================
+# ГЕОГРАФИЯ
+# =============================================================================
 
 class RegionSerializer(serializers.ModelSerializer):
-    """ИСПРАВЛЕНИЕ #4: Сериализатор региона с городами"""
-    cities = CitySerializer(many=True, read_only=True)
+    """Сериализатор региона."""
+
+    cities_count = serializers.SerializerMethodField()
+    stores_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Region
-        fields = ['id', 'name', 'cities']
-
-
-# ============= STORE =============
-
-class StoreSerializer(serializers.ModelSerializer):
-    """Сериализатор магазина"""
-    region_name = serializers.CharField(source='region.name', read_only=True)
-    city_name = serializers.CharField(source='city.name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
-    approval_status_display = serializers.CharField(source='get_approval_status_display', read_only=True)
-
-    def validate(self, data):
-        region = data.get('region')
-        city = data.get('city')
-        if region and city and city.region != region:
-            raise serializers.ValidationError({'city': 'Город должен принадлежать выбранному региону.'})
-        return data
-
-    class Meta:
-        model = Store
         fields = [
-            'id', 'name', 'inn', 'owner_name', 'phone',
-            'region', 'region_name', 'city', 'city_name',
-            'address', 'latitude', 'longitude',
-            'debt', 'approval_status', 'approval_status_display',
-            'is_active', 'created_by', 'created_by_name',
-            'created_at', 'updated_at'
+            'id',
+            'name',
+            'cities_count',
+            'stores_count',
+            'created_at',
+            'updated_at'
         ]
-        read_only_fields = ['debt', 'created_by', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_cities_count(self, obj: Region) -> int:
+        """Количество городов в регионе."""
+        return obj.get_cities_count()
+
+    def get_stores_count(self, obj: Region) -> int:
+        """Количество магазинов в регионе."""
+        return obj.get_stores_count()
 
 
-class StoreSelectionSerializer(serializers.ModelSerializer):
-    """Сериализатор выбора магазина"""
-    store_name = serializers.CharField(source='store.name', read_only=True)
-    store_inn = serializers.CharField(source='store.inn', read_only=True)
-    store_is_active = serializers.BooleanField(source='store.is_active', read_only=True)
-    store_approval_status = serializers.CharField(source='store.approval_status', read_only=True)
+class CitySerializer(serializers.ModelSerializer):
+    """Сериализатор города."""
+
+    region_name = serializers.CharField(source='region.name', read_only=True)
+    stores_count = serializers.SerializerMethodField()
 
     class Meta:
-        model = StoreSelection
-        fields = ['id', 'store', 'store_name', 'store_inn',
-                  'store_is_active', 'store_approval_status', 'selected_at']
-        read_only_fields = ['selected_at']
+        model = City
+        fields = [
+            'id',
+            'name',
+            'region',
+            'region_name',
+            'stores_count',
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = ['id', 'region_name', 'created_at', 'updated_at']
+
+    def get_stores_count(self, obj: City) -> int:
+        """Количество магазинов в городе."""
+        return obj.get_stores_count()
 
 
-# ============= STORE PROFILE =============
+# =============================================================================
+# МАГАЗИН
+# =============================================================================
 
-class StoreProfileSerializer(serializers.ModelSerializer):
+class StoreListSerializer(serializers.ModelSerializer):
     """
-    Профиль магазина для текущего выбранного магазина.
-    Полная информация + статистика.
+    Сериализатор для списка магазинов (краткая информация).
+
+    Используется в:
+    - GET /api/stores/ (список магазинов)
+    - Поиск магазинов
     """
+
     region_name = serializers.CharField(source='region.name', read_only=True)
     city_name = serializers.CharField(source='city.name', read_only=True)
     approval_status_display = serializers.CharField(
-        source='get_approval_status_display', read_only=True
+        source='get_approval_status_display',
+        read_only=True
     )
 
-    # Дополнительная статистика
-    total_orders = serializers.SerializerMethodField()
-    total_paid = serializers.SerializerMethodField()
-    pending_requests_count = serializers.SerializerMethodField()
+    class Meta:
+        model = Store
+        fields = [
+            'id',
+            'name',
+            'inn',
+            'owner_name',
+            'phone',
+            'region',
+            'region_name',
+            'city',
+            'city_name',
+            'address',
+            'debt',
+            'approval_status',
+            'approval_status_display',
+            'is_active',
+            'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+
+
+class StoreSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор магазина (полная информация).
+
+    Используется в:
+    - GET /api/stores/{id}/ (детальная информация)
+    - Профиль магазина
+    """
+
+    region_name = serializers.CharField(source='region.name', read_only=True)
+    city_name = serializers.CharField(source='city.name', read_only=True)
+    approval_status_display = serializers.CharField(
+        source='get_approval_status_display',
+        read_only=True
+    )
+
+    # Дополнительные вычисляемые поля
+    can_interact = serializers.BooleanField(read_only=True)
+    is_frozen = serializers.BooleanField(read_only=True)
+    is_approved = serializers.BooleanField(read_only=True)
+    has_debt = serializers.BooleanField(read_only=True)
+    outstanding_debt = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        read_only=True
+    )
+
+    # Статистика
+    total_orders_count = serializers.SerializerMethodField()
+    accepted_orders_count = serializers.SerializerMethodField()
+    inventory_items_count = serializers.SerializerMethodField()
+    users_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Store
         fields = [
-            'id', 'name', 'inn', 'owner_name', 'phone',
-            'region', 'region_name', 'city', 'city_name',
-            'address', 'latitude', 'longitude',
-            'debt', 'approval_status', 'approval_status_display',
-            'is_active', 'created_at', 'updated_at',
-            # Статистика
-            'total_orders', 'total_paid', 'pending_requests_count'
+            'id',
+            'name',
+            'inn',
+            'owner_name',
+            'phone',
+            'region',
+            'region_name',
+            'city',
+            'city_name',
+            'address',
+            'latitude',
+            'longitude',
+            'debt',
+            'total_paid',
+            'outstanding_debt',
+            'has_debt',
+            'approval_status',
+            'approval_status_display',
+            'is_active',
+            'is_frozen',
+            'is_approved',
+            'can_interact',
+            'total_orders_count',
+            'accepted_orders_count',
+            'inventory_items_count',
+            'users_count',
+            'created_by',
+            'created_at',
+            'updated_at'
         ]
         read_only_fields = [
-            'id', 'inn', 'debt', 'approval_status', 'is_active',
-            'created_at', 'updated_at'
+            'id',
+            'debt',
+            'total_paid',
+            'approval_status',
+            'is_active',
+            'created_by',
+            'created_at',
+            'updated_at'
         ]
 
-    @extend_schema_field(OpenApiTypes.INT)
-    def get_total_orders(self, obj) -> int:
-        """Общее количество заказов"""
-        return obj.orders.count() if hasattr(obj, 'orders') else 0
+    def get_total_orders_count(self, obj: Store) -> int:
+        """Общее количество заказов."""
+        return obj.get_total_orders_count()
 
-    @extend_schema_field(OpenApiTypes.DECIMAL)
-    def get_total_paid(self, obj) -> Decimal:
-        """Общая сумма оплаченных заказов"""
-        from django.db.models import Sum
-        result = obj.orders.aggregate(total=Sum('paid_amount'))
-        return result['total'] or Decimal('0')
+    def get_accepted_orders_count(self, obj: Store) -> int:
+        """Количество принятых заказов."""
+        return obj.get_accepted_orders_count()
 
-    @extend_schema_field(OpenApiTypes.INT)
-    def get_pending_requests_count(self, obj) -> int:
-        """Количество товаров в wishlist"""
-        return obj.product_requests.count()
+    def get_inventory_items_count(self, obj: Store) -> int:
+        """Количество позиций в инвентаре."""
+        return obj.get_inventory_items_count()
+
+    def get_users_count(self, obj: Store) -> int:
+        """Количество пользователей в магазине."""
+        return obj.get_users_count()
 
 
-class StoreProfileUpdateSerializer(serializers.ModelSerializer):
+class StoreCreateSerializer(serializers.ModelSerializer):
     """
-    Сериализатор для обновления профиля магазина.
-    Разрешено редактировать: name, owner_name, phone, region, city, address.
-    ИНН редактировать НЕЛЬЗЯ (по ТЗ).
+    Сериализатор для регистрации магазина (ТЗ v2.0, раздел 1.4).
+
+    Используется в:
+    - POST /api/stores/ (регистрация нового магазина)
+
+    Поля:
+    - Название магазина
+    - Владелец магазина
+    - Номер телефона магазина
+    - ИНН (12-14 цифр)
+    - Город
+    - Область
+    - Адрес магазина
     """
 
     class Meta:
         model = Store
         fields = [
-            'name', 'owner_name', 'phone',
-            'region', 'city', 'address',
-            'latitude', 'longitude'
+            'name',
+            'inn',
+            'owner_name',
+            'phone',
+            'region',
+            'city',
+            'address',
+            'latitude',
+            'longitude'
         ]
 
-    def validate_phone(self, value):
-        """Валидация телефона: только цифры в формате +996XXXXXXXXX"""
-        import re
-        if not re.match(r'^\+996\d{9}$', value):
+    def validate_inn(self, value: str) -> str:
+        """Валидация ИНН."""
+        # Проверка: только цифры
+        if not value.isdigit():
+            raise serializers.ValidationError('ИНН должен содержать только цифры')
+
+        # Проверка: длина 12-14
+        if not (12 <= len(value) <= 14):
+            raise serializers.ValidationError('ИНН должен содержать от 12 до 14 цифр')
+
+        # Проверка: уникальность
+        if Store.objects.filter(inn=value).exists():
             raise serializers.ValidationError(
-                'Телефон должен быть в формате +996XXXXXXXXX'
+                f'Магазин с ИНН {value} уже зарегистрирован'
             )
+
         return value
 
-    def validate(self, data):
-        """Проверка что город принадлежит региону"""
-        region = data.get('region') or (self.instance.region if self.instance else None)
-        city = data.get('city') or (self.instance.city if self.instance else None)
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """Валидация связанности город-регион."""
+        city = attrs.get('city')
+        region = attrs.get('region')
 
-        if region and city and city.region != region:
+        if city and region and city.region_id != region.id:
             raise serializers.ValidationError({
-                'city': 'Город должен принадлежать выбранному региону.'
+                'city': f'Город {city.name} не принадлежит региону {region.name}'
             })
-        return data
+
+        return attrs
 
 
-# ============= PRODUCT REQUESTS (WISHLIST) =============
+class StoreUpdateSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор для обновления профиля магазина.
 
-class StoreProductRequestSerializer(serializers.ModelSerializer):
-    """Запрос на товар (временная корзина / wishlist)"""
+    Используется в:
+    - PATCH /api/stores/{id}/ (обновление профиля)
+
+    Все поля опциональны.
+    """
+
+    class Meta:
+        model = Store
+        fields = [
+            'name',
+            'owner_name',
+            'phone',
+            'region',
+            'city',
+            'address',
+            'latitude',
+            'longitude'
+        ]
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """Валидация связанности город-регион."""
+        city = attrs.get('city')
+        region = attrs.get('region', self.instance.region if self.instance else None)
+
+        if city and region and city.region_id != region.id:
+            raise serializers.ValidationError({
+                'city': f'Город {city.name} не принадлежит региону {region.name}'
+            })
+
+        return attrs
+
+
+# =============================================================================
+# ВЫБОР МАГАЗИНА
+# =============================================================================
+
+class StoreSelectionSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор для выбора магазина пользователем.
+
+    ТЗ v2.0: "Пользователь может выбрать магазин из списка"
+    """
+
+    store_name = serializers.CharField(source='store.name', read_only=True)
+    store_inn = serializers.CharField(source='store.inn', read_only=True)
+    store_address = serializers.CharField(source='store.address', read_only=True)
+    user_name = serializers.CharField(source='user.get_full_name', read_only=True)
+
+    class Meta:
+        model = StoreSelection
+        fields = [
+            'id',
+            'user',
+            'user_name',
+            'store',
+            'store_name',
+            'store_inn',
+            'store_address',
+            'is_current',
+            'selected_at',
+            'deselected_at'
+        ]
+        read_only_fields = [
+            'id',
+            'user',
+            'is_current',
+            'selected_at',
+            'deselected_at'
+        ]
+
+
+class StoreSelectionCreateSerializer(serializers.Serializer):
+    """
+    Сериализатор для создания выбора магазина.
+
+    Используется в:
+    - POST /api/stores/select/ (выбрать магазин)
+    """
+
+    store_id = serializers.IntegerField(min_value=1)
+
+    def validate_store_id(self, value: int) -> int:
+        """Валидация существования и доступности магазина."""
+        try:
+            store = Store.objects.get(pk=value)
+        except Store.DoesNotExist:
+            raise serializers.ValidationError(f'Магазин с ID {value} не найден')
+
+        # Проверка: магазин одобрен
+        if store.approval_status != Store.ApprovalStatus.APPROVED:
+            raise serializers.ValidationError(
+                f'Магазин "{store.name}" не одобрен. Выбор невозможен.'
+            )
+
+        # Проверка: магазин активен
+        if not store.is_active:
+            raise serializers.ValidationError(
+                f'Магазин "{store.name}" заблокирован. Выбор невозможен.'
+            )
+
+        return value
+
+
+# =============================================================================
+# ИНВЕНТАРЬ МАГАЗИНА
+# =============================================================================
+
+class StoreInventorySerializer(serializers.ModelSerializer):
+    """
+    Сериализатор инвентаря магазина.
+
+    ТЗ v2.0: "Все заказы складываются в один инвентарь магазина"
+    """
+
     product_name = serializers.CharField(source='product.name', read_only=True)
+    product_unit = serializers.CharField(source='product.unit', read_only=True)
     product_price = serializers.DecimalField(
-        source='product.price',
+        source='product.final_price',
         max_digits=10,
         decimal_places=2,
         read_only=True
     )
-    product_unit = serializers.CharField(
-        source='product.get_unit_display', read_only=True
+    is_weight_based = serializers.BooleanField(
+        source='product.is_weight_based',
+        read_only=True
     )
-    product_is_weight_based = serializers.BooleanField(
-        source='product.is_weight_based', read_only=True
+    total_price = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        read_only=True
     )
-
-    @extend_schema_field(OpenApiTypes.DECIMAL)
-    def get_total(self, obj) -> Decimal:
-        """Общая стоимость"""
-        return obj.quantity * obj.product.price
-
-    total = serializers.SerializerMethodField()
-
-    class Meta:
-        model = StoreProductRequest
-        fields = [
-            'id', 'store', 'product', 'product_name',
-            'product_price', 'product_unit', 'product_is_weight_based',
-            'quantity', 'total', 'created_at'
-        ]
-        read_only_fields = ['store', 'created_at']
-
-
-class AddToWishlistSerializer(serializers.Serializer):
-    """Сериализатор для добавления товара в wishlist"""
-    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
-    quantity = serializers.DecimalField(
-        max_digits=10, decimal_places=2,
-        min_value=Decimal('0.1')
-    )
-
-    def validate(self, data):
-        product = data['product']
-        quantity = data['quantity']
-
-        # Валидация для весовых товаров
-        if product.is_weight_based:
-            if quantity < Decimal('0.1'):
-                raise serializers.ValidationError({
-                    'quantity': 'Минимальное количество для весового товара: 0.1 кг'
-                })
-        else:
-            # Для штучных - целое число
-            if quantity != int(quantity):
-                raise serializers.ValidationError({
-                    'quantity': 'Для штучного товара количество должно быть целым числом'
-                })
-            if quantity < 1:
-                raise serializers.ValidationError({
-                    'quantity': 'Минимальное количество: 1 шт'
-                })
-
-        return data
-
-
-class RemoveFromWishlistSerializer(serializers.Serializer):
-    """Сериализатор для удаления товара из wishlist"""
-    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
-
-
-# ============= STORE REQUESTS =============
-
-class StoreRequestItemSerializer(serializers.ModelSerializer):
-    """Позиция в запросе магазина"""
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    product_unit = serializers.CharField(source='product.get_unit_display', read_only=True)
-
-    @extend_schema_field(OpenApiTypes.DECIMAL)
-    def get_total(self, obj) -> Decimal:
-        """Общая стоимость позиции"""
-        return obj.total
-
-    total = serializers.SerializerMethodField()
-
-    class Meta:
-        model = StoreRequestItem
-        fields = [
-            'id', 'product', 'product_name', 'product_unit',
-            'quantity', 'price', 'total', 'is_cancelled'
-        ]
-
-
-class StoreRequestSerializer(serializers.ModelSerializer):
-    """История запросов магазина"""
-    store_name = serializers.CharField(source='store.name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
-    items = StoreRequestItemSerializer(many=True, read_only=True)
-    items_count = serializers.SerializerMethodField()
-    active_items_count = serializers.SerializerMethodField()
-
-    class Meta:
-        model = StoreRequest
-        fields = [
-            'id', 'store', 'store_name', 'created_by', 'created_by_name',
-            'total_amount', 'note', 'items', 'items_count',
-            'active_items_count', 'created_at'
-        ]
-        read_only_fields = ['total_amount', 'created_at']
-
-    @extend_schema_field(OpenApiTypes.INT)
-    def get_items_count(self, obj) -> int:
-        return obj.items.count()
-
-    @extend_schema_field(OpenApiTypes.INT)
-    def get_active_items_count(self, obj) -> int:
-        return obj.items.filter(is_cancelled=False).count()
-
-
-class CreateStoreRequestSerializer(serializers.Serializer):
-    """Создание запроса из wishlist с idempotency"""
-    note = serializers.CharField(required=False, allow_blank=True, max_length=500)
-    idempotency_key = serializers.CharField(required=False, allow_null=True, max_length=100)
-
-
-# ============= INVENTORY =============
-
-class StoreInventorySerializer(serializers.ModelSerializer):
-    """Инвентарь магазина"""
-    store_name = serializers.CharField(source='store.name', read_only=True)
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    product_unit = serializers.CharField(source='product.get_unit_display', read_only=True)
-
-    @extend_schema_field(OpenApiTypes.DECIMAL)
-    def get_total_price(self, obj) -> Decimal:
-        """Общая стоимость"""
-        return obj.total_price
-
-    total_price = serializers.SerializerMethodField()
 
     class Meta:
         model = StoreInventory
         fields = [
-            'id', 'store', 'store_name', 'product', 'product_name',
-            'product_unit', 'quantity', 'total_price', 'last_updated'
+            'id',
+            'store',
+            'product',
+            'product_name',
+            'product_unit',
+            'product_price',
+            'is_weight_based',
+            'quantity',
+            'total_price',
+            'last_updated',
+            'created_at'
+        ]
+        read_only_fields = [
+            'id',
+            'store',
+            'product',
+            'last_updated',
+            'created_at'
         ]
 
 
-class PartnerInventorySerializer(serializers.ModelSerializer):
-    """Инвентарь партнёра"""
-    partner_name = serializers.CharField(source='partner.name', read_only=True)
+class StoreInventoryListSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор инвентаря (краткая версия для списков).
+    """
+
     product_name = serializers.CharField(source='product.name', read_only=True)
-    product_unit = serializers.CharField(source='product.get_unit_display', read_only=True)
-
-    class Meta:
-        model = PartnerInventory
-        fields = [
-            'id', 'partner', 'partner_name', 'product', 'product_name',
-            'product_unit', 'quantity', 'last_updated'
-        ]
-
-
-# ============= RETURN REQUESTS =============
-
-class ReturnRequestItemSerializer(serializers.ModelSerializer):
-    """Позиция в возврате"""
-    product_name = serializers.CharField(source='product.name', read_only=True)
-
-    @extend_schema_field(OpenApiTypes.DECIMAL)
-    def get_total(self, obj) -> Decimal:
-        """Общая стоимость позиции"""
-        return obj.total
-
-    total = serializers.SerializerMethodField()
-
-    class Meta:
-        model = ReturnRequestItem
-        fields = [
-            'id', 'product', 'product_name',
-            'quantity', 'price', 'total'
-        ]
-
-
-class ReturnRequestSerializer(serializers.ModelSerializer):
-    """Запрос на возврат"""
-    partner_name = serializers.CharField(source='partner.name', read_only=True)
-    status_display = serializers.CharField(source='get_status_display', read_only=True)
-    items = ReturnRequestItemSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = ReturnRequest
-        fields = [
-            'id', 'partner', 'partner_name',
-            'status', 'status_display', 'total_amount',
-            'reason', 'items', 'created_at'
-        ]
-        read_only_fields = ['partner', 'total_amount', 'status', 'created_at']
-
-
-# ============= STORE DEBT INFO =============
-
-class StoreDebtSerializer(serializers.ModelSerializer):
-    """Информация о долге магазина"""
-    total_debt = serializers.DecimalField(
-        source='debt', max_digits=12, decimal_places=2, read_only=True
+    product_price = serializers.DecimalField(
+        source='product.final_price',
+        max_digits=10,
+        decimal_places=2,
+        read_only=True
     )
 
     class Meta:
-        model = Store
-        fields = ['id', 'name', 'total_debt']
+        model = StoreInventory
+        fields = [
+            'id',
+            'product',
+            'product_name',
+            'product_price',
+            'quantity',
+            'total_price',
+            'last_updated'
+        ]
+        read_only_fields = ['id', 'last_updated']
+
+
+# =============================================================================
+# ПОИСК И ФИЛЬТРАЦИЯ
+# =============================================================================
+
+class StoreSearchSerializer(serializers.Serializer):
+    """
+    Сериализатор для поиска и фильтрации магазинов (ТЗ v2.0).
+
+    Поиск по:
+    - ИНН (12-14 цифр)
+    - Название
+    - Город
+
+    Фильтрация по:
+    - Область
+    - Город
+    - Долг
+    - Статус
+    """
+
+    search = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Поиск по ИНН, названию, городу'
+    )
+    region_id = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text='ID региона'
+    )
+    city_id = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text='ID города'
+    )
+    has_debt = serializers.BooleanField(
+        required=False,
+        help_text='Только с долгом / без долга'
+    )
+    is_active = serializers.BooleanField(
+        required=False,
+        help_text='Только активные / заблокированные'
+    )
+    approval_status = serializers.ChoiceField(
+        choices=Store.ApprovalStatus.choices,
+        required=False,
+        help_text='Статус одобрения'
+    )
+    min_debt = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        required=False,
+        min_value=Decimal('0'),
+        help_text='Минимальный долг'
+    )
+    max_debt = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        required=False,
+        min_value=Decimal('0'),
+        help_text='Максимальный долг'
+    )
+
+
+# =============================================================================
+# АДМИНИСТРАТИВНЫЕ ДЕЙСТВИЯ
+# =============================================================================
+
+class StoreApproveSerializer(serializers.Serializer):
+    """Сериализатор для одобрения магазина."""
+
+    comment = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        help_text='Комментарий админа'
+    )
+
+
+class StoreRejectSerializer(serializers.Serializer):
+    """Сериализатор для отклонения магазина."""
+
+    reason = serializers.CharField(
+        required=True,
+        max_length=500,
+        help_text='Причина отклонения'
+    )
+
+
+class StoreFreezeSerializer(serializers.Serializer):
+    """Сериализатор для заморозки магазина."""
+
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        help_text='Причина заморозки'
+    )

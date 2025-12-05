@@ -1,501 +1,678 @@
-# apps/stores/services.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
-from django.db import transaction
-from django.core.exceptions import ValidationError
-from django.db.models import Sum, Count, Q
+# apps/stores/services.py - ПОЛНАЯ ВЕРСИЯ v2.0
+"""
+Сервисы для работы с магазинами согласно ТЗ v2.0.
+
+ОСНОВНЫЕ СЕРВИСЫ:
+- StoreService: CRUD магазинов, управление статусами
+- StoreSelectionService: Выбор магазина пользователем
+- StoreInventoryService: Управление инвентарём
+- GeographyService: Управление регионами и городами (админ)
+
+ТЗ v2.0 ТРЕБОВАНИЯ:
+- Общая база магазинов для всех пользователей role='store'
+- Один пользователь только в одном магазине одновременно
+- Несколько пользователей могут быть в одном магазине
+- Инвентарь обновляется при одобрении админом
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional, Dict, Any
-from datetime import date
+from typing import List, Optional, Dict, Any, Tuple
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import QuerySet, Q, Sum, Count
+from django.utils import timezone
 
 from .models import (
-    Store, StoreSelection,
-    StoreProductRequest, StoreRequest, StoreRequestItem,
-    StoreInventory, PartnerInventory
+    Store,
+    StoreSelection,
+    StoreInventory,
+    Region,
+    City,
 )
-from products.models import Product, StoreProductCounter, BonusHistory
 
 
-class StoreProfileService:
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class StoreCreateData:
+    """Данные для создания магазина."""
+    name: str
+    inn: str
+    owner_name: str
+    phone: str
+    region_id: int
+    city_id: int
+    address: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
+@dataclass
+class StoreUpdateData:
+    """Данные для обновления магазина."""
+    name: Optional[str] = None
+    owner_name: Optional[str] = None
+    phone: Optional[str] = None
+    region_id: Optional[int] = None
+    city_id: Optional[int] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
+@dataclass
+class StoreSearchFilters:
+    """Фильтры для поиска магазинов."""
+    search_query: Optional[str] = None  # ИНН, название, город
+    region_id: Optional[int] = None
+    city_id: Optional[int] = None
+    has_debt: Optional[bool] = None
+    is_active: Optional[bool] = None
+    approval_status: Optional[str] = None
+    min_debt: Optional[Decimal] = None
+    max_debt: Optional[Decimal] = None
+
+
+# =============================================================================
+# STORE SERVICE
+# =============================================================================
+
+class StoreService:
     """
-    Сервис для работы с профилем магазина.
-    Обеспечивает CRUD операции после выбора магазина (StoreSelection).
+    Сервис для работы с магазинами.
+
+    Основные операции:
+    - Регистрация магазина
+    - Обновление профиля
+    - Поиск и фильтрация
+    - Управление статусами (одобрение/блокировка)
     """
 
-    @staticmethod
-    def get_current_store(user) -> Optional[Store]:
-        """
-        Получить текущий выбранный магазин пользователя.
-        Возвращает последний выбранный магазин.
-        """
-        selection = StoreSelection.objects.filter(
-            user=user
-        ).select_related('store', 'store__region', 'store__city').order_by('-selected_at').first()
-
-        return selection.store if selection else None
-
-    @staticmethod
-    def get_store_profile(user) -> Optional[Store]:
-        """
-        Получить профиль текущего магазина с prefetch для статистики.
-        """
-        store = StoreProfileService.get_current_store(user)
-        if not store:
-            return None
-
-        # Prefetch связанные данные для оптимизации
-        return Store.objects.select_related(
-            'region', 'city', 'created_by'
-        ).prefetch_related(
-            'orders', 'product_requests', 'requests'
-        ).get(pk=store.pk)
-
-    @staticmethod
+    @classmethod
     @transaction.atomic
-    def update_store_profile(user, data: Dict[str, Any]) -> Store:
+    def create_store(
+            cls,
+            *,
+            data: StoreCreateData,
+            created_by: Optional['User'] = None
+    ) -> Store:
         """
-        Обновить профиль магазина.
-        Разрешено: name, owner_name, phone, region, city, address, latitude, longitude.
-        Запрещено: inn (по ТЗ).
+        Регистрация нового магазина (ТЗ v2.0, раздел 1.4).
+
+        Args:
+            data: Данные магазина
+            created_by: Пользователь, создавший магазин
+
+        Returns:
+            Store в статусе PENDING
+
+        Raises:
+            ValidationError: Если данные некорректны
         """
-        store = StoreProfileService.get_current_store(user)
-        if not store:
-            raise ValidationError('Магазин не выбран. Сначала выберите магазин.')
+        # Проверка: ИНН уникален
+        if Store.objects.filter(inn=data.inn).exists():
+            raise ValidationError(f'Магазин с ИНН {data.inn} уже зарегистрирован')
 
-        # Проверка статуса магазина
-        if not store.is_active:
-            raise ValidationError('Магазин заморожен. Редактирование недоступно.')
+        # Проверка: город принадлежит региону
+        try:
+            city = City.objects.select_related('region').get(pk=data.city_id)
+        except City.DoesNotExist:
+            raise ValidationError(f'Город с ID {data.city_id} не найден')
 
-        if store.approval_status != 'approved':
-            raise ValidationError('Магазин не одобрен. Редактирование недоступно.')
+        if city.region_id != data.region_id:
+            raise ValidationError(
+                f'Город {city.name} не принадлежит выбранному региону'
+            )
 
-        # Блокируем запись для обновления
-        store = Store.objects.select_for_update().get(pk=store.pk)
-
-        # Обновляем разрешённые поля
-        allowed_fields = ['name', 'owner_name', 'phone', 'region', 'city',
-                          'address', 'latitude', 'longitude']
-
-        for field in allowed_fields:
-            if field in data:
-                setattr(store, field, data[field])
-
-        store.full_clean()  # Валидация модели
-        store.save()
+        # Создаём магазин
+        store = Store.objects.create(
+            name=data.name,
+            inn=data.inn,
+            owner_name=data.owner_name,
+            phone=data.phone,
+            region_id=data.region_id,
+            city_id=data.city_id,
+            address=data.address,
+            latitude=data.latitude,
+            longitude=data.longitude,
+            created_by=created_by,
+            approval_status=Store.ApprovalStatus.PENDING
+        )
 
         return store
 
-    @staticmethod
-    def get_store_statistics(store: Store, date_from: date = None, date_to: date = None) -> Dict[str, Any]:
-        """
-        Получить статистику магазина за период.
-        """
-        from orders.models import StoreOrder, StoreOrderItem
-
-        orders_qs = StoreOrder.objects.filter(store=store)
-
-        if date_from:
-            orders_qs = orders_qs.filter(created_at__date__gte=date_from)
-        if date_to:
-            orders_qs = orders_qs.filter(created_at__date__lte=date_to)
-
-        # Агрегация
-        stats = orders_qs.aggregate(
-            total_orders=Count('id'),
-            total_amount=Sum('total_amount'),
-            total_debt=Sum('debt_amount'),
-            total_paid=Sum('paid_amount')
-        )
-
-        # Бонусы
-        bonus_items = StoreOrderItem.objects.filter(
-            order__store=store,
-            is_bonus=True
-        )
-        if date_from:
-            bonus_items = bonus_items.filter(order__created_at__date__gte=date_from)
-        if date_to:
-            bonus_items = bonus_items.filter(order__created_at__date__lte=date_to)
-
-        bonus_stats = bonus_items.aggregate(
-            bonus_count=Count('id'),
-            bonus_quantity=Sum('quantity')
-        )
-
-        return {
-            'total_orders': stats['total_orders'] or 0,
-            'total_amount': stats['total_amount'] or Decimal('0'),
-            'total_debt': stats['total_debt'] or Decimal('0'),
-            'total_paid': stats['total_paid'] or Decimal('0'),
-            'outstanding_debt': store.debt,
-            'bonus_count': bonus_stats['bonus_count'] or 0,
-            'bonus_quantity': bonus_stats['bonus_quantity'] or Decimal('0'),
-            'wishlist_items': store.product_requests.count()
-        }
-
-
-class StoreRequestService:
-    """Сервис работы с запросами магазинов (wishlist)"""
-
-    @staticmethod
-    def get_current_store(user) -> Optional[Store]:
-        """Helper: получить текущий магазин пользователя"""
-        return StoreProfileService.get_current_store(user)
-
-    @staticmethod
+    @classmethod
     @transaction.atomic
-    def add_to_wishlist(user, product: Product, quantity: Decimal) -> StoreProductRequest:
+    def update_store(
+            cls,
+            *,
+            store: Store,
+            data: StoreUpdateData,
+            updated_by: Optional['User'] = None
+    ) -> Store:
         """
-        Добавить товар в wishlist магазина.
-        Если товар уже есть - обновляет количество.
+        Обновление профиля магазина.
+
+        Args:
+            store: Магазин для обновления
+            data: Новые данные
+            updated_by: Кто обновил
+
+        Returns:
+            Обновлённый Store
         """
-        store = StoreRequestService.get_current_store(user)
-        if not store:
-            raise ValidationError('Магазин не выбран.')
+        # Обновляем только предоставленные поля
+        if data.name is not None:
+            store.name = data.name
 
-        if not store.is_active:
-            raise ValidationError('Магазин заморожен. Операции недоступны.')
+        if data.owner_name is not None:
+            store.owner_name = data.owner_name
 
-        if store.approval_status != 'approved':
-            raise ValidationError('Магазин не одобрен.')
+        if data.phone is not None:
+            store.phone = data.phone
 
-        # Валидация количества для весовых товаров
-        if product.is_weight_based:
-            if quantity < Decimal('0.1'):
-                raise ValidationError('Минимальное количество для весового товара: 0.1 кг')
-        else:
-            if quantity < 1 or quantity != int(quantity):
-                raise ValidationError('Для штучного товара количество должно быть целым числом >= 1')
+        if data.address is not None:
+            store.address = data.address
 
-        product_request, created = StoreProductRequest.objects.update_or_create(
-            store=store,
-            product=product,
-            defaults={'quantity': quantity}
-        )
+        if data.latitude is not None:
+            store.latitude = data.latitude
 
-        return product_request
+        if data.longitude is not None:
+            store.longitude = data.longitude
 
-    @staticmethod
-    @transaction.atomic
-    def remove_from_wishlist(user, product: Product) -> bool:
+        # Обновление региона и города
+        if data.region_id is not None or data.city_id is not None:
+            region_id = data.region_id or store.region_id
+            city_id = data.city_id or store.city_id
+
+            city = City.objects.select_related('region').get(pk=city_id)
+
+            if city.region_id != region_id:
+                raise ValidationError('Город должен принадлежать выбранному региону')
+
+            store.region_id = region_id
+            store.city_id = city_id
+
+        store.save()
+        return store
+
+    @classmethod
+    def search_stores(cls, filters: StoreSearchFilters) -> QuerySet[Store]:
         """
-        Удалить товар из wishlist магазина.
-        Возвращает True если удалено, False если не найдено.
+        Поиск и фильтрация магазинов (ТЗ v2.0).
+
+        Поиск по:
+        - ИНН (12-14 цифр)
+        - Название магазина
+        - Город
+
+        Фильтрация по:
+        - Область
+        - Город
+        - Долг (есть/нет, диапазон)
+        - Статус (активный/заблокированный)
+
+        Args:
+            filters: Параметры поиска
+
+        Returns:
+            QuerySet магазинов
         """
-        store = StoreRequestService.get_current_store(user)
-        if not store:
-            raise ValidationError('Магазин не выбран.')
+        queryset = Store.objects.select_related('region', 'city')
 
-        deleted_count, _ = StoreProductRequest.objects.filter(
-            store=store,
-            product=product
-        ).delete()
-
-        return deleted_count > 0
-
-    @staticmethod
-    @transaction.atomic
-    def clear_wishlist(user) -> int:
-        """
-        Очистить весь wishlist магазина.
-        Возвращает количество удалённых позиций.
-        """
-        store = StoreRequestService.get_current_store(user)
-        if not store:
-            raise ValidationError('Магазин не выбран.')
-
-        deleted_count, _ = StoreProductRequest.objects.filter(store=store).delete()
-        return deleted_count
-
-    @staticmethod
-    def get_wishlist(user) -> Dict[str, Any]:
-        """
-        Получить wishlist магазина с итогами.
-        """
-        store = StoreRequestService.get_current_store(user)
-        if not store:
-            raise ValidationError('Магазин не выбран.')
-
-        items = StoreProductRequest.objects.filter(
-            store=store
-        ).select_related('product').order_by('-created_at')
-
-        total_amount = sum(
-            item.quantity * item.product.price for item in items
-        )
-        total_items = items.count()
-
-        return {
-            'store_id': store.id,
-            'store_name': store.name,
-            'items': items,
-            'total_amount': total_amount,
-            'total_items': total_items
-        }
-
-    @staticmethod
-    @transaction.atomic
-    def create_from_product_requests(store, user, note=None, idempotency_key=None):
-        """
-        Создание StoreRequest из StoreProductRequest (snapshot wishlist'а).
-        С защитой от race condition через idempotency_key.
-        """
-        # Проверяем idempotency_key
-        if idempotency_key:
-            existing = StoreRequest.objects.filter(idempotency_key=idempotency_key).first()
-            if existing:
-                return existing
-
-        # Получаем все запросы магазина (wishlist items)
-        product_requests = StoreProductRequest.objects.select_for_update().filter(
-            store=store
-        ).select_related('product')
-
-        if not product_requests.exists():
-            raise ValidationError('Wishlist пуст. Добавьте товары.')
-
-        # Создаём новый StoreRequest
-        store_request = StoreRequest.objects.create(
-            store=store,
-            created_by=user,
-            note=note or '',
-            idempotency_key=idempotency_key
-        )
-
-        # Переносим товары в StoreRequestItem
-        total_amount = Decimal('0')
-        for pr in product_requests:
-            # Валидация весовых товаров
-            if pr.product.is_weight_based:
-                if hasattr(pr.product, 'validate_quantity'):
-                    pr.product.validate_quantity(pr.quantity)
-
-            item = StoreRequestItem.objects.create(
-                request=store_request,
-                product=pr.product,
-                quantity=pr.quantity,
-                price=pr.product.price
+        # Поиск по тексту
+        if filters.search_query:
+            query = filters.search_query.strip()
+            queryset = queryset.filter(
+                Q(inn__icontains=query) |
+                Q(name__icontains=query) |
+                Q(owner_name__icontains=query) |
+                Q(city__name__icontains=query)
             )
-            total_amount += item.quantity * item.price
 
-        # Обновляем общую сумму
-        store_request.total_amount = total_amount
-        store_request.save(update_fields=['total_amount'])
+        # Фильтр по региону
+        if filters.region_id:
+            queryset = queryset.filter(region_id=filters.region_id)
 
-        # Удаляем временные запросы (wishlist очищается после snapshot)
-        product_requests.delete()
+        # Фильтр по городу
+        if filters.city_id:
+            queryset = queryset.filter(city_id=filters.city_id)
 
-        return store_request
+        # Фильтр по долгу
+        if filters.has_debt is not None:
+            if filters.has_debt:
+                queryset = queryset.filter(debt__gt=Decimal('0'))
+            else:
+                queryset = queryset.filter(debt__lte=Decimal('0'))
 
-    @staticmethod
+        # Диапазон долга
+        if filters.min_debt is not None:
+            queryset = queryset.filter(debt__gte=filters.min_debt)
+
+        if filters.max_debt is not None:
+            queryset = queryset.filter(debt__lte=filters.max_debt)
+
+        # Фильтр по статусу
+        if filters.is_active is not None:
+            queryset = queryset.filter(is_active=filters.is_active)
+
+        if filters.approval_status:
+            queryset = queryset.filter(approval_status=filters.approval_status)
+
+        return queryset
+
+    @classmethod
+    def get_stores_by_debt_desc(cls) -> QuerySet[Store]:
+        """
+        Сортировка магазинов по долгу (от большего к меньшему).
+
+        ТЗ: "Сортировка должников от большего к меньшему"
+
+        Returns:
+            QuerySet магазинов, отсортированных по долгу
+        """
+        return Store.objects.filter(
+            debt__gt=Decimal('0')
+        ).select_related('region', 'city').order_by('-debt')
+
+    @classmethod
     @transaction.atomic
-    def cancel_item(request: StoreRequest, item_id: int):
-        """Отменить позицию в запросе"""
-        item = StoreRequestItem.objects.select_for_update().get(
-            id=item_id,
-            request=request
-        )
+    def approve_store(cls, *, store: Store, approved_by: 'User') -> Store:
+        """
+        Одобрить магазин (только админ).
 
-        if item.is_cancelled:
-            raise ValidationError('Позиция уже отменена.')
+        Args:
+            store: Магазин для одобрения
+            approved_by: Админ
 
-        item.is_cancelled = True
-        item.save(update_fields=['is_cancelled'])
+        Returns:
+            Одобренный Store
 
-        # Пересчитываем сумму запроса
-        active_items = request.items.filter(is_cancelled=False)
-        request.total_amount = sum(
-            item.quantity * item.price for item in active_items
-        )
-        request.save(update_fields=['total_amount'])
+        Raises:
+            ValidationError: Если не админ или статус не PENDING
+        """
+        if approved_by.role != 'admin':
+            raise ValidationError('Только администратор может одобрять магазины')
 
-
-class InventoryService:
-    """Управление инвентарём магазинов и партнёров"""
-
-    @staticmethod
-    @transaction.atomic
-    def add_to_inventory(store=None, partner=None, product=None, quantity=0):
-        """Добавить товар в инвентарь"""
-        quantity = Decimal(str(quantity))
-
-        if store:
-            inventory, _ = StoreInventory.objects.select_for_update().get_or_create(
-                store=store,
-                product=product,
-                defaults={'quantity': Decimal('0')}
-            )
-            inventory.quantity += quantity
-            inventory.save(update_fields=['quantity'])
-            return inventory
-        elif partner:
-            inventory, _ = PartnerInventory.objects.select_for_update().get_or_create(
-                partner=partner,
-                product=product,
-                defaults={'quantity': Decimal('0')}
-            )
-            inventory.quantity += quantity
-            inventory.save(update_fields=['quantity'])
-            return inventory
-
-        raise ValueError("Укажите store или partner")
-
-    @staticmethod
-    @transaction.atomic
-    def remove_from_inventory(store=None, partner=None, product=None, quantity=0):
-        """Списать товар из инвентаря"""
-        quantity = Decimal(str(quantity))
-
-        if store:
-            inventory = StoreInventory.objects.select_for_update().filter(
-                store=store,
-                product=product
-            ).first()
-        elif partner:
-            inventory = PartnerInventory.objects.select_for_update().filter(
-                partner=partner,
-                product=product
-            ).first()
-        else:
-            raise ValueError("Укажите store или partner")
-
-        if not inventory or inventory.quantity < quantity:
-            available = inventory.quantity if inventory else Decimal('0')
+        if store.approval_status != Store.ApprovalStatus.PENDING:
             raise ValidationError(
-                f"Недостаточно товара {product.name}. Доступно: {available}"
+                f'Можно одобрить только магазины в статусе "Ожидает одобрения". '
+                f'Текущий статус: {store.get_approval_status_display()}'
             )
 
-        inventory.quantity -= quantity
+        store.approve(approved_by=approved_by)
+        return store
 
-        if inventory.quantity <= Decimal('0'):
-            inventory.delete()
-            return None
-        else:
-            inventory.save(update_fields=['quantity'])
-            return inventory
-
-    @staticmethod
-    def get_inventory(store=None, partner=None):
-        """Получить весь инвентарь"""
-        if store:
-            return StoreInventory.objects.filter(store=store).select_related('product')
-        elif partner:
-            return PartnerInventory.objects.filter(partner=partner).select_related('product')
-        return []
-
-    @staticmethod
+    @classmethod
     @transaction.atomic
-    def transfer_inventory(from_partner=None, to_store=None,
-                           from_store=None, to_partner=None,
-                           product=None, quantity=None):
+    def reject_store(
+            cls,
+            *,
+            store: Store,
+            rejected_by: 'User',
+            reason: str = ''
+    ) -> Store:
         """
-        Универсальный метод переноса инвентаря.
-        Поддерживает: partner -> store и store -> partner.
+        Отклонить магазин (только админ).
+
+        Args:
+            store: Магазин для отклонения
+            rejected_by: Админ
+            reason: Причина отклонения
+
+        Returns:
+            Отклонённый Store
         """
-        quantity = Decimal(str(quantity))
+        if rejected_by.role != 'admin':
+            raise ValidationError('Только администратор может отклонять магазины')
 
-        if from_partner and to_store:
-            # Партнёр -> Магазин
-            InventoryService.remove_from_inventory(
-                partner=from_partner, product=product, quantity=quantity
-            )
-            InventoryService.add_to_inventory(
-                store=to_store, product=product, quantity=quantity
-            )
-        elif from_store and to_partner:
-            # Магазин -> Партнёр (возврат)
-            InventoryService.remove_from_inventory(
-                store=from_store, product=product, quantity=quantity
-            )
-            InventoryService.add_to_inventory(
-                partner=to_partner, product=product, quantity=quantity
-            )
-        else:
-            raise ValueError("Укажите корректные параметры переноса")
+        store.reject(rejected_by=rejected_by, reason=reason)
+        return store
 
-    @staticmethod
-    def check_partner_stock(partner, product, quantity) -> bool:
-        """Проверить наличие товара у партнёра"""
-        quantity = Decimal(str(quantity))
-        inventory = PartnerInventory.objects.filter(
-            partner=partner,
-            product=product
-        ).first()
-
-        if not inventory:
-            return False
-        return inventory.quantity >= quantity
-
-
-class BonusService:
-    """
-    Сервис бонусов.
-    Каждый 21-й товар ВСЕГО бесплатно (не по отдельности для каждого товара).
-    Весовые товары НЕ участвуют в бонусах.
-    """
-
-    @staticmethod
+    @classmethod
     @transaction.atomic
-    def add_product_to_counter(store, partner, product, quantity: int) -> int:
+    def freeze_store(cls, *, store: Store, frozen_by: 'User') -> Store:
         """
-        Добавить товары в счётчик и проверить бонус.
-        Весовые товары не участвуют.
-        """
-        if product.is_weight_based:
-            return 0
+        Заморозить магазин (только админ).
 
-        counter, _ = StoreProductCounter.objects.select_for_update().get_or_create(
+        ТЗ: "При заморозке партнёры не могут с магазином взаимодействовать"
+
+        Args:
+            store: Магазин
+            frozen_by: Админ
+
+        Returns:
+            Замороженный Store
+        """
+        if frozen_by.role != 'admin':
+            raise ValidationError('Только администратор может замораживать магазины')
+
+        store.freeze(frozen_by=frozen_by)
+        return store
+
+    @classmethod
+    @transaction.atomic
+    def unfreeze_store(cls, *, store: Store, unfrozen_by: 'User') -> Store:
+        """
+        Разморозить магазин (только админ).
+
+        Args:
+            store: Магазин
+            unfrozen_by: Админ
+
+        Returns:
+            Размороженный Store
+        """
+        if unfrozen_by.role != 'admin':
+            raise ValidationError('Только администратор может размораживать магазины')
+
+        store.unfreeze(unfrozen_by=unfrozen_by)
+        return store
+
+
+# =============================================================================
+# STORE SELECTION SERVICE
+# =============================================================================
+
+class StoreSelectionService:
+    """
+    Сервис для выбора магазина пользователем.
+
+    ТЗ v2.0 ЛОГИКА:
+    - Один пользователь может быть только в ОДНОМ магазине одновременно
+    - Несколько пользователей могут быть в ОДНОМ магазине
+    - При выборе нового магазина старый автоматически отменяется
+    """
+
+    @classmethod
+    def get_current_store(cls, user: 'User') -> Optional[Store]:
+        """
+        Получить текущий активный магазин пользователя.
+
+        Args:
+            user: Пользователь с role='store'
+
+        Returns:
+            Store или None
+        """
+        return StoreSelection.get_current_store_for_user(user)
+
+    @classmethod
+    @transaction.atomic
+    def select_store(cls, *, user: 'User', store_id: int) -> StoreSelection:
+        """
+        Выбрать магазин для работы.
+
+        ТЗ: "Пользователь может выбрать магазин из списка.
+        Один пользователь может быть только в одном магазине одновременно."
+
+        Args:
+            user: Пользователь
+            store_id: ID магазина
+
+        Returns:
+            StoreSelection
+
+        Raises:
+            ValidationError: Если выбор невозможен
+        """
+        # Проверка роли
+        if user.role != 'store':
+            raise ValidationError(
+                'Только пользователи с ролью "Магазин" могут выбирать магазины'
+            )
+
+        # Получаем магазин
+        try:
+            store = Store.objects.get(pk=store_id)
+        except Store.DoesNotExist:
+            raise ValidationError(f'Магазин с ID {store_id} не найден')
+
+        # Проверка доступности магазина
+        store.check_can_interact()
+
+        # Создаём/обновляем выбор
+        selection = StoreSelection.select_store(user=user, store=store)
+
+        return selection
+
+    @classmethod
+    @transaction.atomic
+    def deselect_store(cls, user: 'User') -> bool:
+        """
+        Отменить выбор текущего магазина.
+
+        Args:
+            user: Пользователь
+
+        Returns:
+            True если выбор был отменён
+        """
+        return StoreSelection.deselect_current_store(user)
+
+    @classmethod
+    def get_available_stores(cls, user: 'User') -> QuerySet[Store]:
+        """
+        Получить список доступных магазинов для выбора.
+
+        ТЗ: "Общая база магазинов для всех пользователей role='store'"
+
+        Args:
+            user: Пользователь
+
+        Returns:
+            QuerySet магазинов (одобренные и активные)
+        """
+        return Store.objects.filter(
+            approval_status=Store.ApprovalStatus.APPROVED,
+            is_active=True
+        ).select_related('region', 'city').order_by('name')
+
+    @classmethod
+    def get_users_in_store(cls, store: Store) -> QuerySet['User']:
+        """
+        Получить список пользователей, работающих в магазине.
+
+        ТЗ: "Несколько пользователей могут быть в одном магазине одновременно"
+
+        Args:
+            store: Магазин
+
+        Returns:
+            QuerySet пользователей
+        """
+        from users.models import User
+
+        user_ids = StoreSelection.objects.filter(
             store=store,
-            partner=partner,
+            is_current=True
+        ).values_list('user_id', flat=True)
+
+        return User.objects.filter(id__in=user_ids)
+
+
+# =============================================================================
+# STORE INVENTORY SERVICE
+# =============================================================================
+
+class StoreInventoryService:
+    """
+    Сервис для управления инвентарём магазина.
+
+    ТЗ v2.0 ЛОГИКА:
+    - Товары добавляются при одобрении заказа админом
+    - Все заказы складываются в один инвентарь
+    - Партнёр может удалить товары при подтверждении
+    """
+
+    @classmethod
+    @transaction.atomic
+    def add_to_inventory(
+            cls,
+            *,
+            store: Store,
+            product: 'Product',
+            quantity: Decimal
+    ) -> StoreInventory:
+        """
+        Добавить товар в инвентарь магазина.
+
+        Используется при одобрении заказа админом.
+
+        Args:
+            store: Магазин
+            product: Товар
+            quantity: Количество
+
+        Returns:
+            StoreInventory
+        """
+        if quantity <= Decimal('0'):
+            raise ValidationError('Количество должно быть больше 0')
+
+        # Получаем или создаём запись в инвентаре
+        inventory, created = StoreInventory.objects.get_or_create(
+            store=store,
             product=product,
-            defaults={
-                'total_count': 0,
-                'product_count': 0
-            }
+            defaults={'quantity': Decimal('0')}
         )
 
-        counter.total_count += quantity
-        counter.product_count += quantity
-        counter.save()
+        # Добавляем количество
+        inventory.add_quantity(quantity)
 
-        # Проверяем бонус (каждый 21-й)
-        bonus_count = 0
-        if counter.check_bonus():
-            bonus_count = counter.total_count // 21
+        return inventory
 
-            BonusHistory.objects.create(
-                store=store,
-                partner=partner,
-                product=product,
-                quantity=bonus_count,
-                bonus_value=product.price * bonus_count
+    @classmethod
+    @transaction.atomic
+    def remove_from_inventory(
+            cls,
+            *,
+            store: Store,
+            product: 'Product',
+            quantity: Decimal
+    ) -> Optional[StoreInventory]:
+        """
+        Удалить товар из инвентаря магазина.
+
+        Используется партнёром при подтверждении заказа.
+
+        Args:
+            store: Магазин
+            product: Товар
+            quantity: Количество
+
+        Returns:
+            StoreInventory или None (если удалена полностью)
+        """
+        try:
+            inventory = StoreInventory.objects.get(store=store, product=product)
+        except StoreInventory.DoesNotExist:
+            raise ValidationError(
+                f'Товар {product.name} не найден в инвентаре магазина {store.name}'
             )
 
-            from django.utils import timezone
-            counter.last_bonus_at = timezone.now()
-            counter.save(update_fields=['last_bonus_at'])
+        # Вычитаем количество (автоматически удаляется если 0)
+        inventory.subtract_quantity(quantity)
 
-        return bonus_count
+        # Проверяем, существует ли ещё запись
+        if StoreInventory.objects.filter(pk=inventory.pk).exists():
+            return inventory
 
-    @staticmethod
-    def get_bonus_status(store, partner, product) -> Dict[str, Any]:
-        """Получить статус бонуса для товара"""
-        counter = StoreProductCounter.objects.filter(
-            store=store,
-            partner=partner,
-            product=product
-        ).first()
+        return None
 
-        if not counter:
-            return {
-                'total_count': 0,
-                'product_count': 0,
-                'next_bonus_at': 21,
-                'bonus_available': False
-            }
+    @classmethod
+    def get_inventory(cls, store: Store) -> QuerySet[StoreInventory]:
+        """
+        Получить весь инвентарь магазина.
 
-        return {
-            'total_count': counter.total_count,
-            'product_count': counter.product_count,
-            'next_bonus_at': 21 - (counter.total_count % 21),
-            'bonus_available': counter.check_bonus(),
-            'last_bonus_at': counter.last_bonus_at
-        }
+        Args:
+            store: Магазин
+
+        Returns:
+            QuerySet инвентаря
+        """
+        return StoreInventory.objects.filter(
+            store=store
+        ).select_related('product').order_by('-last_updated')
+
+    @classmethod
+    def get_inventory_total_value(cls, store: Store) -> Decimal:
+        """
+        Общая стоимость инвентаря магазина.
+
+        Args:
+            store: Магазин
+
+        Returns:
+            Сумма всех товаров в инвентаре
+        """
+        inventory = cls.get_inventory(store)
+
+        total = Decimal('0')
+        for item in inventory:
+            total += item.total_price
+
+        return total
+
+
+# =============================================================================
+# GEOGRAPHY SERVICE
+# =============================================================================
+
+class GeographyService:
+    """
+    Сервис для управления регионами и городами (только админ).
+
+    ТЗ v2.0: "Области и города управляются админом"
+    """
+
+    @classmethod
+    @transaction.atomic
+    def create_region(cls, *, name: str, created_by: 'User') -> Region:
+        """Создать регион (только админ)."""
+        if created_by.role != 'admin':
+            raise ValidationError('Только администратор может создавать регионы')
+
+        if Region.objects.filter(name=name).exists():
+            raise ValidationError(f'Регион "{name}" уже существует')
+
+        return Region.objects.create(name=name)
+
+    @classmethod
+    @transaction.atomic
+    def create_city(
+            cls,
+            *,
+            region_id: int,
+            name: str,
+            created_by: 'User'
+    ) -> City:
+        """Создать город (только админ)."""
+        if created_by.role != 'admin':
+            raise ValidationError('Только администратор может создавать города')
+
+        try:
+            region = Region.objects.get(pk=region_id)
+        except Region.DoesNotExist:
+            raise ValidationError(f'Регион с ID {region_id} не найден')
+
+        if City.objects.filter(region=region, name=name).exists():
+            raise ValidationError(f'Город "{name}" уже существует в регионе {region.name}')
+
+        return City.objects.create(region=region, name=name)
+
+    @classmethod
+    def get_all_regions(cls) -> QuerySet[Region]:
+        """Получить все регионы."""
+        return Region.objects.all().order_by('name')
+
+    @classmethod
+    def get_cities_by_region(cls, region_id: int) -> QuerySet[City]:
+        """Получить города региона."""
+        return City.objects.filter(region_id=region_id).order_by('name')

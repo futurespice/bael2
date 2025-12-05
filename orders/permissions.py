@@ -1,38 +1,37 @@
 # apps/orders/permissions.py
+"""Permissions для orders."""
 
 from rest_framework import permissions
 
 
 class IsAdmin(permissions.BasePermission):
+    """Только администраторы."""
+
     def has_permission(self, request, view):
-        user = request.user
-        return bool(
-            user
-            and user.is_authenticated
-            and (getattr(user, "role", None) == "admin" or user.is_superuser)
+        return (
+                request.user and
+                request.user.is_authenticated and
+                request.user.role == 'admin'
         )
 
 
 class IsPartner(permissions.BasePermission):
+    """Только партнёры."""
+
     def has_permission(self, request, view):
-        user = request.user
-        return bool(
-            user and user.is_authenticated and getattr(user, "role", None) == "partner"
+        return (
+                request.user and
+                request.user.is_authenticated and
+                request.user.role == 'partner'
         )
 
 
-class IsStoreUser(permissions.BasePermission):
+class IsStore(permissions.BasePermission):
+    """Только магазины."""
+
     def has_permission(self, request, view):
-        user = request.user
-        return bool(
-            user and user.is_authenticated and getattr(user, "role", None) == "store"
+        return (
+                request.user and
+                request.user.is_authenticated and
+                request.user.role == 'store'
         )
-
-
-class IsAdminOrPartner(permissions.BasePermission):
-    def has_permission(self, request, view):
-        user = request.user
-        if not user or not user.is_authenticated:
-            return False
-        role = getattr(user, "role", None)
-        return role in {"admin", "partner"} or user.is_superuser
