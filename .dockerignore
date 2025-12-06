@@ -1,0 +1,60 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual Environment
+.venv
+venv
+ENV
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database (SQLite)
+*.sqlite3
+db.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Static & Media (будут собраны в контейнере)
+staticfiles/
+media/
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+
+# Tests
+.pytest_cache
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
+*.tmp
+dump.rdb

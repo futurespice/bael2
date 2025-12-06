@@ -1,0 +1,158 @@
+# docker-compose.yml - Production configuration for БайЭл
+# Nginx настраивается отдельно на сервере через /etc/nginx/sites-available/
+
+services:
+  # ==========================================================================
+  # PostgreSQL Database
+  # ==========================================================================
+  db:
+    image: postgres:16-alpine
+    container_name: baiel_postgres
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=beiel2
+      - POSTGRES_USER=beiel2
+      - POSTGRES_PASSWORD=12345678
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beiel2 -d beiel2"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - baiel_network
+
+  # ==========================================================================
+  # Redis
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: baiel_redis
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - baiel_network
+
+  # ==========================================================================
+  # Django Web Application
+  # ==========================================================================
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: baiel_web
+    restart: always
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --threads 2 --timeout 60"
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+      - logs_volume:/app/logs
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-change-me-in-production}
+      - DATABASE_URL=postgres://beiel2:12345678@db:5432/beiel2
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - EMAIL_HOST=${EMAIL_HOST:-smtp.gmail.com}
+      - EMAIL_PORT=${EMAIL_PORT:-587}
+      - EMAIL_HOST_USER=${EMAIL_HOST_USER}
+      - EMAIL_HOST_PASSWORD=${EMAIL_HOST_PASSWORD}
+      - DEFAULT_FROM_EMAIL=${DEFAULT_FROM_EMAIL:-noreply@baielapp.com.kg}
+      - PARTNER_MARKER=${PARTNER_MARKER:-p!8Rt}
+      - FRONTEND_URL=https://baielapp.com.kg
+      - DOCKER_CONTAINER=true
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - baiel_network
+
+  # ==========================================================================
+  # Celery Worker
+  # ==========================================================================
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: baiel_celery
+    restart: always
+    command: celery -A config worker -l INFO --concurrency=2
+    volumes:
+      - logs_volume:/app/logs
+    environment:
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-change-me-in-production}
+      - DATABASE_URL=postgres://beiel2:12345678@db:5432/beiel2
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DOCKER_CONTAINER=true
+    depends_on:
+      - db
+      - redis
+      - web
+    networks:
+      - baiel_network
+
+  # ==========================================================================
+  # Celery Beat (Scheduler)
+  # ==========================================================================
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: baiel_celery_beat
+    restart: always
+    command: celery -A config beat -l INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - logs_volume:/app/logs
+    environment:
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-change-me-in-production}
+      - DATABASE_URL=postgres://beiel2:12345678@db:5432/beiel2
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DOCKER_CONTAINER=true
+    depends_on:
+      - db
+      - redis
+      - web
+    networks:
+      - baiel_network
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+  logs_volume:
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  baiel_network:
+    driver: bridge
