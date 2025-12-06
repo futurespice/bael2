@@ -68,15 +68,17 @@ class StoreUpdateData:
 
 @dataclass
 class StoreSearchFilters:
-    """Фильтры для поиска магазинов."""
+    """
+    Фильтры для поиска магазинов.
+    
+    ИЗМЕНЕНИЕ v2.0 (требование #5):
+    - Убраны фильтры по долгу: has_debt, min_debt, max_debt
+    """
     search_query: Optional[str] = None  # ИНН, название, город
     region_id: Optional[int] = None
     city_id: Optional[int] = None
-    has_debt: Optional[bool] = None
     is_active: Optional[bool] = None
     approval_status: Optional[str] = None
-    min_debt: Optional[Decimal] = None
-    max_debt: Optional[Decimal] = None
 
 
 # =============================================================================
@@ -131,6 +133,7 @@ class StoreService:
             )
 
         # Создаём магазин
+        # ✅ ИСПРАВЛЕНИЕ v2.0: Автоматическое одобрение магазина
         store = Store.objects.create(
             name=data.name,
             inn=data.inn,
@@ -142,7 +145,7 @@ class StoreService:
             latitude=data.latitude,
             longitude=data.longitude,
             created_by=created_by,
-            approval_status=Store.ApprovalStatus.PENDING
+            approval_status=Store.ApprovalStatus.APPROVED  # ✅ Было PENDING
         )
 
         return store
@@ -215,8 +218,10 @@ class StoreService:
         Фильтрация по:
         - Область
         - Город
-        - Долг (есть/нет, диапазон)
         - Статус (активный/заблокированный)
+
+        ИЗМЕНЕНИЕ v2.0 (требование #5):
+        - Убраны фильтры по долгу
 
         Args:
             filters: Параметры поиска
@@ -243,20 +248,6 @@ class StoreService:
         # Фильтр по городу
         if filters.city_id:
             queryset = queryset.filter(city_id=filters.city_id)
-
-        # Фильтр по долгу
-        if filters.has_debt is not None:
-            if filters.has_debt:
-                queryset = queryset.filter(debt__gt=Decimal('0'))
-            else:
-                queryset = queryset.filter(debt__lte=Decimal('0'))
-
-        # Диапазон долга
-        if filters.min_debt is not None:
-            queryset = queryset.filter(debt__gte=filters.min_debt)
-
-        if filters.max_debt is not None:
-            queryset = queryset.filter(debt__lte=filters.max_debt)
 
         # Фильтр по статусу
         if filters.is_active is not None:
@@ -619,6 +610,154 @@ class StoreInventoryService:
             total += item.total_price
 
         return total
+
+
+# =============================================================================
+# BONUS CALCULATION SERVICE (НОВОЕ v2.0)
+# =============================================================================
+
+class BonusCalculationService:
+    """
+    Сервис для расчёта бонусов в инвентаре магазина (ТЗ v2.0).
+
+    ЛОГИКА БОНУСОВ:
+    - Каждый 21-й товар бесплатно (20 платных + 1 бонусный)
+    - Бонусы применяются ТОЛЬКО к штучным товарам с флагом is_bonus=True
+    - Весовые товары НЕ могут быть бонусными
+    - Бонусы считаются по НАКОПЛЕННОМУ количеству в инвентаре
+
+    ПРИМЕР:
+    - Товар "Мороженое" (is_bonus=True)
+    - Заказ #1: 15 шт → Инвентарь: 15
+    - Заказ #2: 10 шт → Инвентарь: 25
+    - Бонусы = 25 // 21 = 1 бонусный
+    - Платных = 25 - 1 = 24 шт
+    """
+
+    BONUS_THRESHOLD = 21  # Каждый 21-й товар бесплатно
+
+    @classmethod
+    def calculate_bonuses_for_product(
+            cls,
+            total_quantity: int
+    ) -> Dict[str, int]:
+        """
+        Рассчитать бонусы для товара по количеству.
+
+        Args:
+            total_quantity: Общее количество в инвентаре
+
+        Returns:
+            {
+                'total': 25,
+                'bonus_count': 1,
+                'paid_count': 24
+            }
+        """
+        bonus_count = total_quantity // cls.BONUS_THRESHOLD
+        paid_count = total_quantity - bonus_count
+
+        return {
+            'total': total_quantity,
+            'bonus_count': bonus_count,
+            'paid_count': paid_count
+        }
+
+    @classmethod
+    def get_inventory_with_bonuses(
+            cls,
+            store: Store
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить инвентарь магазина с расчётом бонусов.
+
+        Args:
+            store: Магазин
+
+        Returns:
+            List[Dict] с информацией о товарах и бонусах
+        """
+        inventory = StoreInventory.objects.filter(
+            store=store
+        ).select_related('product').order_by('-last_updated')
+
+        result = []
+
+        for item in inventory:
+            product = item.product
+            quantity = int(item.quantity)  # Для бонусов только целые
+
+            item_data = {
+                'id': item.id,
+                'product_id': product.id,
+                'product_name': product.name,
+                'quantity': float(item.quantity),
+                'unit_price': float(product.final_price),
+                'is_weight_based': product.is_weight_based,
+                'is_bonus_product': product.is_bonus,  # Флаг "бонусный товар"
+                'bonus_count': 0,
+                'paid_count': quantity,
+                'total_price': float(item.total_price),
+                'paid_price': float(item.total_price),
+            }
+
+            # Бонусы только для штучных товаров с is_bonus=True
+            if product.is_bonus and not product.is_weight_based:
+                bonus_info = cls.calculate_bonuses_for_product(quantity)
+                item_data['bonus_count'] = bonus_info['bonus_count']
+                item_data['paid_count'] = bonus_info['paid_count']
+                # Платная сумма = paid_count × цена
+                item_data['paid_price'] = float(
+                    Decimal(str(bonus_info['paid_count'])) * product.final_price
+                )
+
+            result.append(item_data)
+
+        return result
+
+    @classmethod
+    def get_total_bonuses_summary(
+            cls,
+            store: Store
+    ) -> Dict[str, Any]:
+        """
+        Сводка по бонусам в инвентаре магазина.
+
+        Args:
+            store: Магазин
+
+        Returns:
+            {
+                'total_bonus_items': 3,
+                'total_bonus_value': 300.00,
+                'products_with_bonuses': [...]
+            }
+        """
+        inventory_with_bonuses = cls.get_inventory_with_bonuses(store)
+
+        total_bonus_items = 0
+        total_bonus_value = Decimal('0')
+        products_with_bonuses = []
+
+        for item in inventory_with_bonuses:
+            if item['bonus_count'] > 0:
+                total_bonus_items += item['bonus_count']
+                bonus_value = Decimal(str(item['bonus_count'])) * Decimal(str(item['unit_price']))
+                total_bonus_value += bonus_value
+
+                products_with_bonuses.append({
+                    'product_name': item['product_name'],
+                    'total_quantity': item['quantity'],
+                    'bonus_count': item['bonus_count'],
+                    'paid_count': item['paid_count'],
+                    'bonus_value': float(bonus_value)
+                })
+
+        return {
+            'total_bonus_items': total_bonus_items,
+            'total_bonus_value': float(total_bonus_value),
+            'products_with_bonuses': products_with_bonuses
+        }
 
 
 # =============================================================================

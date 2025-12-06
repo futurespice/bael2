@@ -1,10 +1,18 @@
-# apps/products/serializers.py
-"""Сериализаторы для products."""
+# apps/products/serializers.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
+"""
+Сериализаторы для products.
+
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
+1. Добавлены сериализаторы для PartnerExpense
+2. Добавлен сериализатор для ProductExpenseRelation CRUD
+3. Добавлен сериализатор для расчёта себестоимости
+"""
 
 from rest_framework import serializers
 from decimal import Decimal
 from .models import (
     Expense,
+    PartnerExpense,
     Product,
     ProductionBatch,
     ProductImage,
@@ -13,11 +21,11 @@ from .models import (
 
 
 # =============================================================================
-# EXPENSE SERIALIZERS
+# EXPENSE SERIALIZERS (PRODUCTION)
 # =============================================================================
 
 class ExpenseSerializer(serializers.ModelSerializer):
-    """Сериализатор расхода."""
+    """Сериализатор расхода на производство."""
 
     expense_type_display = serializers.CharField(
         source='get_expense_type_display',
@@ -45,7 +53,7 @@ class ExpenseSerializer(serializers.ModelSerializer):
 
 
 class ExpenseCreateSerializer(serializers.ModelSerializer):
-    """Создание расхода."""
+    """Создание расхода на производство."""
 
     class Meta:
         model = Expense
@@ -66,6 +74,82 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
                 'Укажите месячную или дневную сумму'
             )
         return attrs
+
+
+# =============================================================================
+# PARTNER EXPENSE SERIALIZERS (НОВОЕ v2.0)
+# =============================================================================
+
+class PartnerExpenseSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор расхода партнёра.
+    
+    ТЗ: "Партнер добавляет расходы: Amount + Description"
+    """
+
+    partner_name = serializers.CharField(
+        source='partner.get_full_name',
+        read_only=True
+    )
+
+    class Meta:
+        model = PartnerExpense
+        fields = [
+            'id',
+            'partner',
+            'partner_name',
+            'amount',
+            'description',
+            'date',
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = ['id', 'partner', 'created_at', 'updated_at']
+
+
+class PartnerExpenseCreateSerializer(serializers.ModelSerializer):
+    """
+    Создание расхода партнёра.
+    
+    Партнёр указывает только amount и description.
+    partner берётся из request.user.
+    """
+
+    class Meta:
+        model = PartnerExpense
+        fields = ['amount', 'description', 'date']
+
+    def validate_amount(self, value):
+        if value <= Decimal('0'):
+            raise serializers.ValidationError('Сумма расхода должна быть больше 0')
+        return value
+
+    def validate_description(self, value):
+        if not value or not value.strip():
+            raise serializers.ValidationError('Описание расхода обязательно')
+        return value.strip()
+
+
+class PartnerExpenseListSerializer(serializers.ModelSerializer):
+    """Сериализатор списка расходов партнёра."""
+
+    partner_name = serializers.CharField(
+        source='partner.get_full_name',
+        read_only=True
+    )
+
+    class Meta:
+        model = PartnerExpense
+        fields = [
+            'id',
+            'partner',
+            'partner_name',
+            'amount',
+            'description',
+            'date',
+            'created_at'
+        ]
+        read_only_fields = ['id', 'partner', 'created_at']
 
 
 # =============================================================================
@@ -220,7 +304,23 @@ class ProductDetailSerializer(serializers.ModelSerializer):
 
 
 class ProductCreateSerializer(serializers.ModelSerializer):
-    """Создание товара."""
+    """Создание товара с возможностью загрузки изображений."""
+    
+    images = serializers.ListField(
+        child=serializers.ImageField(),
+        max_length=3,
+        required=False,
+        write_only=True,
+        help_text='До 3 изображений'
+    )
+    
+    # ✅ ИСПРАВЛЕНИЕ: Явная валидация описания (ТЗ v2.0: до 250 символов)
+    description = serializers.CharField(
+        max_length=250,
+        required=False,
+        allow_blank=True,
+        help_text='Описание товара (до 250 символов)'
+    )
 
     class Meta:
         model = Product
@@ -232,8 +332,21 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             'is_bonus',
             'markup_percentage',
             'stock_quantity',
-            'popularity_weight'
+            'popularity_weight',
+            'images'
         ]
+
+    def validate_name(self, value):
+        """
+        Проверка уникальности названия товара.
+        
+        ТЗ v2.0: "Нельзя добавить два товара с одинаковым названием"
+        """
+        if Product.objects.filter(name__iexact=value.strip()).exists():
+            raise serializers.ValidationError(
+                f'Товар с названием "{value}" уже существует'
+            )
+        return value.strip()
 
     def validate(self, attrs):
         if attrs.get('is_weight_based') and attrs.get('unit') != 'kg':
@@ -247,6 +360,20 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             })
 
         return attrs
+    
+    def create(self, validated_data):
+        images_data = validated_data.pop('images', [])
+        product = Product.objects.create(**validated_data)
+        
+        # Создаём изображения
+        for i, image in enumerate(images_data[:3]):
+            ProductImage.objects.create(
+                product=product,
+                image=image,
+                order=i
+            )
+        
+        return product
 
 
 class ProductUpdateMarkupSerializer(serializers.Serializer):
@@ -284,6 +411,58 @@ class ProductExpenseRelationSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
+class ProductExpenseRelationCreateSerializer(serializers.ModelSerializer):
+    """Создание связи товар-расход."""
+
+    class Meta:
+        model = ProductExpenseRelation
+        fields = ['product', 'expense', 'proportion']
+
+    def validate(self, attrs):
+        # Проверка на дубликат
+        if ProductExpenseRelation.objects.filter(
+            product=attrs['product'],
+            expense=attrs['expense']
+        ).exists():
+            raise serializers.ValidationError(
+                'Связь между этим товаром и расходом уже существует'
+            )
+        return attrs
+
+
+# =============================================================================
+# COST CALCULATION SERIALIZERS (НОВОЕ v2.0)
+# =============================================================================
+
+class CostCalculationRequestSerializer(serializers.Serializer):
+    """Запрос на расчёт себестоимости."""
+    
+    quantity_produced = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+        help_text='Количество произведённого товара'
+    )
+    date = serializers.DateField(
+        required=False,
+        help_text='Дата для расчёта расходов (по умолчанию - сегодня)'
+    )
+
+
+class CostCalculationResultSerializer(serializers.Serializer):
+    """Результат расчёта себестоимости."""
+    
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    quantity_produced = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_daily_expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
+    total_monthly_expenses_per_day = serializers.DecimalField(max_digits=14, decimal_places=2)
+    total_expenses = serializers.DecimalField(max_digits=14, decimal_places=2)
+    cost_price_per_unit = serializers.DecimalField(max_digits=12, decimal_places=2)
+    suggested_final_price = serializers.DecimalField(max_digits=12, decimal_places=2)
+    current_markup_percentage = serializers.DecimalField(max_digits=5, decimal_places=2)
+
+
 # =============================================================================
 # SUMMARY SERIALIZERS
 # =============================================================================
@@ -298,3 +477,12 @@ class ExpenseSummarySerializer(serializers.Serializer):
     expenses_count = serializers.IntegerField()
     physical_count = serializers.IntegerField()
     overhead_count = serializers.IntegerField()
+
+
+class PartnerExpenseSummarySerializer(serializers.Serializer):
+    """Сводка по расходам партнёров."""
+    
+    total_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    expenses_count = serializers.IntegerField()
+    period_start = serializers.DateField()
+    period_end = serializers.DateField()

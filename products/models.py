@@ -1,21 +1,23 @@
-# apps/products/models.py
+# apps/products/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
 """
-Модели для управления товарами и расходами.
+Модели для управления товарами, расходами и расходами партнёров.
 
-КРИТИЧЕСКИ ВАЖНО:
-- ТОЛЬКО АДМИН управляет всем (товары, расходы, производство)
-- Партнёры и магазины ТОЛЬКО читают
-- Цена автоматически рассчитывается с наценкой
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
+1. Добавлена модель PartnerExpense (расходы партнёра)
+2. Расходы партнёра: Amount + Description (по ТЗ)
+3. Расходы партнёра влияют на статистику админа
 """
 
 from decimal import Decimal
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db import models
+from django.utils import timezone
 
 
 # =============================================================================
-# РАСХОДЫ
+# РАСХОДЫ АДМИНА (ПРОИЗВОДСТВЕННЫЕ)
 # =============================================================================
 
 class ExpenseType(models.TextChoices):
@@ -44,7 +46,12 @@ class ApplyType(models.TextChoices):
 
 
 class Expense(models.Model):
-    """Расход (управляется админом)."""
+    """
+    Расход на производство (управляется админом).
+    
+    Это расходы на производство: ингредиенты, аренда, зарплата и т.д.
+    НЕ путать с PartnerExpense (расходы партнёра).
+    """
 
     name = models.CharField(
         max_length=200,
@@ -100,8 +107,8 @@ class Expense(models.Model):
 
     class Meta:
         db_table = 'expenses'
-        verbose_name = 'Расход'
-        verbose_name_plural = 'Расходы'
+        verbose_name = 'Расход (производство)'
+        verbose_name_plural = 'Расходы (производство)'
         ordering = ['name']
         indexes = [
             models.Index(fields=['is_active']),
@@ -110,6 +117,87 @@ class Expense(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.get_expense_type_display()})"
+
+
+# =============================================================================
+# РАСХОДЫ ПАРТНЁРА (НОВАЯ МОДЕЛЬ v2.0)
+# =============================================================================
+
+class PartnerExpense(models.Model):
+    """
+    Расход партнёра (ТЗ v2.0).
+    
+    ТЗ: "Партнер будет добавлять расходы. Для этого нужны поля:
+    1. Amount - сумма расхода
+    2. Description - описание расхода"
+    
+    Расходы партнёра влияют на статистику админа.
+    """
+
+    partner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'partner'},
+        related_name='partner_expenses',
+        verbose_name='Партнёр'
+    )
+
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))],
+        verbose_name='Сумма расхода',
+        help_text='Сумма расхода в сомах'
+    )
+
+    description = models.TextField(
+        verbose_name='Описание расхода',
+        help_text='Причина/описание расхода'
+    )
+
+    date = models.DateField(
+        default=timezone.now,
+        verbose_name='Дата расхода',
+        db_index=True
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name='Дата создания'
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name='Дата обновления'
+    )
+
+    class Meta:
+        db_table = 'partner_expenses'
+        verbose_name = 'Расход партнёра'
+        verbose_name_plural = 'Расходы партнёров'
+        ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['partner', '-date']),
+            models.Index(fields=['date']),
+            models.Index(fields=['-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.partner.get_full_name()}: {self.amount} сом - {self.description[:50]}"
+
+    def clean(self):
+        """Валидация расхода."""
+        super().clean()
+        
+        if self.amount <= Decimal('0'):
+            raise ValidationError({
+                'amount': 'Сумма расхода должна быть больше 0'
+            })
+        
+        if not self.description or not self.description.strip():
+            raise ValidationError({
+                'description': 'Описание расхода обязательно'
+            })
 
 
 # =============================================================================
@@ -130,6 +218,7 @@ class Product(models.Model):
     ВАЖНО:
     - Создаётся админом
     - Цена автоматически: final_price = cost × (1 + markup/100)
+    - Запрещена смена категории "Весовой" → "Штучный"
     """
 
     name = models.CharField(
@@ -140,8 +229,8 @@ class Product(models.Model):
 
     description = models.TextField(
         blank=True,
-        max_length=250,
-        verbose_name='Описание'
+        verbose_name='Описание',
+        help_text='Максимум 250 символов'
     )
 
     is_weight_based = models.BooleanField(
@@ -222,6 +311,7 @@ class Product(models.Model):
         ordering = ['name']
         indexes = [
             models.Index(fields=['is_active', 'is_available']),
+            models.Index(fields=['name']),
         ]
 
     def __str__(self):
@@ -229,6 +319,12 @@ class Product(models.Model):
 
     def clean(self):
         super().clean()
+        
+        # Валидация описания (250 символов)
+        if self.description and len(self.description) > 250:
+            raise ValidationError({
+                'description': 'Описание не может превышать 250 символов'
+            })
 
         if self.is_weight_based and self.unit != ProductUnit.KG:
             raise ValidationError({
@@ -239,6 +335,14 @@ class Product(models.Model):
             raise ValidationError({
                 'is_bonus': 'Весовые товары не могут быть бонусными'
             })
+        
+        # Проверка на смену категории "Весовой" → "Штучный"
+        if self.pk:
+            old_product = Product.objects.filter(pk=self.pk).first()
+            if old_product and old_product.is_weight_based and not self.is_weight_based:
+                raise ValidationError({
+                    'is_weight_based': 'Запрещена смена категории "Весовой" → "Штучный"'
+                })
 
     def save(self, *args, **kwargs):
         """Автоматический расчёт цены."""
@@ -420,4 +524,9 @@ class ProductExpenseRelation(models.Model):
 
     class Meta:
         db_table = 'product_expense_relations'
+        verbose_name = 'Связь товар-расход'
+        verbose_name_plural = 'Связи товар-расход'
         unique_together = ['product', 'expense']
+
+    def __str__(self):
+        return f"{self.product.name} ← {self.expense.name}"

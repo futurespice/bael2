@@ -1,3 +1,12 @@
+# apps/users/managers.py
+"""
+Менеджер пользователей с логикой определения роли по маркеру.
+
+ИЗМЕНЕНИЯ v2.0:
+- Все пользователи автоматически одобряются после регистрации
+- Маркер партнёра определяет роль, но не влияет на approval_status
+"""
+
 from django.contrib.auth.models import BaseUserManager
 from django.conf import settings
 
@@ -6,20 +15,66 @@ PARTNER_MARKER = getattr(settings, 'PARTNER_MARKER', 'p!8Rt')
 
 
 class UserManager(BaseUserManager):
-    """Менеджер пользователей с логикой определения роли по маркеру"""
+    """
+    Менеджер пользователей с логикой определения роли по маркеру.
+    
+    ВАЖНО (ТЗ v2.0):
+    - ВСЕ пользователи автоматически получают approval_status='approved'
+    - Маркер в пароле определяет только роль (partner/store)
+    """
 
-    def _extract_role_from_password(self, password):
-        """Определяет роль по наличию маркера в пароле"""
+    def _extract_role_from_password(self, password: str) -> str:
+        """
+        Определяет роль по наличию маркера в пароле.
+        
+        Args:
+            password: Пароль пользователя
+            
+        Returns:
+            'partner' если маркер найден, иначе 'store'
+        """
         if PARTNER_MARKER in password:
             return 'partner'
         return 'store'
 
-    def _clean_password_from_marker(self, password):
-        """Удаляет маркер из пароля перед сохранением"""
+    def _clean_password_from_marker(self, password: str) -> str:
+        """
+        Удаляет маркер из пароля перед сохранением.
+        
+        Args:
+            password: Пароль с возможным маркером
+            
+        Returns:
+            Очищенный пароль
+        """
         return password.replace(PARTNER_MARKER, '')
 
-    def create_user(self, phone, email, password=None, **extra_fields):
-        """Создает пользователя с автоматическим определением роли"""
+    def create_user(
+        self, 
+        phone: str, 
+        email: str, 
+        password: str = None, 
+        **extra_fields
+    ):
+        """
+        Создает пользователя с автоматическим определением роли.
+        
+        ВАЖНО (ТЗ v2.0):
+        - ВСЕ пользователи автоматически одобряются (approval_status='approved')
+        - Роль определяется по маркеру в пароле
+        
+        Args:
+            phone: Номер телефона (+996XXXXXXXXX)
+            email: Email пользователя
+            password: Пароль (может содержать маркер партнёра)
+            **extra_fields: Дополнительные поля
+            
+        Returns:
+            User: Созданный пользователь
+            
+        Raises:
+            ValueError: Если обязательные поля не указаны
+        """
         if not phone:
             raise ValueError('Номер телефона обязателен')
         if not email:
@@ -37,11 +92,9 @@ class UserManager(BaseUserManager):
         # Очищаем пароль от маркера
         clean_password = self._clean_password_from_marker(password)
 
-        # Партнёры требуют одобрения администратора
-        if role == 'partner':
-            extra_fields.setdefault('approval_status', 'pending')
-        else:
-            extra_fields.setdefault('approval_status', 'approved')
+        # ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ВСЕ пользователи автоматически одобряются
+        # По требованию #1: "Все пользователи после регистрации автоматически проходят регистрацию"
+        extra_fields['approval_status'] = 'approved'
 
         # Создаем пользователя
         user = self.model(phone=phone, email=email, **extra_fields)
@@ -50,8 +103,25 @@ class UserManager(BaseUserManager):
 
         return user
 
-    def create_superuser(self, phone, email, password=None, **extra_fields):
-        """Создает суперпользователя (администратора)"""
+    def create_superuser(
+        self, 
+        phone: str, 
+        email: str, 
+        password: str = None, 
+        **extra_fields
+    ):
+        """
+        Создает суперпользователя (администратора).
+        
+        Args:
+            phone: Номер телефона
+            email: Email
+            password: Пароль
+            **extra_fields: Дополнительные поля
+            
+        Returns:
+            User: Созданный суперпользователь
+        """
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', True)
         extra_fields.setdefault('approval_status', 'approved')

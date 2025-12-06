@@ -45,6 +45,7 @@ INSTALLED_APPS = [
 
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',  # ✅ Добавлено для инвалидации токенов
     'django_filters',
     'corsheaders',
     'drf_spectacular',
@@ -56,6 +57,7 @@ INSTALLED_APPS = [
     'stores',
     'orders',
     'reports',
+    'notifications',
 ]
 
 MIDDLEWARE = [
@@ -174,6 +176,21 @@ REST_FRAMEWORK = {
         'rest_framework.filters.OrderingFilter',
     ],
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    
+    # ==========================================================================
+    # RATE LIMITING (СРЕДНЯЯ проблема #25)
+    # ==========================================================================
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',       # Анонимные: 100 запросов в час
+        'user': '1000/hour',      # Авторизованные: 1000 запросов в час
+        'login': '5/minute',      # Логин: 5 попыток в минуту
+        'password_reset': '3/hour',
+        # Сброс пароля: 3 запроса в час
+    },
 }
 
 SIMPLE_JWT = {
@@ -224,10 +241,13 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@b2b-system.co
 
 # Cache configuration
 # Redis для кэша
+REDIS_HOST = os.environ.get('REDIS_HOST', '127.0.0.1')  # Для Docker: 'redis', для локальной разработки: '127.0.0.1'
+REDIS_PORT = os.environ.get('REDIS_PORT', '6379')
+
 CACHES = {
     'default': {
         'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': 'redis://redis:6379/1',
+        'LOCATION': f'redis://{REDIS_HOST}:{REDIS_PORT}/1',
         'OPTIONS': {
             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
         },

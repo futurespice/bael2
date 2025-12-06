@@ -1,15 +1,20 @@
-# apps/orders/views.py - ПОЛНАЯ ВЕРСИЯ v2.0
+# apps/orders/views.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
 """
 Views для orders согласно ТЗ v2.0.
+
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
+1. УДАЛЁН cancel_items action (по требованию #10)
+2. Добавлен my_orders action для магазина (требование #13)
+3. Добавлена пагинация
 
 API ENDPOINTS:
 1. Заказы магазинов:
    - GET/POST /api/orders/store-orders/
    - GET /api/orders/store-orders/{id}/
+   - GET /api/orders/store-orders/my-orders/ (магазин)
    - POST /api/orders/store-orders/{id}/approve/ (админ)
    - POST /api/orders/store-orders/{id}/reject/ (админ)
    - POST /api/orders/store-orders/{id}/confirm/ (партнёр)
-   - POST /api/orders/store-orders/{id}/cancel-items/ (магазин)
 
 2. Долги:
    - POST /api/orders/store-orders/{id}/pay-debt/
@@ -29,6 +34,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 
 from stores.services import StoreSelectionService
 
@@ -59,6 +65,21 @@ from .services import (
 from .permissions import IsAdmin, IsPartner, IsStore
 
 
+# =============================================================================
+# PAGINATION
+# =============================================================================
+
+class StandardPagination(PageNumberPagination):
+    """Стандартная пагинация."""
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+# =============================================================================
+# STORE ORDER VIEWSET
+# =============================================================================
+
 class StoreOrderViewSet(viewsets.ModelViewSet):
     """
     ViewSet для заказов магазинов (ТЗ v2.0).
@@ -67,16 +88,22 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
     - Админ: все заказы
     - Партнёр: только IN_TRANSIT
     - Магазин: только свои заказы
+
+    ВАЖНО (ТЗ v2.0):
+    - Магазин НЕ может отменять товары (cancel_items удалён)
     """
 
     permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
 
     def get_queryset(self) -> QuerySet[StoreOrder]:
         """Получение заказов в зависимости от роли."""
         user = self.request.user
 
         if user.role == 'admin':
-            return StoreOrder.objects.all()
+            return StoreOrder.objects.all().select_related(
+                'store', 'partner'
+            ).prefetch_related('items__product')
 
         elif user.role == 'partner':
             # Партнёр видит только IN_TRANSIT
@@ -98,6 +125,23 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         elif self.action == 'create':
             return StoreOrderCreateSerializer
         return StoreOrderDetailSerializer
+
+    def list(self, request: Request) -> Response:
+        """Список заказов с пагинацией."""
+        queryset = self.get_queryset()
+        
+        # Фильтрация по статусу
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
     def create(self, request: Request) -> Response:
         """
@@ -150,6 +194,126 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         output = StoreOrderDetailSerializer(order)
         return Response(output.data, status=status.HTTP_201_CREATED)
 
+    # =========================================================================
+    # ACTIONS ДЛЯ МАГАЗИНА (ТЗ v2.0, требование #13)
+    # =========================================================================
+
+    @action(detail=False, methods=['get'], permission_classes=[IsStore])
+    def my_orders(self, request: Request) -> Response:
+        """
+        Заказы магазина (ТЗ v2.0, требование #13).
+
+        GET /api/orders/store-orders/my-orders/
+        GET /api/orders/store-orders/my-orders/?status=pending
+        GET /api/orders/store-orders/my-orders/?start_date=2024-01-01&end_date=2024-12-31
+        
+        Возвращает все заказы текущего магазина с фильтрацией.
+        """
+        store = StoreSelectionService.get_current_store(request.user)
+        
+        if not store:
+            return Response(
+                {'error': 'Выберите магазин для работы'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        orders = StoreOrder.objects.filter(store=store).select_related(
+            'partner'
+        ).prefetch_related('items__product')
+
+        # Фильтрация по статусу
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            orders = orders.filter(status=status_filter)
+
+        # Фильтрация по датам
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        
+        if start_date:
+            orders = orders.filter(created_at__date__gte=start_date)
+        if end_date:
+            orders = orders.filter(created_at__date__lte=end_date)
+
+        # Пагинация
+        page = self.paginate_queryset(orders)
+        if page is not None:
+            serializer = StoreOrderListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreOrderListSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsStore])
+    def order_history(self, request: Request) -> Response:
+        """
+        История заказов магазина.
+
+        GET /api/orders/store-orders/order-history/
+        """
+        store = StoreSelectionService.get_current_store(request.user)
+        
+        if not store:
+            return Response(
+                {'error': 'Выберите магазин для работы'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.ACCEPTED
+        ).select_related('partner').prefetch_related('items__product')
+
+        # Фильтрация по датам
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        
+        if start_date:
+            orders = orders.filter(created_at__date__gte=start_date)
+        if end_date:
+            orders = orders.filter(created_at__date__lte=end_date)
+
+        # Пагинация
+        page = self.paginate_queryset(orders)
+        if page is not None:
+            serializer = StoreOrderDetailSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreOrderDetailSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsStore])
+    def pending_orders(self, request: Request) -> Response:
+        """
+        Заказы в ожидании.
+
+        GET /api/orders/store-orders/pending-orders/
+        """
+        store = StoreSelectionService.get_current_store(request.user)
+        
+        if not store:
+            return Response(
+                {'error': 'Выберите магазин для работы'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.PENDING
+        ).select_related('partner').prefetch_related('items__product')
+
+        page = self.paginate_queryset(orders)
+        if page is not None:
+            serializer = StoreOrderListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreOrderListSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    # =========================================================================
+    # ACTIONS ДЛЯ АДМИНА
+    # =========================================================================
+
     @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
     def approve(self, request: Request, pk=None) -> Response:
         """
@@ -199,6 +363,10 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         output = StoreOrderDetailSerializer(order)
         return Response(output.data)
 
+    # =========================================================================
+    # ACTIONS ДЛЯ ПАРТНЁРА
+    # =========================================================================
+
     @action(detail=True, methods=['post'], permission_classes=[IsPartner])
     def confirm(self, request: Request, pk=None) -> Response:
         """
@@ -225,31 +393,9 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         output = StoreOrderDetailSerializer(order)
         return Response(output.data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsStore])
-    def cancel_items(self, request: Request, pk=None) -> Response:
-        """
-        Магазин отменяет товары (только в статусе PENDING).
-
-        POST /api/orders/store-orders/{id}/cancel-items/
-        Body: {"item_ids": [1, 2, 3]}
-        """
-        order = self.get_object()
-
-        item_ids = request.data.get('item_ids', [])
-        if not item_ids:
-            return Response(
-                {'error': 'item_ids обязателен'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        order = OrderWorkflowService.store_cancel_items(
-            order=order,
-            item_ids_to_cancel=item_ids,
-            cancelled_by=request.user
-        )
-
-        output = StoreOrderDetailSerializer(order)
-        return Response(output.data)
+    # =========================================================================
+    # ОБЩИЕ ACTIONS
+    # =========================================================================
 
     @action(detail=True, methods=['post'])
     def pay_debt(self, request: Request, pk=None) -> Response:
@@ -308,13 +454,25 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         output = DefectiveProductSerializer(defect)
         return Response(output.data, status=status.HTTP_201_CREATED)
 
+    # =========================================================================
+    # ПРИМЕЧАНИЕ: cancel_items УДАЛЁН
+    # По требованию #10: "Магазин НЕ может отменять товары"
+    # =========================================================================
+
+
+# =============================================================================
+# DEFECTIVE PRODUCT VIEWSET
+# =============================================================================
 
 class DefectiveProductViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet для бракованных товаров."""
 
-    queryset = DefectiveProduct.objects.all()
+    queryset = DefectiveProduct.objects.all().select_related(
+        'order__store', 'product'
+    )
     serializer_class = DefectiveProductSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
 
     @action(detail=True, methods=['post'], permission_classes=[IsPartner])
     def approve(self, request: Request, pk=None) -> Response:

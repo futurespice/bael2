@@ -1,4 +1,4 @@
-# apps/reports/services.py - ПОЛНАЯ ВЕРСИЯ v2.0
+# apps/reports/services.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
 """
 Сервисы для статистики и отчётов согласно ТЗ v2.0.
 
@@ -10,6 +10,10 @@
 - Календарная фильтрация (день, неделя, месяц, полгода, год, всё время)
 - Фильтрация по магазинам, городам, областям
 - Общий баланс: доход - брак - расходы - долг
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ:
+1. Используем PartnerExpense вместо Expense для расходов партнёров
+2. Поля date и partner_id теперь корректны
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from django.utils import timezone
 
 from stores.models import Store, Region, City
 from orders.models import StoreOrder, StoreOrderStatus, DebtPayment, DefectiveProduct
-from products.models import Expense  # Расходы партнёров
+from products.models import PartnerExpense  # ✅ ИСПРАВЛЕНО: Было Expense
 
 
 # =============================================================================
@@ -63,7 +67,7 @@ class StatisticsData:
     debt: Decimal  # Непогашенный долг
     paid_debt: Decimal  # Погашенные долги
     defect_amount: Decimal  # Брак
-    expenses: Decimal  # Расходы
+    expenses: Decimal  # Расходы партнёров
 
     # Количественные показатели
     bonus_count: int  # Бонусы (штук)
@@ -202,7 +206,7 @@ class ReportService:
             status=StoreOrderStatus.ACCEPTED,
             confirmed_at__date__gte=start_date,
             confirmed_at__date__lte=end_date
-        )
+        ).select_related('store')
 
         # Фильтрация по магазину
         if filters.store_id:
@@ -269,9 +273,10 @@ class ReportService:
         defect_data = defect_qs.aggregate(total=Sum('total_amount'))
         defect_amount = defect_data['total'] or Decimal('0')
 
-        # === РАСХОДЫ ===
-        # Расходы = сумма всех Expense в периоде
-        expenses_qs = Expense.objects.filter(
+        # === РАСХОДЫ ПАРТНЁРОВ ===
+        # ✅ ИСПРАВЛЕНО: Используем PartnerExpense (не Expense)
+        # Расходы = сумма всех PartnerExpense в периоде
+        expenses_qs = PartnerExpense.objects.filter(
             date__gte=start_date,
             date__lte=end_date
         )
@@ -336,7 +341,7 @@ class ReportService:
 
         return {
             'period': {
-                'type': filters.period,
+                'type': filters.period.value,
                 'start_date': str(start_date),
                 'end_date': str(end_date),
             },
@@ -383,12 +388,13 @@ class ReportService:
             status=StoreOrderStatus.ACCEPTED,
             confirmed_at__date__gte=start_date,
             confirmed_at__date__lte=end_date
-        ).prefetch_related('items__product')
+        ).prefetch_related('items__product').select_related('partner')
 
         for order in orders:
             day_data = {
-                'date': order.confirmed_at.date(),
+                'date': order.confirmed_at.date().isoformat(),
                 'order_id': order.id,
+                'partner_name': order.partner.get_full_name() if order.partner else None,
                 'products': [],
                 'bonus_products': [],
                 'defective_products': [],
@@ -415,7 +421,7 @@ class ReportService:
             defects = DefectiveProduct.objects.filter(
                 order=order,
                 status=DefectiveProduct.DefectStatus.APPROVED
-            )
+            ).select_related('product')
 
             for defect in defects:
                 day_data['defective_products'].append({
@@ -428,3 +434,48 @@ class ReportService:
             history.append(day_data)
 
         return history
+
+    @classmethod
+    def get_partner_expenses_summary(
+            cls,
+            partner_id: Optional[int] = None,
+            start_date: Optional[date] = None,
+            end_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
+        """
+        Сводка по расходам партнёров.
+
+        Args:
+            partner_id: ID партнёра (опционально, если None - все партнёры)
+            start_date: Начальная дата
+            end_date: Конечная дата
+
+        Returns:
+            Dict с суммой и количеством расходов
+        """
+        today = timezone.now().date()
+        start_date = start_date or today.replace(day=1)
+        end_date = end_date or today
+
+        expenses_qs = PartnerExpense.objects.filter(
+            date__gte=start_date,
+            date__lte=end_date
+        )
+
+        if partner_id:
+            expenses_qs = expenses_qs.filter(partner_id=partner_id)
+
+        stats = expenses_qs.aggregate(
+            total_amount=Sum('amount'),
+            count=Count('id')
+        )
+
+        return {
+            'period': {
+                'start_date': str(start_date),
+                'end_date': str(end_date),
+            },
+            'partner_id': partner_id,
+            'total_amount': float(stats['total_amount'] or 0),
+            'expenses_count': stats['count'] or 0,
+        }

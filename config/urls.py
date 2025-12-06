@@ -79,7 +79,7 @@ urlpatterns = [
     path('api/products/', include('products.urls')),
     path('api/stores/', include('stores.urls')),
     path('api/orders/', include('orders.urls')),
-    # path('api/reports/', include('reports.urls')),
+    path('api/reports/', include('reports.urls')),
     # path('api/notifications/', include('notifications.urls')),
 
     # Дополнительные модули (когда будут готовы)

@@ -5,6 +5,84 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# TOKEN SERVICE (НОВОЕ v2.0)
+# =============================================================================
+
+class TokenService:
+    """
+    Сервис для работы с JWT токенами.
+    
+    ТЗ v2.0: При блокировке пользователя токены должны быть инвалидированы.
+    """
+
+    @staticmethod
+    def blacklist_all_user_tokens(user):
+        """
+        Инвалидировать все токены пользователя.
+        
+        Используется при:
+        - Блокировке пользователя
+        - Смене пароля
+        - Выходе изо всех устройств
+        
+        Args:
+            user: Пользователь
+            
+        Returns:
+            int: Количество инвалидированных токенов
+        """
+        try:
+            from rest_framework_simplejwt.token_blacklist.models import OutstandingToken, BlacklistedToken
+            
+            # Получаем все активные токены пользователя
+            tokens = OutstandingToken.objects.filter(user=user)
+            count = 0
+            
+            for token in tokens:
+                # Проверяем, не в blacklist ли уже
+                if not BlacklistedToken.objects.filter(token=token).exists():
+                    BlacklistedToken.objects.create(token=token)
+                    count += 1
+            
+            logger.info(f"Инвалидировано {count} токенов для пользователя {user.id}")
+            return count
+            
+        except ImportError:
+            logger.warning(
+                "Модуль token_blacklist не установлен. "
+                "Добавьте 'rest_framework_simplejwt.token_blacklist' в INSTALLED_APPS"
+            )
+            return 0
+        except Exception as e:
+            logger.error(f"Ошибка инвалидации токенов: {e}")
+            return 0
+
+    @staticmethod
+    def blacklist_token(token_str):
+        """
+        Инвалидировать конкретный refresh токен.
+        
+        Args:
+            token_str: Строка refresh токена
+            
+        Returns:
+            bool: Успешность операции
+        """
+        try:
+            from rest_framework_simplejwt.tokens import RefreshToken
+            
+            token = RefreshToken(token_str)
+            token.blacklist()
+            
+            logger.info("Токен успешно инвалидирован")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка инвалидации токена: {e}")
+            return False
+
+
 class EmailService:
     """Сервис для отправки email уведомлений"""
 

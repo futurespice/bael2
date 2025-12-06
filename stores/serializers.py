@@ -483,8 +483,10 @@ class StoreSearchSerializer(serializers.Serializer):
     Фильтрация по:
     - Область
     - Город
-    - Долг
     - Статус
+    
+    ИЗМЕНЕНИЕ v2.0 (требование #5):
+    - Убраны фильтры по долгу: has_debt, min_debt, max_debt
     """
 
     search = serializers.CharField(
@@ -502,10 +504,6 @@ class StoreSearchSerializer(serializers.Serializer):
         min_value=1,
         help_text='ID города'
     )
-    has_debt = serializers.BooleanField(
-        required=False,
-        help_text='Только с долгом / без долга'
-    )
     is_active = serializers.BooleanField(
         required=False,
         help_text='Только активные / заблокированные'
@@ -515,20 +513,7 @@ class StoreSearchSerializer(serializers.Serializer):
         required=False,
         help_text='Статус одобрения'
     )
-    min_debt = serializers.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-        required=False,
-        min_value=Decimal('0'),
-        help_text='Минимальный долг'
-    )
-    max_debt = serializers.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-        required=False,
-        min_value=Decimal('0'),
-        help_text='Максимальный долг'
-    )
+    # ПРИМЕЧАНИЕ: Фильтры has_debt, min_debt, max_debt удалены по требованию #5
 
 
 # =============================================================================

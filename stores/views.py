@@ -1,6 +1,11 @@
-# apps/stores/views.py - ПОЛНАЯ ВЕРСИЯ v2.0 (ЧАСТЬ 1/2)
+# apps/stores/views.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
 """
 Views для stores согласно ТЗ v2.0.
+
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
+1. Инвентарь скрыт при статусе "В пути" (требование #11)
+2. Удалён фильтр по долгу (требование #5)
+3. Добавлена пагинация
 
 API ENDPOINTS:
 1. Регионы и города (админ):
@@ -34,11 +39,12 @@ from typing import Any, Dict
 
 from django.db.models import QuerySet
 from rest_framework import viewsets, status, generics
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.pagination import PageNumberPagination
 
 from .models import (
     Region,
@@ -68,11 +74,23 @@ from .services import (
     StoreSelectionService,
     StoreInventoryService,
     GeographyService,
+    BonusCalculationService,  # ✅ НОВОЕ v2.0
     StoreCreateData,
     StoreUpdateData,
     StoreSearchFilters,
 )
 from .permissions import IsAdmin, IsStore, IsAdminOrReadOnly
+
+
+# =============================================================================
+# PAGINATION
+# =============================================================================
+
+class StandardPagination(PageNumberPagination):
+    """Стандартная пагинация."""
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
 
 # =============================================================================
@@ -83,13 +101,13 @@ class RegionViewSet(viewsets.ModelViewSet):
     """
     ViewSet для управления регионами (только админ).
 
-    ТЗ v2.0: "Области и города управляются админом (добавление,
-    редактирование, удаление)"
+    ТЗ v2.0: "Области и города управляются админом"
     """
 
     queryset = Region.objects.all()
     serializer_class = RegionSerializer
     permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
 
     def perform_create(self, serializer):
         """Создание региона через сервис."""
@@ -110,6 +128,7 @@ class CityViewSet(viewsets.ModelViewSet):
     queryset = City.objects.select_related('region').all()
     serializer_class = CitySerializer
     permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
     filterset_fields = ['region']
 
     def perform_create(self, serializer):
@@ -134,39 +153,25 @@ class StoreViewSet(viewsets.ModelViewSet):
     - Админ: все операции
     - Партнёр: чтение, поиск, фильтрация
     - Магазин: регистрация, обновление своего профиля, чтение
-
-    ENDPOINTS:
-    - GET /api/stores/ - список магазинов
-    - POST /api/stores/ - регистрация магазина
-    - GET /api/stores/{id}/ - детальная информация
-    - PATCH /api/stores/{id}/ - обновление профиля
     """
 
     permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
 
     def get_queryset(self) -> QuerySet[Store]:
-        """
-        Получение списка магазинов в зависимости от роли.
-
-        - Админ: все магазины
-        - Партнёр: только одобренные и активные
-        - Магазин: только свой выбранный магазин
-        """
+        """Получение списка магазинов в зависимости от роли."""
         user = self.request.user
 
         if user.role == 'admin':
-            # Админ видит все магазины
             queryset = Store.objects.all()
 
         elif user.role == 'partner':
-            # Партнёр видит только одобренные и активные
             queryset = Store.objects.filter(
                 approval_status=Store.ApprovalStatus.APPROVED,
                 is_active=True
             )
 
         elif user.role == 'store':
-            # Магазин видит только свой текущий магазин
             current_store = StoreSelectionService.get_current_store(user)
             if current_store:
                 queryset = Store.objects.filter(pk=current_store.pk)
@@ -189,26 +194,10 @@ class StoreViewSet(viewsets.ModelViewSet):
         return StoreSerializer
 
     def create(self, request: Request, *args, **kwargs) -> Response:
-        """
-        Регистрация нового магазина (ТЗ v2.0, раздел 1.4).
-
-        POST /api/stores/
-
-        Body:
-        {
-            "name": "Мой магазин",
-            "inn": "123456789012",
-            "owner_name": "Иванов Иван",
-            "phone": "+996700000001",
-            "region": 1,
-            "city": 1,
-            "address": "ул. Ленина, 1"
-        }
-        """
+        """Регистрация нового магазина."""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Создаём магазин через сервис
         data = StoreCreateData(
             name=serializer.validated_data['name'],
             inn=serializer.validated_data['inn'],
@@ -226,24 +215,14 @@ class StoreViewSet(viewsets.ModelViewSet):
             created_by=request.user
         )
 
-        # Возвращаем полную информацию
         output_serializer = StoreSerializer(store)
         return Response(output_serializer.data, status=status.HTTP_201_CREATED)
 
     def update(self, request: Request, *args, **kwargs) -> Response:
-        """
-        Обновление профиля магазина.
-
-        PATCH /api/stores/{id}/
-
-        Доступ:
-        - Админ: любой магазин
-        - Магазин: только свой профиль
-        """
+        """Обновление профиля магазина."""
         store = self.get_object()
         user = request.user
 
-        # Проверка доступа
         if user.role == 'store':
             current_store = StoreSelectionService.get_current_store(user)
             if not current_store or current_store.id != store.id:
@@ -256,7 +235,6 @@ class StoreViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(store, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
 
-        # Обновляем через сервис
         data = StoreUpdateData(
             name=serializer.validated_data.get('name'),
             owner_name=serializer.validated_data.get('owner_name'),
@@ -282,38 +260,31 @@ class StoreViewSet(viewsets.ModelViewSet):
         """
         Поиск и фильтрация магазинов (ТЗ v2.0).
 
-        GET /api/stores/search/?search=123&region_id=1&has_debt=true
+        GET /api/stores/search/?search=123&region_id=1
 
+        ИЗМЕНЕНИЕ v2.0: Убран фильтр по долгу (требование #5)
+        
         Параметры:
         - search: Поиск по ИНН, названию, городу
         - region_id: Фильтр по региону
         - city_id: Фильтр по городу
-        - has_debt: Только с долгом / без долга
         - is_active: Только активные / заблокированные
         - approval_status: Статус одобрения
-        - min_debt: Минимальный долг
-        - max_debt: Максимальный долг
         """
-        # Валидация параметров
         search_serializer = StoreSearchSerializer(data=request.query_params)
         search_serializer.is_valid(raise_exception=True)
 
-        # Формируем фильтры
+        # ✅ ИЗМЕНЕНИЕ v2.0: Убраны has_debt, min_debt, max_debt
         filters = StoreSearchFilters(
             search_query=search_serializer.validated_data.get('search'),
             region_id=search_serializer.validated_data.get('region_id'),
             city_id=search_serializer.validated_data.get('city_id'),
-            has_debt=search_serializer.validated_data.get('has_debt'),
             is_active=search_serializer.validated_data.get('is_active'),
             approval_status=search_serializer.validated_data.get('approval_status'),
-            min_debt=search_serializer.validated_data.get('min_debt'),
-            max_debt=search_serializer.validated_data.get('max_debt'),
         )
 
-        # Поиск через сервис
         stores = StoreService.search_stores(filters)
 
-        # Пагинация
         page = self.paginate_queryset(stores)
         if page is not None:
             serializer = StoreListSerializer(page, many=True)
@@ -328,8 +299,6 @@ class StoreViewSet(viewsets.ModelViewSet):
         Список магазинов с долгом (от большего к меньшему).
 
         GET /api/stores/debtors/
-
-        ТЗ: "Сортировка должников от большего к меньшему"
         """
         stores = StoreService.get_stores_by_debt_desc()
 
@@ -343,22 +312,12 @@ class StoreViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='approve', permission_classes=[IsAdmin])
     def approve(self, request: Request, pk=None) -> Response:
-        """
-        Одобрить магазин (только админ).
-
-        POST /api/stores/{id}/approve/
-
-        Body (опционально):
-        {
-            "comment": "Магазин одобрен"
-        }
-        """
+        """Одобрить магазин (только админ)."""
         store = self.get_object()
 
         serializer = StoreApproveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Одобряем через сервис
         store = StoreService.approve_store(
             store=store,
             approved_by=request.user
@@ -369,22 +328,12 @@ class StoreViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='reject', permission_classes=[IsAdmin])
     def reject(self, request: Request, pk=None) -> Response:
-        """
-        Отклонить магазин (только админ).
-
-        POST /api/stores/{id}/reject/
-
-        Body:
-        {
-            "reason": "Неверные данные"
-        }
-        """
+        """Отклонить магазин (только админ)."""
         store = self.get_object()
 
         serializer = StoreRejectSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Отклоняем через сервис
         store = StoreService.reject_store(
             store=store,
             rejected_by=request.user,
@@ -396,19 +345,12 @@ class StoreViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='freeze', permission_classes=[IsAdmin])
     def freeze(self, request: Request, pk=None) -> Response:
-        """
-        Заморозить магазин (только админ).
-
-        POST /api/stores/{id}/freeze/
-
-        ТЗ: "При заморозке партнёры не могут с магазином взаимодействовать"
-        """
+        """Заморозить магазин (только админ)."""
         store = self.get_object()
 
         serializer = StoreFreezeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Замораживаем через сервис
         store = StoreService.freeze_store(
             store=store,
             frozen_by=request.user
@@ -419,14 +361,9 @@ class StoreViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='unfreeze', permission_classes=[IsAdmin])
     def unfreeze(self, request: Request, pk=None) -> Response:
-        """
-        Разморозить магазин (только админ).
-
-        POST /api/stores/{id}/unfreeze/
-        """
+        """Разморозить магазин (только админ)."""
         store = self.get_object()
 
-        # Размораживаем через сервис
         store = StoreService.unfreeze_store(
             store=store,
             unfrozen_by=request.user
@@ -442,37 +379,94 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         GET /api/stores/{id}/inventory/
 
-        ТЗ: "Все заказы складываются в один инвентарь"
+        КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2.0 (требование #11):
+        - Магазин НЕ видит инвентарь, пока есть заказы со статусом "В пути"
+        - Инвентарь становится виден только после статуса "Принят"
         """
         store = self.get_object()
+        user = request.user
+
+        # ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2.0: Проверка для магазина
+        if user.role == 'store':
+            # Импортируем здесь чтобы избежать circular import
+            from orders.models import StoreOrder, StoreOrderStatus
+            
+            # Проверяем есть ли заказы со статусом IN_TRANSIT
+            has_in_transit = StoreOrder.objects.filter(
+                store=store,
+                status=StoreOrderStatus.IN_TRANSIT
+            ).exists()
+            
+            if has_in_transit:
+                return Response(
+                    {
+                        'error': 'Инвентарь недоступен',
+                        'message': 'У вас есть заказы в статусе "В пути". '
+                                   'Инвентарь станет доступен после подтверждения заказов партнёром.'
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         inventory = StoreInventoryService.get_inventory(store)
+
+        page = self.paginate_queryset(inventory)
+        if page is not None:
+            serializer = StoreInventoryListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
 
         serializer = StoreInventoryListSerializer(inventory, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=['get'], url_path='inventory-with-bonuses')
+    def inventory_with_bonuses(self, request: Request, pk=None) -> Response:
+        """
+        Инвентарь магазина с расчётом бонусов (ТЗ v2.0).
 
-# apps/stores/views.py - ПОЛНАЯ ВЕРСИЯ v2.0 (ЧАСТЬ 2/2)
-"""
-Views для выбора магазина и инвентаря.
-"""
+        GET /api/stores/{id}/inventory-with-bonuses/
 
-from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.request import Request
-from rest_framework.response import Response
-from rest_framework.views import APIView
+        ЛОГИКА БОНУСОВ:
+        - Каждый 21-й товар бесплатно (20 платных + 1 бонусный)
+        - Бонусы только для штучных товаров с is_bonus=True
+        - Бонусы считаются по НАКОПЛЕННОМУ количеству в инвентаре
 
-from .models import Store
-from .serializers import (
-    StoreListSerializer,
-    StoreSerializer,
-    StoreSelectionSerializer,
-    StoreSelectionCreateSerializer,
-)
-from .services import StoreSelectionService
-from .permissions import IsStore
+        ПРИМЕР:
+        - Товар "Мороженое" (is_bonus=True)
+        - Заказ #1: 15 шт, Заказ #2: 10 шт → Инвентарь: 25
+        - Бонусы = 25 // 21 = 1 бонусный
+        - Платных = 25 - 1 = 24 шт
+        """
+        store = self.get_object()
+        user = request.user
+
+        # Проверка для магазина: инвентарь скрыт при IN_TRANSIT
+        if user.role == 'store':
+            from orders.models import StoreOrder, StoreOrderStatus
+            
+            has_in_transit = StoreOrder.objects.filter(
+                store=store,
+                status=StoreOrderStatus.IN_TRANSIT
+            ).exists()
+            
+            if has_in_transit:
+                return Response(
+                    {
+                        'error': 'Инвентарь недоступен',
+                        'message': 'У вас есть заказы в статусе "В пути". '
+                                   'Инвентарь станет доступен после подтверждения заказов партнёром.'
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Получаем инвентарь с бонусами
+        inventory_data = BonusCalculationService.get_inventory_with_bonuses(store)
+        summary = BonusCalculationService.get_total_bonuses_summary(store)
+
+        return Response({
+            'store_id': store.id,
+            'store_name': store.name,
+            'inventory': inventory_data,
+            'bonus_summary': summary
+        })
 
 
 # =============================================================================
@@ -484,8 +478,6 @@ class AvailableStoresView(APIView):
     Список доступных магазинов для выбора (только для role='store').
 
     GET /api/stores/available/
-
-    ТЗ: "Общая база магазинов для всех пользователей role='store'"
     """
 
     permission_classes = [IsAuthenticated, IsStore]
@@ -503,14 +495,7 @@ class SelectStoreView(APIView):
     Выбрать магазин для работы (только для role='store').
 
     POST /api/stores/select/
-
-    ТЗ: "Один пользователь может быть только в одном магазине одновременно.
-    Несколько пользователей могут быть в одном магазине."
-
-    Body:
-    {
-        "store_id": 1
-    }
+    Body: {"store_id": 1}
     """
 
     permission_classes = [IsAuthenticated, IsStore]
@@ -520,7 +505,6 @@ class SelectStoreView(APIView):
         serializer = StoreSelectionCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Выбираем магазин через сервис
         selection = StoreSelectionService.select_store(
             user=request.user,
             store_id=serializer.validated_data['store_id']
@@ -535,8 +519,6 @@ class DeselectStoreView(APIView):
     Отменить выбор текущего магазина (только для role='store').
 
     POST /api/stores/deselect/
-
-    ТЗ: "Пользователь может выйти и переключиться на другой магазин"
     """
 
     permission_classes = [IsAuthenticated, IsStore]
@@ -562,8 +544,6 @@ class CurrentStoreView(APIView):
     Получить текущий выбранный магазин (только для role='store').
 
     GET /api/stores/current/
-
-    Возвращает полную информацию о текущем магазине пользователя.
     """
 
     permission_classes = [IsAuthenticated, IsStore]
@@ -583,7 +563,7 @@ class CurrentStoreView(APIView):
 
 
 # =============================================================================
-# ФУНКЦИОНАЛЬНЫЕ VIEWS (ПРОСТЫЕ)
+# ФУНКЦИОНАЛЬНЫЕ VIEWS
 # =============================================================================
 
 @api_view(['GET'])
@@ -593,10 +573,6 @@ def get_current_store_profile(request: Request) -> Response:
     Профиль текущего магазина пользователя.
 
     GET /api/stores/profile/
-
-    ТЗ: "После выбора магазина доступен CRUD профиля через /stores/profile/"
-
-    Алиас для /api/stores/current/
     """
     store = StoreSelectionService.get_current_store(request.user)
 
@@ -617,8 +593,6 @@ def get_users_in_store(request: Request, pk: int) -> Response:
     Список пользователей, работающих в магазине.
 
     GET /api/stores/{id}/users/
-
-    ТЗ: "Несколько пользователей могут быть в одном магазине одновременно"
     """
     try:
         store = Store.objects.get(pk=pk)
@@ -630,7 +604,6 @@ def get_users_in_store(request: Request, pk: int) -> Response:
 
     users = StoreSelectionService.get_users_in_store(store)
 
-    # Простой ответ с именами и ID
     users_data = [
         {
             'id': user.id,

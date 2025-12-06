@@ -1,12 +1,17 @@
-# apps/stores/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ (с default для миграций)
+# apps/stores/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
 """
 Модели для управления магазинами согласно ТЗ v2.0.
+
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
+1. Магазины автоматически одобряются (approval_status='approved' по умолчанию)
+2. Добавлены методы get_cities_count(), get_stores_count() в Region и City
+3. Убрана необходимость ручного одобрения магазинов
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional, List
+from typing import Optional
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -46,6 +51,24 @@ class Region(models.Model):
     def __str__(self) -> str:
         return self.name
 
+    def get_cities_count(self) -> int:
+        """
+        Количество городов в регионе.
+        
+        Returns:
+            int: Количество городов
+        """
+        return self.cities.count()
+
+    def get_stores_count(self) -> int:
+        """
+        Количество магазинов в регионе.
+        
+        Returns:
+            int: Количество магазинов
+        """
+        return self.stores.count()
+
 
 class City(models.Model):
     """Город Кыргызстана."""
@@ -82,6 +105,15 @@ class City(models.Model):
     def __str__(self) -> str:
         return f"{self.name} ({self.region.name})"
 
+    def get_stores_count(self) -> int:
+        """
+        Количество магазинов в городе.
+        
+        Returns:
+            int: Количество магазинов
+        """
+        return self.stores.count()
+
 
 # =============================================================================
 # МАГАЗИН
@@ -94,11 +126,11 @@ class Store(models.Model):
     БИЗНЕС-ЛОГИКА (ТЗ v2.0):
     1. Общая база магазинов для всех пользователей role='store'
     2. Пользователь выбирает магазин через StoreSelection
-    3. Магазин может быть активным или заблокированным админом
-    4. Заблокированный магазин не может создавать/получать заказы
+    3. Магазин автоматически одобряется при создании (approval_status='approved')
+    4. Магазин может быть заблокирован админом (is_active=False)
     5. ИНН - уникальный идентификатор (12-14 цифр)
     6. Поиск по: ИНН, название, город
-    7. Фильтрация по: город, область, долг, погашен
+    7. Фильтрация по: город, область
 
     ФИНАНСЫ:
     - debt: Текущий непогашенный долг
@@ -208,13 +240,14 @@ class Store(models.Model):
     )
 
     # === Статусы ===
+    # ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: default=APPROVED (по требованию #2)
     approval_status = models.CharField(
         max_length=20,
         choices=ApprovalStatus.choices,
-        default=ApprovalStatus.PENDING,
+        default=ApprovalStatus.APPROVED,  # ✅ Автоматическое одобрение
         verbose_name='Статус одобрения',
         db_index=True,
-        help_text='Магазин должен быть одобрен админом для работы'
+        help_text='Магазины автоматически одобряются при создании'
     )
 
     is_active = models.BooleanField(
@@ -270,7 +303,6 @@ class Store(models.Model):
         Проверки:
         1. Город принадлежит выбранному региону
         2. ИНН содержит только цифры
-        3. Телефон в правильном формате
         """
         super().clean()
 
@@ -327,22 +359,11 @@ class Store(models.Model):
         """
         Заморозить магазин (заблокировать).
 
-        ТЗ: "При заморозке магазин не может создавать/получать заказы,
-        партнёры не могут с ним взаимодействовать."
-
         Args:
             frozen_by: Кто заблокировал (обычно админ)
         """
         self.is_active = False
         self.save(update_fields=['is_active', 'updated_at'])
-
-        # TODO: Добавить запись в историю
-        # StoreHistory.objects.create(
-        #     store=self,
-        #     action='frozen',
-        #     changed_by=frozen_by,
-        #     comment='Магазин заблокирован'
-        # )
 
     @transaction.atomic
     def unfreeze(self, *, unfrozen_by: Optional['User'] = None) -> None:
@@ -354,14 +375,6 @@ class Store(models.Model):
         """
         self.is_active = True
         self.save(update_fields=['is_active', 'updated_at'])
-
-        # TODO: Добавить запись в историю
-        # StoreHistory.objects.create(
-        #     store=self,
-        #     action='unfrozen',
-        #     changed_by=unfrozen_by,
-        #     comment='Магазин разблокирован'
-        # )
 
     @transaction.atomic
     def approve(self, *, approved_by: Optional['User'] = None) -> None:
@@ -437,11 +450,6 @@ class StoreSelection(models.Model):
     2. Несколько пользователей могут быть в ОДНОМ магазине одновременно
     3. При выборе нового магазина старый автоматически становится is_current=False
     4. Пользователь может выйти из магазина и выбрать другой
-
-    ПРИМЕРЫ:
-    - User A выбрал Store 1 → User A.current_store = Store 1
-    - User B выбрал Store 1 → User B.current_store = Store 1 (OK!)
-    - User A выбрал Store 2 → User A.current_store = Store 2, старый выбор → is_current=False
     """
 
     user = models.ForeignKey(
@@ -482,14 +490,12 @@ class StoreSelection(models.Model):
         verbose_name = 'Выбор магазина'
         verbose_name_plural = 'Выборы магазинов'
         ordering = ['-selected_at']
-        # ВАЖНО: Один user может выбрать один store только один раз
         unique_together = ['user', 'store']
         indexes = [
             models.Index(fields=['user', 'is_current']),
             models.Index(fields=['store', 'is_current']),
         ]
         constraints = [
-            # КРИТИЧНАЯ ПРОВЕРКА: У пользователя только один активный магазин
             models.UniqueConstraint(
                 fields=['user'],
                 condition=models.Q(is_current=True),
@@ -502,28 +508,19 @@ class StoreSelection(models.Model):
         return f"{self.user.get_full_name()} → {self.store.name}{status}"
 
     def clean(self) -> None:
-        """
-        Валидация выбора магазина.
-
-        Проверки:
-        1. Пользователь имеет роль 'store'
-        2. Магазин одобрен и активен
-        """
+        """Валидация выбора магазина."""
         super().clean()
 
-        # Проверка роли пользователя
         if self.user.role != 'store':
             raise ValidationError({
                 'user': 'Только пользователи с ролью "Магазин" могут выбирать магазины'
             })
 
-        # Проверка: магазин одобрен
         if self.store.approval_status != Store.ApprovalStatus.APPROVED:
             raise ValidationError({
                 'store': f'Магазин "{self.store.name}" не одобрен. Выбор невозможен.'
             })
 
-        # Проверка: магазин активен
         if not self.store.is_active:
             raise ValidationError({
                 'store': f'Магазин "{self.store.name}" заблокирован. Выбор невозможен.'
@@ -531,17 +528,8 @@ class StoreSelection(models.Model):
 
     @transaction.atomic
     def save(self, *args, **kwargs) -> None:
-        """
-        Сохранение с автоматическим сбросом других активных выборов.
-
-        Логика:
-        - Если is_current=True, все другие выборы этого пользователя → is_current=False
-        - Обновляется deselected_at для старых выборов
-        """
-        from django.utils import timezone
-
+        """Сохранение с автоматическим сбросом других активных выборов."""
         if self.is_current:
-            # Находим все активные выборы пользователя кроме текущего
             StoreSelection.objects.filter(
                 user=self.user,
                 is_current=True
@@ -550,22 +538,12 @@ class StoreSelection(models.Model):
                 deselected_at=timezone.now()
             )
 
-        # Валидация перед сохранением
         self.full_clean()
-
         super().save(*args, **kwargs)
 
     @classmethod
     def get_current_store_for_user(cls, user: 'User') -> Optional[Store]:
-        """
-        Получить текущий активный магазин пользователя.
-
-        Args:
-            user: Пользователь с role='store'
-
-        Returns:
-            Store или None
-        """
+        """Получить текущий активный магазин пользователя."""
         selection = cls.objects.filter(
             user=user,
             is_current=True
@@ -576,27 +554,12 @@ class StoreSelection(models.Model):
     @classmethod
     @transaction.atomic
     def select_store(cls, *, user: 'User', store: Store) -> 'StoreSelection':
-        """
-        Выбрать магазин для пользователя.
-
-        Args:
-            user: Пользователь
-            store: Магазин
-
-        Returns:
-            StoreSelection
-
-        Raises:
-            ValidationError: Если пользователь не может выбрать магазин
-        """
-        # Проверка роли
+        """Выбрать магазин для пользователя."""
         if user.role != 'store':
             raise ValidationError('Только пользователи с ролью "Магазин" могут выбирать магазины')
 
-        # Проверка доступности магазина
         store.check_can_interact()
 
-        # Получаем или создаём выбор
         selection, created = cls.objects.get_or_create(
             user=user,
             store=store,
@@ -604,7 +567,6 @@ class StoreSelection(models.Model):
         )
 
         if not created and not selection.is_current:
-            # Если выбор уже был, но неактивен - активируем
             selection.is_current = True
             selection.save()
 
@@ -613,17 +575,7 @@ class StoreSelection(models.Model):
     @classmethod
     @transaction.atomic
     def deselect_current_store(cls, user: 'User') -> bool:
-        """
-        Отменить выбор текущего магазина.
-
-        Args:
-            user: Пользователь
-
-        Returns:
-            True если выбор был отменён, False если не было активного выбора
-        """
-        from django.utils import timezone
-
+        """Отменить выбор текущего магазина."""
         updated = cls.objects.filter(
             user=user,
             is_current=True
@@ -647,18 +599,7 @@ class StoreInventory(models.Model):
     1. Товары добавляются при одобрении заказа админом
     2. Все заказы складываются в ОДИН инвентарь
     3. Партнёр может удалить товары из инвентаря при подтверждении
-    4. Инвентарь показывает текущее наличие товаров у магазина
-
-    WORKFLOW:
-    1. Магазин создаёт заказ → товары НЕ добавляются в инвентарь
-    2. Админ одобряет → товары добавляются в инвентарь
-    3. Партнёр подтверждает → может удалить товары из инвентаря
-    4. После подтверждения → товары остаются в инвентаре (магазин владеет ими)
-
-    ПРИМЕРЫ:
-    - Заказ #1: 10 кг курицы → Админ одобрил → StoreInventory: курица +10 кг
-    - Заказ #2: 5 кг курицы → Админ одобрил → StoreInventory: курица +5 кг = 15 кг
-    - Партнёр подтверждает заказ #2, удаляет 3 кг → StoreInventory: курица -3 кг = 12 кг
+    4. Магазин видит инвентарь только после статуса ACCEPTED
     """
 
     store = models.ForeignKey(
@@ -677,7 +618,7 @@ class StoreInventory(models.Model):
 
     quantity = models.DecimalField(
         max_digits=10,
-        decimal_places=3,  # Для весовых товаров (0.1 кг = 0.100)
+        decimal_places=3,
         default=Decimal('0'),
         validators=[MinValueValidator(Decimal('0'))],
         verbose_name='Количество'
@@ -709,12 +650,7 @@ class StoreInventory(models.Model):
 
     @property
     def total_price(self) -> Decimal:
-        """
-        Общая стоимость товара в инвентаре.
-
-        Returns:
-            quantity * product.final_price
-        """
+        """Общая стоимость товара в инвентаре."""
         if self.product and self.product.final_price:
             return self.quantity * self.product.final_price
         return Decimal('0')
@@ -727,8 +663,6 @@ class StoreInventory(models.Model):
     def clean(self) -> None:
         """Валидация инвентаря."""
         super().clean()
-
-        # Количество не может быть отрицательным
         if self.quantity < Decimal('0'):
             raise ValidationError({
                 'quantity': 'Количество не может быть отрицательным'
@@ -736,15 +670,7 @@ class StoreInventory(models.Model):
 
     @transaction.atomic
     def add_quantity(self, amount: Decimal) -> None:
-        """
-        Добавить количество товара в инвентарь.
-
-        Args:
-            amount: Количество для добавления
-
-        Raises:
-            ValidationError: Если amount <= 0
-        """
+        """Добавить количество товара в инвентарь."""
         if amount <= Decimal('0'):
             raise ValidationError('Количество для добавления должно быть больше 0')
 
@@ -753,15 +679,7 @@ class StoreInventory(models.Model):
 
     @transaction.atomic
     def subtract_quantity(self, amount: Decimal) -> None:
-        """
-        Вычесть количество товара из инвентаря.
-
-        Args:
-            amount: Количество для вычитания
-
-        Raises:
-            ValidationError: Если amount > quantity или amount <= 0
-        """
+        """Вычесть количество товара из инвентаря."""
         if amount <= Decimal('0'):
             raise ValidationError('Количество для вычитания должно быть больше 0')
 
@@ -774,6 +692,5 @@ class StoreInventory(models.Model):
         self.quantity -= amount
         self.save(update_fields=['quantity', 'last_updated'])
 
-        # Если количество стало 0, удаляем запись
         if self.quantity == Decimal('0'):
             self.delete()
