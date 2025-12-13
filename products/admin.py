@@ -139,9 +139,11 @@ class ProductAdmin(admin.ModelAdmin):
 
     def final_price_display(self, obj):
         """Цена продажи."""
+        # ИСПРАВЛЕНО
+        price_formatted = f'{obj.final_price:.2f}'
         return format_html(
-            '<strong>{:.2f} сом</strong>',
-            obj.final_price
+            '<strong>{} сом</strong>',
+            price_formatted
         )
 
     final_price_display.short_description = 'Цена продажи'
@@ -150,10 +152,12 @@ class ProductAdmin(admin.ModelAdmin):
         """Прибыль."""
         profit = obj.profit_per_unit
         color = 'green' if profit > 0 else 'red'
+        # ИСПРАВЛЕНО
+        profit_formatted = f'{profit:.2f}'
         return format_html(
-            '<span style="color: {};">{:.2f} сом</span>',
+            '<span style="color: {};">{} сом</span>',
             color,
-            profit
+            profit_formatted
         )
 
     profit_display.short_description = 'Прибыль/шт'
@@ -210,9 +214,9 @@ class ProductionBatchAdmin(admin.ModelAdmin):
     def total_expenses_display(self, obj):
         """Общие расходы."""
         total = obj.total_daily_expenses + obj.total_monthly_expenses_per_day
-        return format_html('{:.2f} сом', total)
-
-    total_expenses_display.short_description = 'Всего расходов'
+        # ИСПРАВЛЕНО
+        total_formatted = f'{total:.2f}'
+        return format_html('{} сом', total_formatted)
 
 
 @admin.register(ProductImage)

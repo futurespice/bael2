@@ -108,7 +108,9 @@ class StoreInventoryInline(admin.TabularInline):
     def total_price_display(self, obj):
         """Общая стоимость."""
         if obj.id:
-            return format_html('{:.2f} сом', obj.total_price)
+            # ИСПРАВЛЕНО
+            price_formatted = f'{obj.total_price:.2f}'
+            return format_html('{} сом', price_formatted)
         return '-'
 
     total_price_display.short_description = 'Сумма'
@@ -209,26 +211,31 @@ class StoreAdmin(admin.ModelAdmin):
     def total_debt_display(self, obj):
         """Общий долг."""
         color = 'red' if obj.debt > 0 else 'green'
+        debt_formatted = f'{obj.debt:.2f}'
         return format_html(
-            '<span style="color: {}; font-weight: bold;">{:.2f} сом</span>',
-            color, obj.debt
+            '<span style="color: {}; font-weight: bold;">{} сом</span>',
+            color, debt_formatted
         )
 
     total_debt_display.short_description = 'Долг'
 
     def inventory_summary(self, obj):
         """Сводка по инвентарю."""
-        from django.db.models import Count
+        from django.db.models import Count, Sum
 
         stats = obj.inventory.aggregate(
             total_items=Count('id'),
             total_qty=Sum('quantity')
         )
 
+        # ИСПРАВЛЕНО
+        total_qty = stats['total_qty'] or 0
+        qty_formatted = f'{total_qty:.2f}'
+
         return format_html(
-            'Позиций: <strong>{}</strong> | Товаров: <strong>{:.2f}</strong>',
+            'Позиций: <strong>{}</strong> | Товаров: <strong>{}</strong>',
             stats['total_items'] or 0,
-            stats['total_qty'] or 0
+            qty_formatted
         )
 
     inventory_summary.short_description = 'Инвентарь'
@@ -348,6 +355,6 @@ class StoreInventoryAdmin(admin.ModelAdmin):
 
     def total_price_display(self, obj):
         """Общая стоимость."""
-        return format_html('{:.2f} сом', obj.total_price)
-
-    total_price_display.short_description = 'Сумма'
+        # ИСПРАВЛЕНО
+        price_formatted = f'{obj.total_price:.2f}'
+        return format_html('{} сом', price_formatted)
