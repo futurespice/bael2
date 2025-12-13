@@ -68,3 +68,37 @@ class StoreHistoryFiltersSerializer(serializers.Serializer):
                 'start_date должна быть меньше end_date'
             )
         return attrs
+
+
+class StatisticsSerializer(serializers.Serializer):
+    # Финансовые показатели
+    income = serializers.DecimalField(max_digits=14, decimal_places=2)
+    debt = serializers.DecimalField(max_digits=14, decimal_places=2)
+    paid_debt = serializers.DecimalField(max_digits=14, decimal_places=2)
+    defect_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+    # ✅ НОВОЕ: Разделённые расходы
+    partner_expenses = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        help_text='Расходы партнёра (ручной ввод)'
+    )
+    production_expenses = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        help_text='Себестоимость производства'
+    )
+    total_expenses = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        help_text='Общая сумма расходов'
+    )
+
+    # Количественные
+    bonus_count = serializers.IntegerField()
+    orders_count = serializers.IntegerField()
+    products_count = serializers.IntegerField()
+
+    # Вычисляемые
+    total_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
+    profit = serializers.DecimalField(max_digits=14, decimal_places=2)

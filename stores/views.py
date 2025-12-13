@@ -45,6 +45,8 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
+from django.core.exceptions import ValidationError
+
 
 from .models import (
     Region,
@@ -68,6 +70,7 @@ from .serializers import (
     StoreApproveSerializer,
     StoreRejectSerializer,
     StoreFreezeSerializer,
+    StoreUnfreezeSerializer,
 )
 from .services import (
     StoreService,
@@ -172,14 +175,15 @@ class StoreViewSet(viewsets.ModelViewSet):
             )
 
         elif user.role == 'store':
-            current_store = StoreSelectionService.get_current_store(user)
-            if current_store:
-                queryset = Store.objects.filter(pk=current_store.pk)
-            else:
-                queryset = Store.objects.none()
+            queryset = Store.objects.filter(
+                approval_status=Store.ApprovalStatus.APPROVED,
+                is_active=True
+            )
 
         else:
             queryset = Store.objects.none()
+
+        return queryset.select_related('region', 'city').order_by('name')
 
         return queryset.select_related('region', 'city').order_by('-created_at')
 
@@ -343,34 +347,176 @@ class StoreViewSet(viewsets.ModelViewSet):
         output_serializer = StoreSerializer(store)
         return Response(output_serializer.data)
 
-    @action(detail=True, methods=['post'], url_path='freeze', permission_classes=[IsAdmin])
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='freeze',
+        permission_classes=[IsAuthenticated, IsAdmin]
+    )
     def freeze(self, request: Request, pk=None) -> Response:
-        """Заморозить магазин (только админ)."""
+        """
+        Заморозить (заблокировать) магазин.
+
+        Только для администраторов.
+
+        POST /api/stores/{id}/freeze/
+
+        Request Body:
+            {
+                "reason": "Нарушение условий работы"  // опционально
+            }
+
+        Response (Success):
+            {
+                "message": "Магазин 'Название' заморожен",
+                "store": {
+                    "id": 1,
+                    "name": "Название",
+                    "is_active": false,
+                    ...
+                }
+            }
+
+        Response (Error):
+            {
+                "error": "Только администратор может замораживать магазины"
+            }
+
+        Статус коды:
+        - 200: Успешно заморожен
+        - 400: Ошибка валидации (например, уже заморожен)
+        - 403: Недостаточно прав
+        - 404: Магазин не найден
+        """
         store = self.get_object()
 
+        # Валидация входных данных
         serializer = StoreFreezeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        store = StoreService.freeze_store(
-            store=store,
-            frozen_by=request.user
-        )
+        try:
+            # Вызываем сервис для заморозки
+            store = StoreService.freeze_store(
+                store=store,
+                frozen_by=request.user,
+                reason=serializer.validated_data.get('reason', '')
+            )
 
-        output_serializer = StoreSerializer(store)
-        return Response(output_serializer.data)
+            # Формируем успешный ответ
+            output_serializer = StoreSerializer(store)
+            return Response(
+                {
+                    'success': True,
+                    'message': f"Магазин '{store.name}' успешно заморожен",
+                    'store': output_serializer.data
+                },
+                status=status.HTTP_200_OK
+            )
 
-    @action(detail=True, methods=['post'], url_path='unfreeze', permission_classes=[IsAdmin])
+        except ValidationError as e:
+            # Обработка ошибок валидации
+            return Response(
+                {
+                    'success': False,
+                    'error': str(e)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            # Обработка непредвиденных ошибок
+            return Response(
+                {
+                    'success': False,
+                    'error': f'Произошла ошибка при заморозке магазина: {str(e)}'
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='unfreeze',
+        permission_classes=[IsAuthenticated, IsAdmin]
+    )
     def unfreeze(self, request: Request, pk=None) -> Response:
-        """Разморозить магазин (только админ)."""
+        """
+        Разморозить (разблокировать) магазин.
+
+        Только для администраторов.
+
+        POST /api/stores/{id}/unfreeze/
+
+        Request Body:
+            {
+                "comment": "Нарушение устранено"  // опционально
+            }
+
+        Response (Success):
+            {
+                "message": "Магазин 'Название' разморожен",
+                "store": {
+                    "id": 1,
+                    "name": "Название",
+                    "is_active": true,
+                    ...
+                }
+            }
+
+        Response (Error):
+            {
+                "error": "Только администратор может размораживать магазины"
+            }
+
+        Статус коды:
+        - 200: Успешно разморожен
+        - 400: Ошибка валидации (например, уже активен)
+        - 403: Недостаточно прав
+        - 404: Магазин не найден
+        """
         store = self.get_object()
 
-        store = StoreService.unfreeze_store(
-            store=store,
-            unfrozen_by=request.user
-        )
+        # Валидация входных данных
+        serializer = StoreUnfreezeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-        output_serializer = StoreSerializer(store)
-        return Response(output_serializer.data)
+        try:
+            # Вызываем сервис для разморозки
+            store = StoreService.unfreeze_store(
+                store=store,
+                unfrozen_by=request.user,
+                comment=serializer.validated_data.get('comment', '')
+            )
+
+            # Формируем успешный ответ
+            output_serializer = StoreSerializer(store)
+            return Response(
+                {
+                    'success': True,
+                    'message': f"Магазин '{store.name}' успешно разморожен",
+                    'store': output_serializer.data
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except ValidationError as e:
+            # Обработка ошибок валидации
+            return Response(
+                {
+                    'success': False,
+                    'error': str(e)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            # Обработка непредвиденных ошибок
+            return Response(
+                {
+                    'success': False,
+                    'error': f'Произошла ошибка при разморозке магазина: {str(e)}'
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 
     @action(detail=True, methods=['get'], url_path='inventory')
     def inventory(self, request: Request, pk=None) -> Response:

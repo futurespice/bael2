@@ -34,6 +34,11 @@ from .models import (
     City,
 )
 
+import logging
+from django.db import transaction
+from django.core.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # DATA CLASSES
@@ -328,43 +333,76 @@ class StoreService:
 
     @classmethod
     @transaction.atomic
-    def freeze_store(cls, *, store: Store, frozen_by: 'User') -> Store:
-        """
-        Заморозить магазин (только админ).
-
-        ТЗ: "При заморозке партнёры не могут с магазином взаимодействовать"
-
-        Args:
-            store: Магазин
-            frozen_by: Админ
-
-        Returns:
-            Замороженный Store
-        """
+    def freeze_store(
+            cls,
+            *,
+            store: 'Store',
+            frozen_by: 'User',
+            reason: str = ''
+    ) -> 'Store':
+        # Проверка прав доступа
         if frozen_by.role != 'admin':
-            raise ValidationError('Только администратор может замораживать магазины')
+            raise ValidationError(
+                "Только администратор может замораживать магазины. "
+                f"Ваша роль: {frozen_by.get_role_display()}"
+            )
 
-        store.freeze(frozen_by=frozen_by)
+        # Проверка текущего статуса
+        if not store.is_active:
+            raise ValidationError(
+                f"Магазин '{store.name}' уже заморожен и не может быть заморожен повторно."
+            )
+
+        # Замораживаем магазин
+        store.is_active = False
+        store.save(update_fields=['is_active'])
+
+        # Логирование для аудита
+        logger.warning(
+            f"🔒 МАГАЗИН ЗАМОРОЖЕН | "
+            f"ID={store.id} | "
+            f"Название='{store.name}' | "
+            f"Администратор={frozen_by.get_full_name()} (ID={frozen_by.id}) | "
+            f"Причина: {reason or 'Не указана'}"
+        )
+
         return store
 
     @classmethod
     @transaction.atomic
-    def unfreeze_store(cls, *, store: Store, unfrozen_by: 'User') -> Store:
-        """
-        Разморозить магазин (только админ).
-
-        Args:
-            store: Магазин
-            unfrozen_by: Админ
-
-        Returns:
-            Размороженный Store
-        """
+    def unfreeze_store(
+            cls,
+            *,
+            store: 'Store',
+            unfrozen_by: 'User',
+            comment: str = ''
+    ) -> 'Store':
         if unfrozen_by.role != 'admin':
-            raise ValidationError('Только администратор может размораживать магазины')
+            raise ValidationError(
+                "Только администратор может размораживать магазины. "
+                f"Ваша роль: {unfrozen_by.get_role_display()}"
+            )
 
-        store.unfreeze(unfrozen_by=unfrozen_by)
+        # Проверка текущего статуса
+        if store.is_active:
+            raise ValidationError(
+                f"Магазин '{store.name}' уже активен и не требует разморозки."
+            )
+
+        # Размораживаем магазин
+        store.is_active = True
+        store.save(update_fields=['is_active'])
+
+        # Логирование для аудита
+        logger.info(
+            f"🔓 МАГАЗИН РАЗМОРОЖЕН | "
+            f"ID={store.id} | "
+            f"Название='{store.name}' | "
+            f"Администратор={unfrozen_by.get_full_name()} (ID={unfrozen_by.id}) | "
+            f"Комментарий: {comment or 'Не указан'}"
+        )
         return store
+
 
 
 # =============================================================================

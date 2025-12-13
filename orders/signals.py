@@ -190,3 +190,27 @@ def store_order_post_save(sender, instance: StoreOrder, created, **kwargs):
         
         # Отправляем уведомление
         _send_order_status_notification(instance, old_status, instance.status)
+
+
+@receiver(post_save, sender=StoreOrder)
+def handle_order_update(sender, instance, created, **kwargs):
+    # ✅ ИСПРАВЛЕНИЕ ERROR-10: OrderHistory создаётся только в сервисах
+    # Здесь только отправка уведомлений
+
+    if not created and hasattr(instance, 'tracker'):
+        if instance.tracker.has_changed('status'):
+            from notifications.services import NotificationService
+
+            # Уведомление магазину
+            NotificationService.notify_order_status_changed(
+                order=instance,
+                old_status=instance.tracker.previous('status'),
+                new_status=instance.status
+            )
+
+            # Уведомление партнёру
+            if instance.partner:
+                NotificationService.notify_partner_order_update(
+                    partner=instance.partner,
+                    order=instance
+                )

@@ -219,14 +219,28 @@ class ProductImageSerializer(serializers.ModelSerializer):
 # =============================================================================
 
 class ProductListSerializer(serializers.ModelSerializer):
-    """Список товаров."""
+    """
+    Список товаров для партнёров и магазинов.
 
+    СКРЫТО:
+    - average_cost_price (себестоимость)
+    - markup_percentage (процент наценки)
+    - profit_per_unit (прибыль с единицы)
+
+    ВИДНО:
+    - final_price (финальная цена продажи с наценкой)
+    - price_per_100g (для весовых товаров)
+    - stock_quantity (остаток на складе)
+
+    Используется для:
+    - GET /api/products/ (партнёр/магазин)
+    """
+
+    images = serializers.SerializerMethodField()
     unit_display = serializers.CharField(
         source='get_unit_display',
         read_only=True
     )
-
-    main_image = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -238,36 +252,55 @@ class ProductListSerializer(serializers.ModelSerializer):
             'unit_display',
             'is_weight_based',
             'is_bonus',
-            'final_price',
+            'final_price',  # ✅ Только цена продажи
             'price_per_100g',
+            # ❌ СКРЫТО: average_cost_price
+            # ❌ СКРЫТО: markup_percentage
+            # ❌ СКРЫТО: profit_per_unit
             'stock_quantity',
-            'main_image',
+            'is_active',
+            'is_available',
+            'images',
         ]
+        read_only_fields = fields
 
-    def get_main_image(self, obj):
-        main = obj.images.filter(order=0).first()
-        if main:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(main.image.url)
-        return None
+    def get_images(self, obj):
+        """Получить список изображений."""
+        return [
+            {
+                'id': img.id,
+                'image': img.image.url if img.image else None,
+                'order': img.order
+            }
+            for img in obj.images.all()[:3]  # Максимум 3 изображения
+        ]
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
-    """Детали товара."""
+    """
+    Детальная информация о товаре для партнёров и магазинов.
 
+    СКРЫТО:
+    - average_cost_price (себестоимость)
+    - markup_percentage (процент наценки)
+    - profit_per_unit (прибыль с единицы)
+    - expense_relations (связь с расходами)
+
+    ВИДНО:
+    - final_price (финальная цена продажи)
+    - Полное описание
+    - Изображения
+    - Доступность
+
+    Используется для:
+    - GET /api/products/{id}/ (партнёр/магазин)
+    """
+
+    images = serializers.SerializerMethodField()
     unit_display = serializers.CharField(
         source='get_unit_display',
         read_only=True
     )
-
-    profit_per_unit = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        read_only=True
-    )
-
-    images = ProductImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Product
@@ -279,27 +312,169 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'unit_display',
             'is_weight_based',
             'is_bonus',
-            'average_cost_price',
-            'markup_percentage',
-            'final_price',
-            'profit_per_unit',
+            'final_price',  # ✅ Только цена продажи
             'price_per_100g',
+            # ❌ СКРЫТО: average_cost_price
+            # ❌ СКРЫТО: markup_percentage
+            # ❌ СКРЫТО: profit_per_unit
             'stock_quantity',
             'is_active',
             'is_available',
             'popularity_weight',
             'images',
             'created_at',
-            'updated_at'
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_images(self, obj):
+        """Получить список изображений."""
+        return [
+            {
+                'id': img.id,
+                'image': img.image.url if img.image else None,
+                'order': img.order
+            }
+            for img in obj.images.all()
+        ]
+
+
+# =============================================================================
+# СЕРИАЛИЗАТОРЫ ДЛЯ АДМИНИСТРАТОРА (С СЕБЕСТОИМОСТЬЮ)
+# =============================================================================
+
+class ProductAdminListSerializer(serializers.ModelSerializer):
+    """
+    Список товаров для администратора (с себестоимостью и наценкой).
+
+    ВИДНО ТОЛЬКО АДМИНУ:
+    - average_cost_price (себестоимость)
+    - markup_percentage (процент наценки)
+    - profit (прибыль с единицы)
+
+    Используется для:
+    - GET /api/products/ (админ)
+    """
+
+    images = serializers.SerializerMethodField()
+    unit_display = serializers.CharField(
+        source='get_unit_display',
+        read_only=True
+    )
+    profit = serializers.DecimalField(
+        source='profit_per_unit',
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+
+    class Meta:
+        model = Product
+        fields = [
+            'id',
+            'name',
+            'description',
+            'unit',
+            'unit_display',
+            'is_weight_based',
+            'is_bonus',
+            'average_cost_price',  # ✅ Видно только админу
+            'markup_percentage',  # ✅ Видно только админу
+            'final_price',
+            'price_per_100g',
+            'profit',  # ✅ Видно только админу
+            'stock_quantity',
+            'is_active',
+            'is_available',
+            'images',
         ]
         read_only_fields = [
+            'id', 'average_cost_price', 'final_price',
+            'price_per_100g', 'profit', 'created_at', 'updated_at'
+        ]
+
+    def get_images(self, obj):
+        """Получить список изображений."""
+        return [
+            {
+                'id': img.id,
+                'image': img.image.url if img.image else None,
+                'order': img.order
+            }
+            for img in obj.images.all()[:3]
+        ]
+
+
+class ProductAdminDetailSerializer(serializers.ModelSerializer):
+    """
+    Детальная информация о товаре для администратора (полная).
+
+    ВИДНО ТОЛЬКО АДМИНУ:
+    - average_cost_price (себестоимость)
+    - markup_percentage (процент наценки)
+    - profit (прибыль с единицы)
+    - expense_relations (связь с расходами на производство)
+
+    Используется для:
+    - GET /api/products/{id}/ (админ)
+    - PATCH /api/products/{id}/ (админ)
+    """
+
+    images = serializers.SerializerMethodField()
+    unit_display = serializers.CharField(
+        source='get_unit_display',
+        read_only=True
+    )
+    profit = serializers.DecimalField(
+        source='profit_per_unit',
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+
+    # expense_relations = ProductExpenseRelationSerializer(
+    #     many=True,
+    #     read_only=True
+    # )
+
+    class Meta:
+        model = Product
+        fields = [
             'id',
-            'average_cost_price',
+            'name',
+            'description',
+            'unit',
+            'unit_display',
+            'is_weight_based',
+            'is_bonus',
+            'average_cost_price',  # ✅ Видно только админу
+            'markup_percentage',  # ✅ Видно только админу
             'final_price',
-            'profit_per_unit',
             'price_per_100g',
+            'profit',  # ✅ Видно только админу
+            'stock_quantity',
+            'is_active',
+            'is_available',
+            'popularity_weight',
+            'images',
+            # 'expense_relations',   # ✅ Связь с расходами (только админ)
             'created_at',
-            'updated_at'
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'average_cost_price', 'final_price',
+            'price_per_100g', 'profit', 'created_at', 'updated_at'
+        ]
+
+    def get_images(self, obj):
+        """Получить список изображений."""
+        return [
+            {
+                'id': img.id,
+                'image': img.image.url if img.image else None,
+                'order': img.order
+            }
+            for img in obj.images.all()
         ]
 
 

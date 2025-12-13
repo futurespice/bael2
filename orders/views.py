@@ -54,7 +54,7 @@ from .serializers import (
     PayDebtSerializer,
     DefectiveProductSerializer,
     ReportDefectSerializer,
-    OrderHistorySerializer,
+    OrderHistorySerializer, StoreOrderForStoreSerializer,
 )
 from .services import (
     OrderWorkflowService,
@@ -454,15 +454,232 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         output = DefectiveProductSerializer(defect)
         return Response(output.data, status=status.HTTP_201_CREATED)
 
-    # =========================================================================
-    # ПРИМЕЧАНИЕ: cancel_items УДАЛЁН
-    # По требованию #10: "Магазин НЕ может отменять товары"
-    # =========================================================================
+    def retrieve(self, request: Request, pk=None) -> Response:
+        """
+        Детальная информация о заказе.
 
+        GET /api/orders/store-orders/{id}/
 
-# =============================================================================
-# DEFECTIVE PRODUCT VIEWSET
-# =============================================================================
+        ДОСТУП:
+        - Админ: все заказы
+        - Партнёр: только заказы в статусе "В пути"
+        - Магазин: только свои заказы
+
+        Response:
+            {
+                "id": 1,
+                "store": 5,
+                "items": [...],  // Полный список товаров
+                "status": "in_transit",
+                ...
+            }
+
+        Статус коды:
+        - 200: Успешно
+        - 403: Нет доступа к этому заказу
+        - 404: Заказ не найден
+        """
+        order = self.get_object()
+        user = request.user
+
+        # Проверка доступа для магазина
+        if user.role == 'store':
+            store = StoreSelectionService.get_current_store(user)
+            if not store or order.store.id != store.id:
+                return Response(
+                    {
+                        'error': 'У вас нет доступа к этому заказу',
+                        'detail': 'Вы можете просматривать только заказы своего магазина'
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Проверка доступа для партнёра
+        if user.role == 'partner':
+            if order.status != StoreOrderStatus.IN_TRANSIT:
+                return Response(
+                    {
+                        'error': 'У вас нет доступа к этому заказу',
+                        'detail': 'Партнёры могут видеть только заказы в статусе "В пути"'
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Используем детальный сериализатор
+        serializer = StoreOrderDetailSerializer(order)
+        return Response(serializer.data)
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='my-orders',
+        permission_classes=[IsAuthenticated, IsStore]
+    )
+    def my_orders(self, request: Request) -> Response:
+        """
+        Все заказы магазина с полным содержимым.
+
+        КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ:
+        - ✅ Включает поле 'items' с товарами
+        - ✅ Оптимизирован с prefetch_related
+        - ✅ Фильтрация по статусу и датам
+        - ✅ Пагинация
+
+        GET /api/orders/store-orders/my-orders/
+        GET /api/orders/store-orders/my-orders/?status=pending
+        GET /api/orders/store-orders/my-orders/?start_date=2024-01-01&end_date=2024-12-31
+
+        Query Parameters:
+        - status: Фильтр по статусу (pending, in_transit, accepted, rejected)
+        - start_date: Начальная дата (YYYY-MM-DD)
+        - end_date: Конечная дата (YYYY-MM-DD)
+        - page: Номер страницы (по умолчанию 1)
+        - page_size: Размер страницы (по умолчанию 20)
+
+        Response:
+            {
+                "count": 25,
+                "next": "http://.../my-orders/?page=2",
+                "previous": null,
+                "results": [
+                    {
+                        "id": 1,
+                        "items": [  // ✅ КРИТИЧЕСКИ ВАЖНО!
+                            {
+                                "product_name": "Манты",
+                                "quantity": "2.500",
+                                "price": "200.00",
+                                ...
+                            }
+                        ],
+                        ...
+                    }
+                ]
+            }
+
+        Статус коды:
+        - 200: Успешно
+        - 400: Магазин не выбран
+        - 403: Недостаточно прав
+        """
+        # Проверка выбранного магазина
+        store = StoreSelectionService.get_current_store(request.user)
+
+        if not store:
+            return Response(
+                {
+                    'error': 'Магазин не выбран',
+                    'detail': 'Пожалуйста, выберите магазин для просмотра заказов',
+                    'action': 'POST /api/stores/select/ {"store_id": <id>}'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ✅ КРИТИЧЕСКИ ВАЖНО: prefetch_related для избежания N+1 запросов
+        orders = StoreOrder.objects.filter(
+            store=store
+        ).select_related(
+            'partner'  # Оптимизация для партнёра
+        ).prefetch_related(
+            'items__product'  # ✅ КРИТИЧЕСКИ ВАЖНО: Загружаем товары вместе с заказами!
+        ).order_by('-created_at')
+
+        # Фильтрация по статусу
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            # Валидация статуса
+            valid_statuses = [choice[0] for choice in StoreOrderStatus.choices]
+            if status_filter not in valid_statuses:
+                return Response(
+                    {
+                        'error': 'Неверный статус',
+                        'detail': f'Допустимые значения: {", ".join(valid_statuses)}'
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            orders = orders.filter(status=status_filter)
+
+        # Фильтрация по датам
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+
+        if start_date:
+            orders = orders.filter(created_at__date__gte=start_date)
+        if end_date:
+            orders = orders.filter(created_at__date__lte=end_date)
+
+        # Пагинация
+        page = self.paginate_queryset(orders)
+        if page is not None:
+            # ✅ ИСПРАВЛЕНО: Используем новый сериализатор с items
+            serializer = StoreOrderForStoreSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        # Если пагинация отключена
+        serializer = StoreOrderForStoreSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    # =============================================================================
+    # ДОПОЛНИТЕЛЬНО: Быстрые фильтры по статусам
+    # =============================================================================
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='pending',
+        permission_classes=[IsAuthenticated, IsStore]
+    )
+    def pending(self, request: Request) -> Response:
+        """
+        Заказы в ожидании (быстрый фильтр).
+
+        GET /api/orders/store-orders/pending/
+        """
+        store = StoreSelectionService.get_current_store(request.user)
+
+        if not store:
+            return Response(
+                {'error': 'Выберите магазин'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.PENDING
+        ).select_related('partner').prefetch_related('items__product')
+
+        page = self.paginate_queryset(orders)
+        if page:
+            serializer = StoreOrderForStoreSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreOrderForStoreSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='in-transit',
+        permission_classes=[IsAuthenticated, IsStore]
+    )
+    def in_transit(self, request: Request) -> Response:
+        """Заказы в пути."""
+        store = StoreSelectionService.get_current_store(request.user)
+        if not store:
+            return Response({'error': 'Выберите магазин'}, status=400)
+
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.IN_TRANSIT
+        ).select_related('partner').prefetch_related('items__product')
+
+        page = self.paginate_queryset(orders)
+        if page:
+            serializer = StoreOrderForStoreSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreOrderForStoreSerializer(orders, many=True)
+        return Response(serializer.data)
 
 class DefectiveProductViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet для бракованных товаров."""

@@ -19,7 +19,6 @@ from django.utils import timezone
 # =============================================================================
 # РАСХОДЫ АДМИНА (ПРОИЗВОДСТВЕННЫЕ)
 # =============================================================================
-
 class ExpenseType(models.TextChoices):
     """Тип расхода."""
     PHYSICAL = 'physical', 'Физические'
@@ -48,7 +47,7 @@ class ApplyType(models.TextChoices):
 class Expense(models.Model):
     """
     Расход на производство (управляется админом).
-    
+
     Это расходы на производство: ингредиенты, аренда, зарплата и т.д.
     НЕ путать с PartnerExpense (расходы партнёра).
     """
@@ -80,6 +79,46 @@ class Expense(models.Model):
         max_length=10,
         choices=ApplyType.choices,
         default=ApplyType.REGULAR
+    )
+
+    # ✅ НОВЫЕ ПОЛЯ ДЛЯ ERROR-4 (система Сюзерен/Вассал)
+    depends_on_suzerain = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='vassals',
+        limit_choices_to={'expense_status': 'suzerain'},
+        verbose_name='Зависит от Сюзерена',
+        help_text='Только для Вассалов: от какого Сюзерена зависит количество'
+    )
+
+    dependency_ratio = models.DecimalField(
+        max_digits=5,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.001'))],
+        verbose_name='Коэффициент зависимости',
+        help_text='Только для Вассалов: какая пропорция от Сюзерена (например: 0.095)'
+    )
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Количество',
+        help_text='Для Сюзеренов - вводится вручную, для Вассалов - рассчитывается автоматически'
+    )
+
+    unit_cost = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Цена за единицу',
+        help_text='Для расчёта суммы расхода'
     )
 
     monthly_amount = models.DecimalField(
@@ -117,6 +156,61 @@ class Expense(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.get_expense_type_display()})"
+
+    def clean(self):
+        """Валидация расхода с учётом иерархии."""
+        super().clean()
+
+        # Правило 1: Только Вассалы могут зависеть от Сюзеренов
+        if self.depends_on_suzerain and self.expense_status != ExpenseStatus.VASSAL:
+            raise ValidationError({
+                'depends_on_suzerain':
+                    'Только расходы со статусом "Вассал" могут зависеть от Сюзерена'
+            })
+
+        # Правило 2: Вассал ДОЛЖЕН иметь Сюзерена
+        if self.expense_status == ExpenseStatus.VASSAL and not self.depends_on_suzerain:
+            raise ValidationError({
+                'depends_on_suzerain':
+                    'Вассал должен зависеть от Сюзерена. Выберите Сюзерена или измените статус.'
+            })
+
+        # Правило 3: Вассал ДОЛЖЕН иметь коэффициент
+        if self.expense_status == ExpenseStatus.VASSAL and not self.dependency_ratio:
+            raise ValidationError({
+                'dependency_ratio':
+                    'Укажите коэффициент зависимости (например: 0.095 для 9.5%)'
+            })
+
+    def calculate_vassal_quantity(self) -> Decimal:
+        """Рассчитать количество для Вассала."""
+        if self.expense_status != ExpenseStatus.VASSAL:
+            return self.quantity
+
+        if not self.depends_on_suzerain or not self.dependency_ratio:
+            return Decimal('0')
+
+        suzerain_quantity = self.depends_on_suzerain.quantity
+        calculated = suzerain_quantity * self.dependency_ratio
+
+        return calculated.quantize(Decimal('0.001'))
+
+    def calculate_amount(self) -> Decimal:
+        """Рассчитать сумму расхода."""
+        if self.expense_status == ExpenseStatus.VASSAL:
+            vassal_quantity = self.calculate_vassal_quantity()
+            amount = vassal_quantity * self.unit_cost
+            return amount.quantize(Decimal('0.01'))
+
+        return self.daily_amount or self.monthly_amount or Decimal('0')
+
+    def save(self, *args, **kwargs):
+        """Автоматический расчёт при сохранении."""
+        if (self.expense_status == ExpenseStatus.VASSAL and
+                self.expense_state == ExpenseState.AUTOMATIC):
+            self.quantity = self.calculate_vassal_quantity()
+
+        super().save(*args, **kwargs)
 
 
 # =============================================================================

@@ -388,3 +388,132 @@ class OrderHistorySerializer(serializers.ModelSerializer):
 
     def get_changed_by_name(self, obj: OrderHistory) -> str:
         return obj.changed_by.get_full_name() if obj.changed_by else 'Система'
+
+
+class StoreOrderForStoreSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор заказа для магазина (с полным содержимым).
+
+    КРИТИЧЕСКИ ВАЖНО:
+    - Магазин ДОЛЖЕН видеть содержимое своих заказов!
+    - Включает список товаров (items) с названиями, ценами, количеством
+    - Показывает статус заказа и историю изменений
+
+    Использование:
+        GET /api/orders/store-orders/my-orders/
+
+    Response:
+        {
+            "id": 1,
+            "store": 5,
+            "store_name": "Магазин №1",
+            "partner": 3,
+            "partner_name": "Иван Петров",
+            "status": "in_transit",
+            "status_display": "В пути",
+            "total_amount": "5000.00",
+            "prepayment_amount": "1000.00",
+            "debt_amount": "4000.00",
+            "paid_amount": "2000.00",
+            "outstanding_debt": "2000.00",
+            "items": [  // <- ВАЖНО: Содержимое заказа!
+                {
+                    "id": 1,
+                    "product": 10,
+                    "product_name": "Манты",
+                    "product_unit": "kg",
+                    "is_weight_based": true,
+                    "quantity": "2.500",
+                    "price": "200.00",
+                    "total": "500.00",
+                    "is_bonus": false
+                },
+                {
+                    "id": 2,
+                    "product": 15,
+                    "product_name": "Самса",
+                    "product_unit": "piece",
+                    "is_weight_based": false,
+                    "quantity": "20.000",
+                    "price": "50.00",
+                    "total": "1000.00",
+                    "is_bonus": false
+                }
+            ],
+            "created_at": "2024-12-13T10:00:00Z",
+            "reviewed_at": "2024-12-13T11:00:00Z",
+            "confirmed_at": null
+        }
+    """
+
+    # Вложенный сериализатор для товаров (используем уже существующий)
+    items = serializers.SerializerMethodField()
+
+    # Отображаемые названия
+    status_display = serializers.CharField(
+        source='get_status_display',
+        read_only=True,
+        help_text='Текстовое представление статуса'
+    )
+    store_name = serializers.CharField(
+        source='store.name',
+        read_only=True,
+        help_text='Название магазина'
+    )
+    partner_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StoreOrder
+        fields = [
+            'id',
+            'store',
+            'store_name',
+            'partner',
+            'partner_name',
+            'status',
+            'status_display',
+            'total_amount',
+            'prepayment_amount',
+            'debt_amount',
+            'paid_amount',
+            'outstanding_debt',
+            'items',  # ✅ КРИТИЧЕСКИ ВАЖНО: Содержимое заказа!
+            'created_at',
+            'reviewed_at',
+            'confirmed_at',
+        ]
+        read_only_fields = fields
+
+    def get_partner_name(self, obj: StoreOrder) -> str:
+        """Получить имя партнёра."""
+        if obj.partner:
+            return obj.partner.get_full_name()
+        return 'Не назначен'
+
+    def get_items(self, obj: StoreOrder) -> list:
+        """
+        Получить список товаров в заказе.
+
+        Возвращает детальную информацию о каждом товаре:
+        - Название товара
+        - Количество
+        - Цена за единицу
+        - Общая стоимость
+        - Тип товара (весовой/штучный)
+        - Бонусный или нет
+        """
+        items = obj.items.select_related('product').all()
+        return [
+            {
+                'id': item.id,
+                'product': item.product.id,
+                'product_name': item.product.name,
+                'product_unit': item.product.unit,
+                'is_weight_based': item.product.is_weight_based,
+                'quantity': str(item.quantity),
+                'price': str(item.price),
+                'total': str(item.total),
+                'is_bonus': item.is_bonus,
+            }
+            for item in items
+        ]

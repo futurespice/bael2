@@ -36,6 +36,7 @@ ALLOWED_HOSTS = [
     'api.baielapp.com.kg',
     'localhost',
     '127.0.0.1',
+    '147.45.138.17',
 ]
 
 # Для Docker внутренних запросов
@@ -343,7 +344,7 @@ SPECTACULAR_SETTINGS = {
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': '/api/',
     'SERVERS': [
-        {'url': 'https://api.baielapp.com.kg', 'description': 'Production'},
+        {'url': 'https://baielapp.com.kg', 'description': 'Production'},
         {'url': 'http://localhost:8000', 'description': 'Development'},
     ],
 }

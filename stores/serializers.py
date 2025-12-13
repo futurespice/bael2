@@ -542,11 +542,62 @@ class StoreRejectSerializer(serializers.Serializer):
 
 
 class StoreFreezeSerializer(serializers.Serializer):
-    """Сериализатор для заморозки магазина."""
+    """
+    Сериализатор для заморозки магазина.
+
+    POST /api/stores/{id}/freeze/
+    Body: {"reason": "Нарушение условий работы"}
+
+    Поля:
+    - reason: Причина заморозки (опционально, до 500 символов)
+
+    Пример запроса:
+        {
+            "reason": "Долг превысил лимит"
+        }
+    """
 
     reason = serializers.CharField(
+        max_length=500,
         required=False,
         allow_blank=True,
-        max_length=500,
-        help_text='Причина заморозки'
+        help_text='Причина заморозки магазина (опционально)',
+        label='Причина'
     )
+
+    def validate_reason(self, value):
+        """Валидация причины заморозки."""
+        if value and len(value.strip()) == 0:
+            return ''  # Пустая строка вместо пробелов
+        return value.strip() if value else ''
+
+
+class StoreUnfreezeSerializer(serializers.Serializer):
+    """
+    Сериализатор для разморозки магазина.
+
+    POST /api/stores/{id}/unfreeze/
+    Body: {"comment": "Нарушение устранено"}
+
+    Поля:
+    - comment: Комментарий к разморозке (опционально, до 500 символов)
+
+    Пример запроса:
+        {
+            "comment": "Долг погашен полностью"
+        }
+    """
+
+    comment = serializers.CharField(
+        max_length=500,
+        required=False,
+        allow_blank=True,
+        help_text='Комментарий к разморозке магазина (опционально)',
+        label='Комментарий'
+    )
+
+    def validate_comment(self, value):
+        """Валидация комментария."""
+        if value and len(value.strip()) == 0:
+            return ''  # Пустая строка вместо пробелов
+        return value.strip() if value else ''

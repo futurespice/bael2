@@ -93,88 +93,232 @@ class OrderWorkflowService:
         """
         Магазин создаёт заказ у админа (ТЗ v2.0).
 
+        КРИТИЧЕСКИЕ ПРОВЕРКИ (ИСПРАВЛЕНИЯ #4 и #5):
+        ✅ 1. Магазин должен быть активным (is_active=True)
+        ✅ 2. Магазин должен быть одобрен (approval_status=APPROVED)
+        ✅ 3. Товар должен быть в наличии (stock_quantity >= quantity)
+        ✅ 4. Товар должен быть активным (is_active=True)
+        ✅ 5. Для весовых товаров: минимум 1 кг, шаг 0.1 кг
+
+        WORKFLOW:
+        1. Магазин создаёт заказ → статус PENDING
+        2. Товары НЕ уходят из инвентаря сразу
+        3. Товары добавляются в инвентарь только после одобрения админом
+
         Args:
-            store: Магазин
-            items_data: Список товаров
-            created_by: Пользователь
-            idempotency_key: Защита от дублирования
+            store: Магазин, создающий заказ
+            items_data: Список товаров для заказа
+            created_by: Пользователь (опционально)
+            idempotency_key: Ключ для защиты от дублирования (опционально)
 
         Returns:
-            StoreOrder в статусе PENDING
+            StoreOrder: Созданный заказ в статусе PENDING
 
         Raises:
-            ValidationError: Если магазин заморожен или данные некорректны
-        """
-        # Проверка: магазин активен
-        store.check_can_interact()
+            ValidationError: При нарушении любого из бизнес-правил
 
-        # Проверка idempotency
+        Example:
+            >>> items = [
+            ...     OrderItemData(product_id=1, quantity=Decimal('10')),
+            ...     OrderItemData(product_id=2, quantity=Decimal('2.5')),
+            ... ]
+            >>> order = OrderWorkflowService.create_store_order(
+            ...     store=my_store,
+            ...     items_data=items,
+            ...     created_by=user
+            ... )
+        """
+
+        # =========================================================================
+        # ✅ КРИТИЧЕСКАЯ ПРОВЕРКА #4: Магазин должен быть активным
+        # =========================================================================
+        if not store.is_active:
+            raise ValidationError(
+                f"Магазин '{store.name}' заблокирован и не может создавать заказы. "
+                f"Обратитесь к администратору для разблокировки. "
+                f"Причина блокировки может быть связана с нарушением условий работы или задолженностью."
+            )
+
+        # =========================================================================
+        # ✅ ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Магазин должен быть одобрен
+        # =========================================================================
+        if store.approval_status != Store.ApprovalStatus.APPROVED:
+            raise ValidationError(
+                f"Магазин '{store.name}' не одобрен администратором. "
+                f"Текущий статус: {store.get_approval_status_display()}. "
+                f"Дождитесь одобрения администратором перед созданием заказов. "
+                f"Для ускорения процесса обратитесь в службу поддержки."
+            )
+
+        # =========================================================================
+        # ПРОВЕРКА IDEMPOTENCY (защита от дублирования)
+        # =========================================================================
         if idempotency_key:
-            existing = StoreOrder.objects.filter(
+            existing_order = StoreOrder.objects.filter(
                 idempotency_key=idempotency_key
             ).first()
-            if existing:
-                return existing
 
-        # Создаём заказ
+            if existing_order:
+                # Заказ с таким ключом уже существует - возвращаем его
+                return existing_order
+
+        # =========================================================================
+        # ✅ КРИТИЧЕСКАЯ ПРОВЕРКА #5: Проверка товаров
+        # =========================================================================
+
+        # Проверка что есть хотя бы один товар
+        if not items_data or len(items_data) == 0:
+            raise ValidationError(
+                "Заказ должен содержать хотя бы один товар. "
+                "Добавьте товары в заказ и попробуйте снова."
+            )
+
+        # Собираем ID всех товаров из заказа
+        product_ids = [item.product_id for item in items_data]
+
+        # Загружаем все товары одним запросом (оптимизация N+1)
+        products = Product.objects.filter(pk__in=product_ids)
+        products_dict = {p.id: p for p in products}
+
+        # Проверяем каждый товар в заказе
+        for item in items_data:
+            product_id = item.product_id
+
+            # ✅ ПРОВЕРКА #5a: Товар существует
+            if product_id not in products_dict:
+                raise ValidationError(
+                    f"Товар с ID={product_id} не найден в каталоге. "
+                    f"Возможно, товар был удалён администратором. "
+                    f"Обновите список товаров и попробуйте снова."
+                )
+
+            product = products_dict[product_id]
+
+            # ✅ ПРОВЕРКА #5b: Товар активен
+            if not product.is_active:
+                raise ValidationError(
+                    f"Товар '{product.name}' недоступен для заказа. "
+                    f"Товар был деактивирован администратором. "
+                    f"Пожалуйста, выберите другой товар из каталога."
+                )
+
+            # ✅ ПРОВЕРКА #5c: Наличие на складе (stock_quantity)
+            if product.stock_quantity < item.quantity:
+                # Для весовых товаров
+                if product.is_weight_based:
+                    raise ValidationError(
+                        f"Недостаточно товара '{product.name}' на складе. "
+                        f"Запрошено: {item.quantity} кг, "
+                        f"доступно: {product.stock_quantity} кг. "
+                        f"Пожалуйста, уменьшите количество в заказе или выберите другой товар."
+                    )
+                # Для штучных товаров
+                else:
+                    raise ValidationError(
+                        f"Недостаточно товара '{product.name}' на складе. "
+                        f"Запрошено: {int(item.quantity)} шт., "
+                        f"доступно: {int(product.stock_quantity)} шт. "
+                        f"Пожалуйста, уменьшите количество в заказе или выберите другой товар."
+                    )
+
+            # ✅ ПРОВЕРКА #5d: Для весовых товаров - минимальное количество и шаг
+            if product.is_weight_based:
+                # Определяем минимум в зависимости от остатка
+                if product.stock_quantity < Decimal('1'):
+                    min_quantity = Decimal('0.1')
+                else:
+                    min_quantity = Decimal('1')
+
+                # Проверка минимума
+                if item.quantity < min_quantity:
+                    raise ValidationError(
+                        f"Для товара '{product.name}' минимальное количество: {min_quantity} кг. "
+                        f"Вы указали: {item.quantity} кг. "
+                        f"Увеличьте количество до {min_quantity} кг или более."
+                    )
+
+                # Проверка шага (должно быть кратно 0.1 кг = 100 грамм)
+                # Умножаем на 10 и проверяем остаток от деления на 1
+                remainder = (item.quantity * 10) % 1
+                if remainder != 0:
+                    raise ValidationError(
+                        f"Количество для '{product.name}' должно быть кратно 0.1 кг (100 грамм). "
+                        f"Вы указали: {item.quantity} кг. "
+                        f"Примеры корректных значений: 1.0, 1.1, 1.2, 1.3, 2.5 кг и т.д."
+                    )
+
+            # ✅ ПРОВЕРКА #5e: Для штучных товаров - целое число
+            if not product.is_weight_based:
+                if item.quantity != int(item.quantity):
+                    raise ValidationError(
+                        f"Для товара '{product.name}' количество должно быть целым числом. "
+                        f"Вы указали: {item.quantity}. "
+                        f"Используйте только целые числа: 1, 2, 3, 10 и т.д."
+                    )
+
+        # =========================================================================
+        # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - СОЗДАЁМ ЗАКАЗ
+        # =========================================================================
+
+        # Создаём заказ в статусе PENDING
         order = StoreOrder.objects.create(
             store=store,
-            partner=None,  # ← Партнёр назначается позже
+            partner=None,  # Партнёр будет назначен позже админом
             created_by=created_by,
             status=StoreOrderStatus.PENDING,
             idempotency_key=idempotency_key,
+            total_amount=Decimal('0'),  # Будет пересчитано ниже
+            debt_amount=Decimal('0'),
+            prepayment_amount=Decimal('0'),
+            paid_amount=Decimal('0'),
         )
 
-        # Добавляем позиции
+        # Добавляем позиции в заказ
         total_amount = Decimal('0')
 
         for item_data in items_data:
-            product = Product.objects.get(pk=item_data.product_id)
+            product = products_dict[item_data.product_id]
 
-            # Валидация товара
-            if not product.is_active or not product.is_available:
-                raise ValidationError(
-                    f"Товар '{product.name}' недоступен для заказа"
-                )
+            # Определяем цену (из item_data или берём из Product)
+            price = item_data.price if item_data.price is not None else product.final_price
 
-            # Валидация количества (весовые товары)
-            if hasattr(product, 'validate_order_quantity'):
-                product.validate_order_quantity(item_data.quantity)
-
-            # Цена
-            price = item_data.price or product.final_price
-
-            # Создаём позицию
-            item = StoreOrderItem.objects.create(
+            # Создаём позицию заказа
+            order_item = StoreOrderItem.objects.create(
                 order=order,
                 product=product,
                 quantity=item_data.quantity,
                 price=price,
-                is_bonus=item_data.is_bonus
+                is_bonus=item_data.is_bonus,
+                # total вычисляется автоматически в save() модели
             )
 
-            total_amount += item.total
+            # Суммируем общую стоимость
+            total_amount += order_item.total
 
-        # Обновляем сумму
+        # Обновляем общую сумму заказа
         order.total_amount = total_amount
         order.save(update_fields=['total_amount'])
 
-        # История
+        # =========================================================================
+        # СОЗДАЁМ ЗАПИСЬ В ИСТОРИИ
+        # =========================================================================
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
-            old_status='',
+            old_status='',  # Нет предыдущего статуса
             new_status=StoreOrderStatus.PENDING,
             changed_by=created_by,
-            comment=f'Заказ создан магазином {store.name}'
+            comment=(
+                f"Заказ создан магазином '{store.name}'. "
+                f"Количество позиций: {len(items_data)}. "
+                f"Общая сумма: {total_amount} сом."
+            )
         )
-
         return order
 
     # =========================================================================
     # 2. АДМИН ОДОБРЯЕТ ЗАКАЗ
     # =========================================================================
-
     @classmethod
     @transaction.atomic
     def admin_approve_order(
@@ -187,38 +331,122 @@ class OrderWorkflowService:
         """
         Админ одобряет заказ (ТЗ v2.0).
 
+        КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ (ERROR-9):
+        ✅ 1. ПЕРЕД одобрением проверяем наличие товаров на складе
+        ✅ 2. УМЕНЬШАЕМ stock_quantity при одобрении
+        ✅ 3. Обновляем is_available если товар закончился
+        ✅ 4. ОТКАТЫВАЕМ транзакцию если товара недостаточно
+
         Действия:
-        1. Статус → IN_TRANSIT
-        2. Товары → инвентарь магазина
-        3. Опционально назначить партнёра
+        1. Проверка прав и статуса
+        2. ✅ НОВОЕ: Проверка наличия товаров на складе
+        3. ✅ НОВОЕ: Уменьшение stock_quantity
+        4. Добавление товаров в инвентарь магазина
+        5. Изменение статуса на IN_TRANSIT
+        6. Опционально назначение партнёра
 
         Args:
-            order: Заказ
+            order: Заказ для одобрения
             admin_user: Администратор
             assign_to_partner: Партнёр (опционально)
 
         Returns:
             StoreOrder в статусе IN_TRANSIT
+
+        Raises:
+            ValidationError: Если недостаточно товаров на складе
         """
-        # Проверки
+        # =========================================================================
+        # ПРОВЕРКА ПРАВ И СТАТУСА
+        # =========================================================================
         if admin_user.role != 'admin':
             raise ValidationError("Только администратор может одобрять заказы")
 
         if order.status != StoreOrderStatus.PENDING:
             raise ValidationError(
                 f"Можно одобрить только заказы в статусе 'В ожидании'. "
-                f"Текущий: {order.get_status_display()}"
+                f"Текущий статус: {order.get_status_display()}"
             )
 
-        # Добавляем товары в инвентарь магазина
-        for item in order.items.all():
+        # =========================================================================
+        # ✅ КРИТИЧЕСКОЕ ДОБАВЛЕНИЕ ERROR-9: ПРОВЕРКА НАЛИЧИЯ НА СКЛАДЕ
+        # =========================================================================
+
+        # Загружаем все товары заказа с блокировкой (для избежания гонки)
+        order_items = order.items.select_related('product').select_for_update()
+
+        # Проверяем КАЖДЫЙ товар ДО одобрения
+        insufficient_products = []
+
+        for item in order_items:
+            product = item.product
+
+            # Проверка наличия
+            if product.stock_quantity < item.quantity:
+                insufficient_products.append({
+                    'product_name': product.name,
+                    'requested': item.quantity,
+                    'available': product.stock_quantity,
+                    'missing': item.quantity - product.stock_quantity,
+                })
+
+        # Если хотя бы один товар отсутствует - ОТКАТЫВАЕМ всю транзакцию
+        if insufficient_products:
+            error_details = "\n".join([
+                f"- {p['product_name']}: "
+                f"нужно {p['requested']}, "
+                f"на складе {p['available']}, "
+                f"не хватает {p['missing']}"
+                for p in insufficient_products
+            ])
+
+            raise ValidationError(
+                f"Недостаточно товаров на складе для одобрения заказа #{order.id}:\n"
+                f"{error_details}\n\n"
+                f"Пожалуйста, пополните склад или уменьшите количество в заказе."
+            )
+
+        # =========================================================================
+        # ✅ КРИТИЧЕСКОЕ ДОБАВЛЕНИЕ ERROR-9: УМЕНЬШЕНИЕ STOCK_QUANTITY
+        # =========================================================================
+
+        # Все проверки пройдены - уменьшаем остатки
+        for item in order_items:
+            product = item.product
+
+            # Уменьшаем количество на складе
+            product.stock_quantity -= item.quantity
+
+            # Если товар закончился - помечаем как недоступный
+            if product.stock_quantity <= Decimal('0'):
+                product.stock_quantity = Decimal('0')
+                product.is_available = False
+
+            # Сохраняем изменения
+            product.save(update_fields=['stock_quantity', 'is_available'])
+
+            # Логирование для аудита
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"Склад обновлён | Товар: {product.name} | "
+                f"Заказ #{order.id} | Списано: {item.quantity} | "
+                f"Остаток: {product.stock_quantity}"
+            )
+
+        # =========================================================================
+        # ДОБАВЛЕНИЕ ТОВАРОВ В ИНВЕНТАРЬ МАГАЗИНА
+        # =========================================================================
+        for item in order_items:
             StoreInventoryService.add_to_inventory(
                 store=order.store,
                 product=item.product,
                 quantity=item.quantity
             )
 
-        # Меняем статус
+        # =========================================================================
+        # ИЗМЕНЕНИЕ СТАТУСА ЗАКАЗА
+        # =========================================================================
         old_status = order.status
         order.status = StoreOrderStatus.IN_TRANSIT
         order.reviewed_by = admin_user
@@ -232,14 +460,20 @@ class OrderWorkflowService:
 
         order.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'partner'])
 
-        # История
+        # =========================================================================
+        # ИСТОРИЯ ЗАКАЗА
+        # =========================================================================
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
             old_status=old_status,
             new_status=StoreOrderStatus.IN_TRANSIT,
             changed_by=admin_user,
-            comment='Заказ одобрен админом, товары добавлены в инвентарь'
+            comment=(
+                f'Заказ одобрен админом. '
+                f'Товары добавлены в инвентарь магазина "{order.store.name}". '
+                f'Остатки на складе обновлены.'
+            )
         )
 
         return order
@@ -486,6 +720,45 @@ class OrderWorkflowService:
             queryset = queryset.filter(status=status)
 
         return queryset.select_related('partner', 'reviewed_by', 'confirmed_by')
+
+    def validate_weight_based_quantity(product: Product, quantity: Decimal) -> None:
+        """
+        Валидация количества для весового товара.
+
+        Правила (ТЗ v2.0):
+        - Минимум: 1 кг (или 0.1 кг если остаток < 1 кг)
+        - Шаг: 0.1 кг (100 грамм)
+        - Максимум: stock_quantity
+
+        Args:
+            product: Товар
+            quantity: Запрошенное количество
+
+        Raises:
+            ValidationError: Если количество некорректно
+        """
+        if not product.is_weight_based:
+            return  # Не весовой товар
+
+        # Определяем минимум
+        if product.stock_quantity < Decimal('1'):
+            min_quantity = Decimal('0.1')
+        else:
+            min_quantity = Decimal('1')
+
+        # Проверка минимума
+        if quantity < min_quantity:
+            raise ValidationError(
+                f"Минимальное количество для '{product.name}': {min_quantity} кг"
+            )
+
+        # Проверка шага (должно быть кратно 0.1)
+        remainder = (quantity * 10) % 1
+        if remainder != 0:
+            raise ValidationError(
+                f"Количество для '{product.name}' должно быть кратно 0.1 кг (100 грамм). "
+                f"Например: 1.0, 1.1, 1.2, 1.3 кг и т.д."
+            )
 
 
 # =============================================================================

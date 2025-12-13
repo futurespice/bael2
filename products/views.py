@@ -12,6 +12,7 @@ Views для products.
 from decimal import Decimal
 from datetime import date
 
+from django.db.models import QuerySet
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -44,7 +45,7 @@ from .serializers import (
     ProductExpenseRelationSerializer,
     ProductExpenseRelationCreateSerializer,
     CostCalculationRequestSerializer,
-    CostCalculationResultSerializer,
+    CostCalculationResultSerializer, ProductAdminListSerializer, ProductAdminDetailSerializer,
 )
 from .services import (
     ExpenseService,
@@ -229,12 +230,38 @@ class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.filter(is_active=True).prefetch_related('images').order_by('name')
     pagination_class = StandardPagination
 
+    def get_queryset(self) -> QuerySet[Product]:
+        """Получение товаров (см. код выше)."""
+        user = self.request.user
+        queryset = Product.objects.prefetch_related('images')
+
+        if user.role == 'admin':
+            return queryset.all()
+
+        return queryset.filter(is_active=True)
+
     def get_serializer_class(self):
-        if self.action in ['create', 'update', 'partial_update']:
-            return ProductCreateSerializer
-        elif self.action == 'list':
-            return ProductListSerializer
+        """Выбор сериализатора в зависимости от роли (см. код выше)."""
+        user = self.request.user
+
+        # АДМИН (с себестоимостью)
+        if user.role == 'admin':
+            if self.action == 'list':
+                return ProductAdminListSerializer
+            elif self.action in ['retrieve', 'update', 'partial_update']:
+                return ProductAdminDetailSerializer
+            elif self.action == 'create':
+                return ProductCreateSerializer
+
+        # ПАРТНЁР/МАГАЗИН (без себестоимости)
+        else:
+            if self.action == 'list':
+                return ProductListSerializer
+            elif self.action == 'retrieve':
+                return ProductDetailSerializer
+
         return ProductDetailSerializer
+
 
     def list(self, request):
         """Каталог товаров."""
@@ -398,6 +425,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         
         output = CostCalculationResultSerializer(result)
         return Response(output.data)
+
+
 
 
 # =============================================================================
