@@ -57,17 +57,21 @@ class ReportFiltersSerializer(serializers.Serializer):
 
 
 class StoreHistoryFiltersSerializer(serializers.Serializer):
-    """Фильтры для истории магазина."""
+    """
+    Фильтры для истории магазина.
 
-    start_date = serializers.DateField(required=True)
-    end_date = serializers.DateField(required=True)
+    ✅ ИСПРАВЛЕНО: start_date и end_date теперь опциональны
+    """
 
-    def validate(self, attrs):
-        if attrs['start_date'] > attrs['end_date']:
-            raise serializers.ValidationError(
-                'start_date должна быть меньше end_date'
-            )
-        return attrs
+    start_date = serializers.DateField(
+        required=False,  # ✅ Теперь НЕ обязательно
+        help_text='Начальная дата (YYYY-MM-DD). По умолчанию: дата первого заказа'
+    )
+
+    end_date = serializers.DateField(
+        required=False,  # ✅ Теперь НЕ обязательно
+        help_text='Конечная дата (YYYY-MM-DD). По умолчанию: сегодня'
+    )
 
 
 class StatisticsSerializer(serializers.Serializer):

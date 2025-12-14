@@ -92,30 +92,25 @@ def get_store_history(request: Request, store_id: int) -> Response:
 
     GET /api/reports/store-history/{store_id}/
 
-    Query параметры:
-    - start_date: YYYY-MM-DD (обязательно)
-    - end_date: YYYY-MM-DD (обязательно)
+    Query параметры (все опциональны):
+    - start_date: YYYY-MM-DD (по умолчанию: с первого заказа)
+    - end_date: YYYY-MM-DD (по умолчанию: сегодня)
 
-    Ответ:
-    [
-        {
-            "date": "2024-12-01",
-            "order_id": 123,
-            "products": [
-                {"name": "Пельмени", "quantity": 10, "price": 100, "total": 1000}
-            ],
-            "bonus_products": [
-                {"name": "Курица", "quantity": 1, "price": 200, "total": 0}
-            ],
-            "defective_products": [
-                {"name": "Хлеб", "quantity": 2, "amount": 50, "reason": "Плесень"}
-            ],
-            "debt": 1000.00,
-            "paid": 500.00,
-            "outstanding_debt": 500.00
-        }
-    ]
+    Примеры:
+    - GET /api/reports/store-history/1/
+      → За всё время
+
+    - GET /api/reports/store-history/1/?start_date=2024-01-01
+      → С 2024-01-01 до сегодня
+
+    - GET /api/reports/store-history/1/?end_date=2024-12-31
+      → С первого заказа до 2024-12-31
+
+    - GET /api/reports/store-history/1/?start_date=2024-01-01&end_date=2024-12-31
+      → Конкретный диапазон
     """
+    from stores.models import Store
+
     # Валидация магазина
     try:
         store = Store.objects.get(pk=store_id)
@@ -125,15 +120,15 @@ def get_store_history(request: Request, store_id: int) -> Response:
             status=status.HTTP_404_NOT_FOUND
         )
 
-    # Валидация дат
+    # Валидация дат (теперь опциональны)
     serializer = StoreHistoryFiltersSerializer(data=request.query_params)
     serializer.is_valid(raise_exception=True)
 
     # Получаем историю
     history = ReportService.get_store_history(
         store=store,
-        start_date=serializer.validated_data['start_date'],
-        end_date=serializer.validated_data['end_date']
+        start_date=serializer.validated_data.get('start_date'),  # ✅ Может быть None
+        end_date=serializer.validated_data.get('end_date')  # ✅ Может быть None
     )
 
     return Response(history)

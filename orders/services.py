@@ -529,24 +529,8 @@ class OrderWorkflowService:
             prepayment_amount: Decimal = Decimal('0'),
             items_to_remove_from_inventory: Optional[List[int]] = None,
     ) -> StoreOrder:
-        """
-        Партнёр подтверждает заказ (ТЗ v2.0).
+        """Партнёр подтверждает заказ."""
 
-        Действия:
-        1. Партнёр может удалить товары из инвентаря
-        2. Указывает предоплату
-        3. Создаётся долг: total - prepayment
-        4. Статус → ACCEPTED
-
-        Args:
-            order: Заказ
-            partner_user: Партнёр
-            prepayment_amount: Предоплата
-            items_to_remove_from_inventory: ID продуктов для удаления
-
-        Returns:
-            StoreOrder в статусе ACCEPTED
-        """
         # Проверки
         if partner_user.role != 'partner':
             raise ValidationError("Только партнёр может подтверждать заказы")
@@ -575,12 +559,9 @@ class OrderWorkflowService:
                             product=order_item.product,
                             quantity=order_item.quantity
                         )
-
                         # Удаляем позицию из заказа
                         order_item.delete()
-
-                except Exception as e:
-                    # Логируем, но не останавливаем процесс
+                except Exception:
                     pass
 
             # Пересчитываем сумму
@@ -590,9 +571,11 @@ class OrderWorkflowService:
         order.prepayment_amount = prepayment_amount
         order.debt_amount = order.total_amount - prepayment_amount
 
-        # Обновляем долг магазина
-        order.store.debt = F('debt') + order.debt_amount
-        order.store.save(update_fields=['debt'])
+        # ✅ ИСПРАВЛЕНО: Обновляем долг магазина через update()
+        Store.objects.filter(pk=order.store.pk).update(
+            debt=F('debt') + order.debt_amount
+        )
+        order.store.refresh_from_db()
 
         # Меняем статус
         old_status = order.status
@@ -611,8 +594,8 @@ class OrderWorkflowService:
             changed_by=partner_user,
             comment=(
                 f'Заказ подтверждён партнёром. '
-                f'Предоплата: {prepayment_amount} сом, '
-                f'Долг: {order.debt_amount} сом'
+                f'Предоплата: {prepayment_amount} сом. '
+                f'Долг: {order.debt_amount} сом.'
             )
         )
 
@@ -822,73 +805,73 @@ class DebtService:
 class DefectiveProductService:
     """Сервис для работы с бракованными товарами."""
 
-    @classmethod
-    @transaction.atomic
-    def report_defect(
-            cls,
-            *,
-            order: StoreOrder,
-            product: Product,
-            quantity: Decimal,
-            price: Decimal,
-            reason: str,
-            reported_by: 'User',
-    ) -> DefectiveProduct:
-        """
-        Магазин заявляет о браке.
-
-        Args:
-            order: Заказ
-            product: Товар
-            quantity: Количество брака
-            price: Цена
-            reason: Причина
-            reported_by: Кто сообщил
-
-        Returns:
-            DefectiveProduct
-        """
-        defect = DefectiveProduct.objects.create(
-            order=order,
-            product=product,
-            quantity=quantity,
-            price=price,
-            reason=reason,
-            reported_by=reported_by,
-            status=DefectiveProduct.DefectStatus.PENDING
-        )
-
-        return defect
-
-    @classmethod
-    @transaction.atomic
-    def approve_defect(
-            cls,
-            *,
-            defect: DefectiveProduct,
-            approved_by: 'User',
-    ) -> DefectiveProduct:
-        """
-        Партнёр подтверждает брак → уменьшается долг.
-
-        Args:
-            defect: Бракованный товар
-            approved_by: Партнёр
-
-        Returns:
-            DefectiveProduct
-        """
-        if approved_by.role != 'partner':
-            raise ValidationError("Только партнёр может подтверждать брак")
-
-        defect.approve(approved_by=approved_by)
-
-        return defect
-
-    @classmethod
-    def get_pending_defects(cls, order: StoreOrder) -> QuerySet[DefectiveProduct]:
-        """Ожидающие проверки дефекты."""
-        return DefectiveProduct.objects.filter(
-            order=order,
-            status=DefectiveProduct.DefectStatus.PENDING
-        )
+    # @classmethod
+    # @transaction.atomic
+    # def report_defect(
+    #         cls,
+    #         *,
+    #         order: StoreOrder,
+    #         product: Product,
+    #         quantity: Decimal,
+    #         price: Decimal,
+    #         reason: str,
+    #         reported_by: 'User',
+    # ) -> DefectiveProduct:
+    #     """
+    #     Магазин заявляет о браке.
+    #
+    #     Args:
+    #         order: Заказ
+    #         product: Товар
+    #         quantity: Количество брака
+    #         price: Цена
+    #         reason: Причина
+    #         reported_by: Кто сообщил
+    #
+    #     Returns:
+    #         DefectiveProduct
+    #     """
+    #     defect = DefectiveProduct.objects.create(
+    #         order=order,
+    #         product=product,
+    #         quantity=quantity,
+    #         price=price,
+    #         reason=reason,
+    #         reported_by=reported_by,
+    #         status=DefectiveProduct.DefectStatus.PENDING
+    #     )
+    #
+    #     return defect
+    #
+    # @classmethod
+    # @transaction.atomic
+    # def approve_defect(
+    #         cls,
+    #         *,
+    #         defect: DefectiveProduct,
+    #         approved_by: 'User',
+    # ) -> DefectiveProduct:
+    #     """
+    #     Партнёр подтверждает брак → уменьшается долг.
+    #
+    #     Args:
+    #         defect: Бракованный товар
+    #         approved_by: Партнёр
+    #
+    #     Returns:
+    #         DefectiveProduct
+    #     """
+    #     if approved_by.role != 'partner':
+    #         raise ValidationError("Только партнёр может подтверждать брак")
+    #
+    #     defect.approve(approved_by=approved_by)
+    #
+    #     return defect
+    #
+    # @classmethod
+    # def get_pending_defects(cls, order: StoreOrder) -> QuerySet[DefectiveProduct]:
+    #     """Ожидающие проверки дефекты."""
+    #     return DefectiveProduct.objects.filter(
+    #         order=order,
+    #         status=DefectiveProduct.DefectStatus.PENDING
+    #     )

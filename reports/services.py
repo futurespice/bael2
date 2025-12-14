@@ -244,8 +244,8 @@ class ReportService:
 
         # Погашенные долги
         paid_debt_qs = DebtPayment.objects.filter(
-            paid_at__date__gte=start_date,
-            paid_at__date__lte=end_date
+            created_at__date__gte=start_date,  # ✅ ИСПРАВЛЕНО
+            created_at__date__lte=end_date  # ✅ ИСПРАВЛЕНО
         )
 
         if filters.store_id:
@@ -406,31 +406,46 @@ class ReportService:
     def get_store_history(
             cls,
             store: Store,
-            start_date: date,
-            end_date: date,
+            start_date: Optional[date] = None,  # ✅ Теперь опционально
+            end_date: Optional[date] = None,  # ✅ Теперь опционально
     ) -> List[Dict[str, Any]]:
         """
         История магазина с фильтрацией по дате (ТЗ v2.0).
 
-        ✅ КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ ERROR-8:
-        1. Добавлено поле prepayment_amount
-        2. Добавлен массив debt_payments (погашения по заказу)
-        3. Добавлен массив status_history (история статусов)
-        4. Добавлены standalone_payments (отдельные погашения)
+        ✅ ИСПРАВЛЕНО:
+        - Поле changed_at → created_at
+        - start_date и end_date теперь опциональны (по умолчанию за всё время)
 
-        Данные:
-        - Полученные товары (название, количество, цена)
-        - Бонусные товары (бесплатные)
-        - Бракованные товары (уменьшают долг)
-        - ✅ НОВОЕ: Предоплата
-        - ✅ НОВОЕ: Погашения долга
-        - ✅ НОВОЕ: История статусов
-        - Долг магазина
+        Args:
+            store: Магазин
+            start_date: Начальная дата (опционально, по умолчанию с начала времён)
+            end_date: Конечная дата (опционально, по умолчанию до сегодня)
 
         Returns:
-            List[Dict] с данными по дням (включая отдельные погашения)
+            List[Dict] с историей магазина
         """
         from orders.models import OrderHistory, OrderType
+        from django.db.models import Min
+
+        # =========================================================================
+        # ОПРЕДЕЛЕНИЕ ДИАПАЗОНА ДАТ (если не указаны)
+        # =========================================================================
+
+        if not start_date:
+            # Берём дату первого заказа магазина
+            first_order = StoreOrder.objects.filter(
+                store=store
+            ).order_by('created_at').first()
+
+            if first_order:
+                start_date = first_order.created_at.date()
+            else:
+                # Если заказов нет - берём сегодня
+                start_date = timezone.now().date()
+
+        if not end_date:
+            # До сегодняшнего дня
+            end_date = timezone.now().date()
 
         history = []
 
@@ -444,22 +459,19 @@ class ReportService:
             confirmed_at__date__lte=end_date
         ).prefetch_related(
             'items__product',
-            'debt_payments',  # ✅ НОВОЕ: Предзагрузка погашений
+            'debt_payments',
         ).select_related('partner')
 
         for order in orders:
             day_data = {
-                'type': 'order',  # ✅ НОВОЕ: Тип записи
+                'type': 'order',
                 'date': order.confirmed_at.date().isoformat(),
                 'order_id': order.id,
                 'partner_name': order.partner.get_full_name() if order.partner else None,
                 'products': [],
                 'bonus_products': [],
                 'defective_products': [],
-
-                # ✅ НОВОЕ: Предоплата
                 'prepayment_amount': float(order.prepayment_amount),
-
                 'debt': float(order.debt_amount),
                 'paid': float(order.paid_amount),
                 'outstanding_debt': float(order.outstanding_debt),
@@ -493,13 +505,13 @@ class ReportService:
                     'reason': defect.reason,
                 })
 
-            # ✅ НОВОЕ: Погашения долга по этому заказу
+            # Погашения долга по этому заказу
             debt_payments_list = []
-            for payment in order.debt_payments.all().order_by('paid_at'):
+            for payment in order.debt_payments.all().order_by('created_at'):  # ✅ ИСПРАВЛЕНО
                 debt_payments_list.append({
                     'payment_id': payment.id,
                     'amount': float(payment.amount),
-                    'paid_at': payment.paid_at.isoformat(),
+                    'created_at': payment.created_at.isoformat(),  # ✅ ИСПРАВЛЕНО
                     'paid_by': payment.paid_by.get_full_name() if payment.paid_by else None,
                     'received_by': payment.received_by.get_full_name() if payment.received_by else None,
                     'comment': payment.comment or '',
@@ -507,19 +519,19 @@ class ReportService:
 
             day_data['debt_payments'] = debt_payments_list
 
-            # ✅ НОВОЕ: История статусов заказа
+            # История статусов заказа
             status_history_list = []
             order_history = OrderHistory.objects.filter(
                 order_type=OrderType.STORE,
                 order_id=order.id
-            ).order_by('changed_at')
+            ).order_by('created_at')  # ✅ ИСПРАВЛЕНО: changed_at → created_at
 
             for history_entry in order_history:
                 status_history_list.append({
                     'old_status': history_entry.old_status,
                     'new_status': history_entry.new_status,
                     'changed_by': history_entry.changed_by.get_full_name() if history_entry.changed_by else None,
-                    'changed_at': history_entry.changed_at.isoformat(),
+                    'created_at': history_entry.created_at.isoformat(),  # ✅ ИСПРАВЛЕНО
                     'comment': history_entry.comment or '',
                 })
 
@@ -528,30 +540,28 @@ class ReportService:
             history.append(day_data)
 
         # =========================================================================
-        # 2. ✅ НОВОЕ: ОТДЕЛЬНЫЕ ПОГАШЕНИЯ ДОЛГА (без привязки к заказу)
+        # 2. ОТДЕЛЬНЫЕ ПОГАШЕНИЯ ДОЛГА (без привязки к заказу)
         # =========================================================================
 
-        # Погашения которые были сделаны напрямую (не через заказ)
+        # Погашения которые были сделаны напрямую
         standalone_payments = DebtPayment.objects.filter(
             order__store=store,
-            paid_at__date__gte=start_date,
-            paid_at__date__lte=end_date
-        ).select_related('order', 'paid_by', 'received_by').order_by('paid_at')
+            created_at__date__gte=start_date,  # ✅ ИСПРАВЛЕНО
+            created_at__date__lte=end_date  # ✅ ИСПРАВЛЕНО
+        ).select_related('order', 'paid_by', 'received_by').order_by('created_at')  # ✅ ИСПРАВЛЕНО
 
         # Группируем по дням
         from collections import defaultdict
         payments_by_date = defaultdict(list)
 
         for payment in standalone_payments:
-            # Проверяем что это погашение НЕ учтено в заказах выше
-            # (погашения уже учтены в order.debt_payments)
-            payment_date = payment.paid_at.date()
+            payment_date = payment.created_at.date()  # ✅ ИСПРАВЛЕНО
 
             payments_by_date[payment_date].append({
                 'payment_id': payment.id,
                 'order_id': payment.order.id if payment.order else None,
                 'amount': float(payment.amount),
-                'paid_at': payment.paid_at.isoformat(),
+                'created_at': payment.created_at.isoformat(),  # ✅ ИСПРАВЛЕНО
                 'paid_by': payment.paid_by.get_full_name() if payment.paid_by else None,
                 'received_by': payment.received_by.get_full_name() if payment.received_by else None,
                 'comment': payment.comment or '',
@@ -560,7 +570,7 @@ class ReportService:
         # Добавляем дни с погашениями в историю
         for payment_date, payments_list in payments_by_date.items():
             history.append({
-                'type': 'payment',  # ✅ НОВОЕ: Тип "погашение"
+                'type': 'payment',
                 'date': payment_date.isoformat(),
                 'payments': payments_list,
                 'total_amount': sum(p['amount'] for p in payments_list),

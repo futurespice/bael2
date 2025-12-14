@@ -2,6 +2,7 @@
 Django settings for БайЭл project.
 
 Production & Development настройки с переключением через DEBUG.
+ИСПРАВЛЕНО: убраны принудительные HTTPS редиректы и исправлена работа Swagger UI
 """
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # =============================================================================
 
 SECRET_KEY = os.environ.get(
-    'SECRET_KEY', 
+    'SECRET_KEY',
     'django-insecure-change-me-in-production-use-real-key'
 )
 
@@ -48,6 +49,13 @@ CSRF_TRUSTED_ORIGINS = [
     'https://www.baielapp.com.kg',
     'https://api.baielapp.com.kg',
 ]
+
+# Добавляем локальные origins для разработки
+if DEBUG:
+    CSRF_TRUSTED_ORIGINS += [
+        'http://localhost:8000',
+        'http://127.0.0.1:8000',
+    ]
 
 # =============================================================================
 # APPLICATION DEFINITION
@@ -135,7 +143,7 @@ else:
 # REDIS & CACHE
 # =============================================================================
 
-REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost' if DEBUG else 'redis')
 REDIS_PORT = os.environ.get('REDIS_PORT', '6379')
 REDIS_URL = f'redis://{REDIS_HOST}:{REDIS_PORT}'
 
@@ -214,6 +222,8 @@ if DEBUG:
     CORS_ALLOWED_ORIGINS += [
         'http://localhost:3000',
         'http://127.0.0.1:3000',
+        'http://localhost:8000',
+        'http://127.0.0.1:8000',
         'http://localhost:8080',
         'http://127.0.0.1:8080',
     ]
@@ -244,28 +254,43 @@ CORS_ALLOW_HEADERS = [
 
 # =============================================================================
 # SECURITY (Production)
+# ИСПРАВЛЕНО: добавлена переменная USE_HTTPS для явного контроля HTTPS
 # =============================================================================
 
-if not DEBUG:
-    # HTTPS
+# Явный контроль HTTPS через переменную окружения
+USE_HTTPS = os.environ.get('USE_HTTPS', 'False').lower() in ('true', '1', 'yes')
+
+# Настройки безопасности только если явно включен HTTPS
+if USE_HTTPS and not DEBUG:
+    # HTTPS редиректы
     SECURE_SSL_REDIRECT = True
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-    
+
     # Cookies
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SESSION_COOKIE_HTTPONLY = True
     CSRF_COOKIE_HTTPONLY = True
-    
+
     # HSTS
     SECURE_HSTS_SECONDS = 31536000  # 1 год
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
-    
+
     # Другие
     SECURE_CONTENT_TYPE_NOSNIFF = True
     SECURE_BROWSER_XSS_FILTER = True
     X_FRAME_OPTIONS = 'DENY'
+else:
+    # Для локальной разработки - отключаем принудительный HTTPS
+    SECURE_SSL_REDIRECT = False
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
+
+    # Базовая безопасность остается
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_BROWSER_XSS_FILTER = True
+    X_FRAME_OPTIONS = 'SAMEORIGIN'  # Для Swagger UI
 
 # =============================================================================
 # REST FRAMEWORK
@@ -308,8 +333,11 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
 }
 
-# В production убираем Session auth
+# В DEBUG добавляем BrowsableAPIRenderer для удобства
 if DEBUG:
+    REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'].append(
+        'rest_framework.renderers.BrowsableAPIRenderer'
+    )
     REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES'].append(
         'rest_framework.authentication.SessionAuthentication'
     )
@@ -334,6 +362,7 @@ SIMPLE_JWT = {
 
 # =============================================================================
 # API DOCUMENTATION
+# ИСПРАВЛЕНО: убраны SIDECAR настройки, используем CDN
 # =============================================================================
 
 SPECTACULAR_SETTINGS = {
@@ -343,10 +372,21 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': '/api/',
-    'SERVERS': [
-        {'url': 'https://baielapp.com.kg', 'description': 'Production'},
-        {'url': 'http://localhost:8000', 'description': 'Development'},
-    ],
+
+    # В DEBUG режиме локальный сервер первый
+
+    # Настройки Swagger UI
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        'persistAuthorization': True,
+        'displayOperationId': True,
+        'filter': True,
+        'tryItOutEnabled': True,
+    },
+
+    # ИСПРАВЛЕНО: используем CDN вместо SIDECAR
+    # Это избавляет от необходимости устанавливать drf-spectacular-sidecar
+    # и собирать статику для Swagger UI
 }
 
 # =============================================================================
@@ -481,4 +521,4 @@ DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Frontend URL (для email ссылок)
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://baielapp.com.kg')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000' if DEBUG else 'https://baielapp.com.kg')

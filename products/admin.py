@@ -27,6 +27,7 @@ class ExpenseAdmin(admin.ModelAdmin):
     """Admin для расходов."""
 
     list_display = [
+        'id',
         'name',
         'expense_type',
         'expense_status',
@@ -77,6 +78,7 @@ class ProductAdmin(admin.ModelAdmin):
     """Admin для товаров."""
 
     list_display = [
+        'id',
         'name',
         'unit',
         'average_cost_price',
@@ -168,6 +170,7 @@ class ProductionBatchAdmin(admin.ModelAdmin):
     """Admin для производства."""
 
     list_display = [
+        'id',
         'date',
         'product',
         'quantity_produced',
@@ -247,7 +250,7 @@ class ProductImageAdmin(admin.ModelAdmin):
 class ProductExpenseRelationAdmin(admin.ModelAdmin):
     """Admin для связей."""
 
-    list_display = ['product', 'expense', 'proportion', 'created_at']
+    list_display = ['id','product', 'expense', 'proportion', 'created_at']
 
     list_filter = ['expense__expense_type']
 

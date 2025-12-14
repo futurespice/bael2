@@ -18,20 +18,16 @@ urlpatterns = [
 
     # === ВЫБОР МАГАЗИНА (для role='store') ===
 
-    # Список доступных магазинов для выбора
-    path('stores/available/', views.AvailableStoresView.as_view(), name='available-stores'),
 
     # Выбрать магазин
-    path('stores/select/', views.SelectStoreView.as_view(), name='select-store'),
+    path('select/', views.SelectStoreView.as_view(), name='select-store'),
 
     # Отменить выбор
-    path('stores/deselect/', views.DeselectStoreView.as_view(), name='deselect-store'),
+    path('deselect/', views.DeselectStoreView.as_view(), name='deselect-store'),
 
-    # Текущий выбранный магазин
-    path('stores/current/', views.CurrentStoreView.as_view(), name='current-store'),
 
     # Профиль текущего магазина (алиас для current)
-    path('stores/profile/', views.get_current_store_profile, name='store-profile'),
+    path('profile/', views.get_current_store_profile, name='store-profile'),
 
     # === ДОПОЛНИТЕЛЬНЫЕ ENDPOINTS ===
 

@@ -12,7 +12,7 @@ from .models import Region, City, Store, StoreSelection, StoreInventory
 class RegionAdmin(admin.ModelAdmin):
     """Admin для областей."""
 
-    list_display = ['name', 'stores_count', 'created_at']
+    list_display = ['id','name', 'stores_count', 'created_at']
 
     list_filter = ['created_at']
 
@@ -56,7 +56,7 @@ class RegionAdmin(admin.ModelAdmin):
 class CityAdmin(admin.ModelAdmin):
     """Admin для городов."""
 
-    list_display = ['name', 'region', 'stores_count', 'created_at']
+    list_display = ['id','name', 'region', 'stores_count', 'created_at']
 
     list_filter = ['region', 'created_at']
 
@@ -102,7 +102,7 @@ class StoreInventoryInline(admin.TabularInline):
     """Инлайн для инвентаря."""
     model = StoreInventory
     extra = 0
-    fields = ['product', 'quantity', 'total_price_display', 'last_updated']
+    fields = ['id','product', 'quantity', 'total_price_display', 'last_updated']
     readonly_fields = ['total_price_display', 'last_updated']
 
     def total_price_display(self, obj):
@@ -121,6 +121,7 @@ class StoreAdmin(admin.ModelAdmin):
     """Admin для магазинов."""
 
     list_display = [
+        'id',
         'name',
         'owner_name',
         'inn',

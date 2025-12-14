@@ -88,13 +88,6 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return ExpenseCreateSerializer
         return ExpenseSerializer
 
-    @action(detail=False, methods=['get'])
-    def summary(self, request):
-        """Сводка по расходам."""
-        data = ExpenseService.get_expenses_summary()
-        serializer = ExpenseSummarySerializer(data)
-        return Response(serializer.data)
-
 
 # =============================================================================
 # PARTNER EXPENSE VIEWSET (НОВОЕ v2.0)
@@ -241,51 +234,73 @@ class ProductViewSet(viewsets.ModelViewSet):
         return queryset.filter(is_active=True)
 
     def get_serializer_class(self):
-        """Выбор сериализатора в зависимости от роли (см. код выше)."""
+        """Выбор сериализатора в зависимости от роли."""
         user = self.request.user
 
-        # АДМИН (с себестоимостью)
-        if user.role == 'admin':
-            if self.action == 'list':
-                return ProductAdminListSerializer
-            elif self.action in ['retrieve', 'update', 'partial_update']:
-                return ProductAdminDetailSerializer
-            elif self.action == 'create':
-                return ProductCreateSerializer
+        # Для списка товаров
+        if self.action == 'list':
+            if user.role == 'admin':
+                return ProductAdminListSerializer  # Админ видит себестоимость
+            else:
+                return ProductListSerializer  # Партнёр/магазин видят только цену продажи
 
-        # ПАРТНЁР/МАГАЗИН (без себестоимости)
-        else:
-            if self.action == 'list':
-                return ProductListSerializer
-            elif self.action == 'retrieve':
-                return ProductDetailSerializer
+        # Для детального просмотра товара
+        elif self.action == 'retrieve':
+            if user.role == 'admin':
+                return ProductAdminDetailSerializer  # Админ видит полную информацию
+            else:
+                return ProductDetailSerializer  # Партнёр/магазин видят ограниченную информацию
 
+        # Для создания товара
+        elif self.action == 'create':
+            return ProductCreateSerializer
+
+        # Для обновления наценки
+        elif self.action == 'update_markup':
+            return ProductUpdateMarkupSerializer
+
+        # По умолчанию
         return ProductDetailSerializer
 
-
     def list(self, request):
-        """Каталог товаров."""
+        """
+        Каталог товаров.
+
+        ✅ ИСПРАВЛЕНО: Теперь использует get_serializer_class()
+        для выбора правильного сериализатора в зависимости от роли.
+        """
+        # Если магазин - используем специальный метод
         if request.user.role == 'store':
             catalog = ProductService.get_catalog_for_stores()
             return Response(catalog)
 
+        # Получаем queryset
         queryset = self.get_queryset()
-        
+
+        # ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Используем get_serializer_class()
+        # Это автоматически вернёт:
+        # - ProductAdminListSerializer для админа
+        # - ProductListSerializer для партнёра
+        serializer_class = self.get_serializer_class()
+
+        # Пагинация
         page = self.paginate_queryset(queryset)
         if page is not None:
-            serializer = ProductListSerializer(
+            serializer = serializer_class(
                 page,
                 many=True,
                 context={'request': request}
             )
             return self.get_paginated_response(serializer.data)
-        
-        serializer = ProductListSerializer(
+
+        # Без пагинации
+        serializer = serializer_class(
             queryset,
             many=True,
             context={'request': request}
         )
         return Response(serializer.data)
+
 
     def retrieve(self, request, pk=None):
         """Детали товара."""

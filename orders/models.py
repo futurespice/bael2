@@ -32,7 +32,7 @@ from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-
+from stores.models import Store
 
 # =============================================================================
 # СТАТУСЫ ЗАКАЗОВ
@@ -389,9 +389,11 @@ class StoreOrder(models.Model):
         self.save(update_fields=['paid_amount'])
 
         # Обновляем долг магазина
-        self.store.debt = models.F('debt') - amount
-        self.store.total_paid = models.F('total_paid') + amount
-        self.store.save(update_fields=['debt', 'total_paid'])
+        Store.objects.filter(pk=self.store.pk).update(
+            debt=models.F('debt') - amount,
+            total_paid=models.F('total_paid') + amount
+        )
+        self.store.refresh_from_db()
 
         # Создаём запись о погашении
         payment = DebtPayment.objects.create(
@@ -758,12 +760,15 @@ class DefectiveProduct(models.Model):
             raise ValidationError('Можно подтвердить только заявки в статусе "Ожидает"')
 
         # Уменьшаем долг заказа
-        self.order.debt_amount = models.F('debt_amount') - self.total_amount
-        self.order.save(update_fields=['debt_amount'])
+        StoreOrder.objects.filter(pk=self.order.pk).update(
+            debt_amount=models.F('debt_amount') - self.total_amount
+        )
+        self.order.refresh_from_db()
 
-        # Уменьшаем долг магазина
-        self.order.store.debt = models.F('debt') - self.total_amount
-        self.order.store.save(update_fields=['debt'])
+        Store.objects.filter(pk=self.order.store.pk).update(
+            debt=models.F('debt') - self.total_amount
+        )
+        self.order.store.refresh_from_db()
 
         # Обновляем статус
         self.status = self.DefectStatus.APPROVED
