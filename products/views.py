@@ -516,7 +516,7 @@ class ProductImageViewSet(viewsets.ModelViewSet):
 
         try:
             product = Product.objects.get(id=product_id)
-            
+
             # Проверка лимита
             existing_count = ProductImage.objects.filter(product=product).count()
             if existing_count >= 3:

@@ -1,6 +1,11 @@
-# apps/reports/services.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
+# apps/reports/services.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.1
 """
 Сервисы для статистики и отчётов согласно ТЗ v2.0.
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v2.1:
+1. ✅ ИСПРАВЛЕНО: Бонусы считаются из ИНВЕНТАРЯ, а не из заказов
+2. ✅ ИСПРАВЛЕНО: Брак фильтруется по дате создания, а не по заказам
+3. ✅ УЛУЧШЕНО: Расходы разделены на партнёрские и производственные
 
 ОСНОВНОЙ СЕРВИС:
 - ReportService: Генерация статистики в реальном времени
@@ -10,10 +15,6 @@
 - Календарная фильтрация (день, неделя, месяц, полгода, год, всё время)
 - Фильтрация по магазинам, городам, областям
 - Общий баланс: доход - брак - расходы - долг
-
-КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ:
-1. Используем PartnerExpense вместо Expense для расходов партнёров
-2. Поля date и partner_id теперь корректны
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ from enum import Enum
 from django.db.models import Q, Sum, Count, F, QuerySet
 from django.utils import timezone
 
-from stores.models import Store, Region, City
-from orders.models import StoreOrder, StoreOrderStatus, DebtPayment, DefectiveProduct
-from products.models import PartnerExpense  # ✅ ИСПРАВЛЕНО: Было Expense
+from stores.models import Store, Region, City, StoreInventory
+from orders.models import StoreOrder, StoreOrderStatus, DebtPayment, DefectiveProduct, StoreOrderItem
+from products.models import PartnerExpense
 from products.services import ExpenseService
 
 
@@ -64,11 +65,9 @@ class StatisticsData:
     """
     Данные статистики для круговой диаграммы.
 
-    ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ERROR-7:
-    Поле expenses разделено на:
-    - partner_expenses (расходы партнёра, ручной ввод)
-    - production_expenses (себестоимость производства)
-    - total_expenses (сумма обоих)
+    ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2.1:
+    - bonus_count теперь считается из ИНВЕНТАРЯ, а не из заказов
+    - defect_amount фильтруется по дате создания, а не по заказам
     """
 
     # Финансовые показатели
@@ -77,13 +76,13 @@ class StatisticsData:
     paid_debt: Decimal  # Погашенные долги
     defect_amount: Decimal  # Брак
 
-    # ✅ НОВОЕ: Разделение расходов
+    # Расходы
     partner_expenses: Decimal  # Расходы партнёра (ручной ввод)
     production_expenses: Decimal  # Себестоимость производства
     total_expenses: Decimal  # Общая сумма расходов
 
     # Количественные показатели
-    bonus_count: int  # Бонусы (штук)
+    bonus_count: int  # ✅ ИСПРАВЛЕНО: Бонусы из инвентаря
     orders_count: int  # Заказов
     products_count: int  # Товаров продано
 
@@ -99,7 +98,7 @@ class StatisticsData:
             'paid_debt': float(self.paid_debt),
             'defect_amount': float(self.defect_amount),
 
-            # ✅ НОВОЕ: Разделённые расходы
+            # Разделённые расходы
             'partner_expenses': float(self.partner_expenses),
             'production_expenses': float(self.production_expenses),
             'total_expenses': float(self.total_expenses),
@@ -115,13 +114,17 @@ class StatisticsData:
         """
         Данные для круговой диаграммы (ТЗ v2.0).
 
-        ✅ ИЗМЕНЕНИЕ: total_expenses вместо отдельных полей
+        Возвращает только 4 основных показателя:
+        - income (доход)
+        - debt (долг)
+        - defect (брак)
+        - expenses (расходы)
         """
         return {
             'income': float(self.income),
             'debt': float(self.debt),
             'defect': float(self.defect_amount),
-            'expenses': float(self.total_expenses),  # ✅ Общая сумма
+            'expenses': float(self.total_expenses),
         }
 
 
@@ -148,8 +151,8 @@ class ReportService:
 
         Args:
             period: Период (день, неделя, месяц и т.д.)
-            start_date: Начальная дата (опционально)
-            end_date: Конечная дата (опционально)
+            start_date: Начало (опционально)
+            end_date: Конец (опционально)
 
         Returns:
             (start_date, end_date)
@@ -163,13 +166,12 @@ class ReportService:
             return today, today
 
         elif period == TimePeriod.WEEK:
-            start = today - timedelta(days=today.weekday())  # Понедельник
-            end = start + timedelta(days=6)  # Воскресенье
+            start = today - timedelta(days=today.weekday())
+            end = start + timedelta(days=6)
             return start, end
 
         elif period == TimePeriod.MONTH:
             start = today.replace(day=1)
-            # Последний день месяца
             if today.month == 12:
                 end = today.replace(day=31)
             else:
@@ -186,11 +188,12 @@ class ReportService:
             end = today.replace(month=12, day=31)
             return start, end
 
-        elif period == TimePeriod.ALL_TIME:
-            # Берём с начала времён до сегодня
-            return date(2020, 1, 1), today
-
-        return today, today
+        else:  # ALL_TIME
+            # Берём от самого раннего заказа
+            first_order = StoreOrder.objects.order_by('created_at').first()
+            if first_order:
+                return first_order.created_at.date(), today
+            return today, today
 
     @classmethod
     def calculate_statistics(
@@ -198,17 +201,19 @@ class ReportService:
             filters: ReportFilters,
     ) -> StatisticsData:
         """
-        Вычислить статистику в реальном времени (ТЗ v2.0).
+        Рассчитать статистику с учётом фильтров.
 
-        ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ERROR-7:
-        Добавлен расчёт production_expenses из ExpenseService
+        ✅ КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v2.1:
+        1. Бонусы считаются из ИНВЕНТАРЯ магазинов (не из заказов)
+        2. Брак фильтруется по дате создания (не по заказам)
+        3. Расходы разделены на partner_expenses и production_expenses
 
         Алгоритм:
         1. Получить диапазон дат
         2. Фильтровать заказы по датам и другим параметрам
         3. Вычислить все показатели
-        4. ✅ НОВОЕ: Рассчитать расходы производства
-        5. ✅ НОВОЕ: Разделить на partner_expenses и production_expenses
+        4. Рассчитать бонусы из инвентаря магазинов
+        5. Фильтровать брак по дате создания
         6. Вернуть StatisticsData
         """
         # 1. Диапазон дат
@@ -225,7 +230,7 @@ class ReportService:
             confirmed_at__date__lte=end_date
         )
 
-        # Фильтры
+        # Применяем фильтры
         if filters.store_id:
             orders_qs = orders_qs.filter(store_id=filters.store_id)
 
@@ -238,14 +243,17 @@ class ReportService:
         if filters.city_id:
             orders_qs = orders_qs.filter(store__city_id=filters.city_id)
 
-        # 3. Доход (сумма заказов + погашенные долги)
+        # =========================================================================
+        # 3. ДОХОД (сумма заказов + погашенные долги)
+        # =========================================================================
+
         orders_data = orders_qs.aggregate(total=Sum('total_amount'))
         orders_income = orders_data['total'] or Decimal('0')
 
         # Погашенные долги
         paid_debt_qs = DebtPayment.objects.filter(
-            created_at__date__gte=start_date,  # ✅ ИСПРАВЛЕНО
-            created_at__date__lte=end_date  # ✅ ИСПРАВЛЕНО
+            created_at__date__gte=start_date,
+            created_at__date__lte=end_date
         )
 
         if filters.store_id:
@@ -260,30 +268,81 @@ class ReportService:
         # Общий доход
         income = orders_income + paid_debt
 
-        # 4. Долги
+        # =========================================================================
+        # 4. ДОЛГИ (непогашенные)
+        # =========================================================================
+
         debt_data = orders_qs.aggregate(total=Sum('debt_amount'))
         debt = debt_data['total'] or Decimal('0')
 
-        # 5. Бонусы (количество)
-        from orders.models import StoreOrderItem
-        bonus_data = StoreOrderItem.objects.filter(
-            order__in=orders_qs,
-            is_bonus=True
-        ).aggregate(count=Count('id'))
-        bonus_count = bonus_data['count'] or 0
+        # =========================================================================
+        # 5. ✅ БОНУСЫ - ИСПРАВЛЕНО v2.1
+        # Считаем из ИНВЕНТАРЯ магазинов, а не из заказов!
+        # =========================================================================
 
-        # 6. Брак
+        bonus_count = 0
+
+        # Определяем магазины для подсчёта
+        if filters.store_id:
+            stores = Store.objects.filter(id=filters.store_id, is_active=True)
+        else:
+            stores = Store.objects.filter(is_active=True)
+
+            # Применяем дополнительные фильтры
+            if filters.region_id:
+                stores = stores.filter(region_id=filters.region_id)
+
+            if filters.city_id:
+                stores = stores.filter(city_id=filters.city_id)
+
+        # Считаем бонусы в инвентаре каждого магазина
+        BONUS_THRESHOLD = 21  # Каждый 21-й товар
+
+        for store in stores:
+            # Получаем инвентарь магазина
+            inventory = StoreInventory.objects.filter(
+                store=store
+            ).select_related('product')
+
+            for item in inventory:
+                product = item.product
+
+                # Бонусы только для штучных товаров с is_bonus=True
+                if product.is_bonus and not product.is_weight_based:
+                    quantity = int(item.quantity)
+                    # Каждый 21-й товар бесплатно
+                    item_bonus_count = quantity // BONUS_THRESHOLD
+                    bonus_count += item_bonus_count
+
+        # =========================================================================
+        # 6. ✅ БРАК - ИСПРАВЛЕНО v2.1
+        # Фильтруем по дате СОЗДАНИЯ брака, а не по заказам!
+        # =========================================================================
+
         defect_qs = DefectiveProduct.objects.filter(
             status=DefectiveProduct.DefectStatus.APPROVED,
             created_at__date__gte=start_date,
-            created_at__date__lte=end_date,
-            order__in=orders_qs
+            created_at__date__lte=end_date
         )
+
+        # Применяем фильтры
+        if filters.store_id:
+            defect_qs = defect_qs.filter(order__store_id=filters.store_id)
+
+        if filters.partner_id:
+            defect_qs = defect_qs.filter(reviewed_by_id=filters.partner_id)
+
+        if filters.region_id:
+            defect_qs = defect_qs.filter(order__store__region_id=filters.region_id)
+
+        if filters.city_id:
+            defect_qs = defect_qs.filter(order__store__city_id=filters.city_id)
+
         defect_data = defect_qs.aggregate(total=Sum('total_amount'))
         defect_amount = defect_data['total'] or Decimal('0')
 
         # =========================================================================
-        # ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ERROR-7: РАЗДЕЛЕНИЕ РАСХОДОВ
+        # 7. РАСХОДЫ (разделённые)
         # =========================================================================
 
         # 7a. РАСХОДЫ ПАРТНЁРОВ (ручной ввод)
@@ -292,7 +351,6 @@ class ReportService:
             date__lte=end_date
         )
 
-        # Фильтрация расходов по партнёру
         if filters.partner_id:
             partner_expenses_qs = partner_expenses_qs.filter(partner_id=filters.partner_id)
 
@@ -300,15 +358,14 @@ class ReportService:
         partner_expenses = partner_expenses_data['total'] or Decimal('0')
 
         # 7b. РАСХОДЫ ПРОИЗВОДСТВА (себестоимость)
-        # Рассчитываем через ExpenseService с учётом иерархии
         try:
             expenses_result = ExpenseService.calculate_total_expenses_with_hierarchy()
 
-            # Себестоимость = дневные расходы * количество дней в периоде
+            # Количество дней в периоде
             days_count = (end_date - start_date).days + 1
 
-            # Дневные расходы из Expense
-            daily_production = expenses_result.daily_expenses
+            # Дневные расходы * количество дней
+            daily_production = expenses_result.daily_expenses * days_count
 
             # Месячные расходы в пересчёте на период
             monthly_production = expenses_result.monthly_per_day * days_count
@@ -317,7 +374,6 @@ class ReportService:
             production_expenses = daily_production + monthly_production
 
         except Exception as e:
-            # Если ExpenseService недоступен - используем 0
             import logging
             logger = logging.getLogger(__name__)
             logger.warning(f"Не удалось рассчитать production_expenses: {e}")
@@ -327,10 +383,9 @@ class ReportService:
         total_expenses = partner_expenses + production_expenses
 
         # =========================================================================
-        # КОНЕЦ ИЗМЕНЕНИЙ ERROR-7
+        # 8. КОЛИЧЕСТВЕННЫЕ ПОКАЗАТЕЛИ
         # =========================================================================
 
-        # 8. Количественные показатели
         orders_count = orders_qs.count()
 
         products_count_data = StoreOrderItem.objects.filter(
@@ -338,26 +393,32 @@ class ReportService:
         ).aggregate(total=Sum('quantity'))
         products_count = int(products_count_data['total'] or 0)
 
-        # 9. Вычисляемые показатели
+        # =========================================================================
+        # 9. ВЫЧИСЛЯЕМЫЕ ПОКАЗАТЕЛИ
+        # =========================================================================
+
         # Общий баланс = доход - брак - расходы - долг
         total_balance = income - defect_amount - total_expenses - debt
 
         # Прибыль (без учёта долга) = доход - брак - расходы
         profit = income - defect_amount - total_expenses
 
-        # 10. Возвращаем результат
+        # =========================================================================
+        # 10. ВОЗВРАЩАЕМ РЕЗУЛЬТАТ
+        # =========================================================================
+
         return StatisticsData(
             income=income,
             debt=debt,
             paid_debt=paid_debt,
             defect_amount=defect_amount,
 
-            # ✅ НОВОЕ: Разделённые расходы
+            # Разделённые расходы
             partner_expenses=partner_expenses,
             production_expenses=production_expenses,
             total_expenses=total_expenses,
 
-            bonus_count=bonus_count,
+            bonus_count=bonus_count,  # ✅ ИСПРАВЛЕНО: из инвентаря
             orders_count=orders_count,
             products_count=products_count,
             total_balance=total_balance,
@@ -406,79 +467,77 @@ class ReportService:
     def get_store_history(
             cls,
             store: Store,
-            start_date: Optional[date] = None,  # ✅ Теперь опционально
-            end_date: Optional[date] = None,  # ✅ Теперь опционально
+            start_date: Optional[date] = None,
+            end_date: Optional[date] = None,
     ) -> List[Dict[str, Any]]:
         """
         История магазина с фильтрацией по дате (ТЗ v2.0).
 
-        ✅ ИСПРАВЛЕНО:
-        - Поле changed_at → created_at
-        - start_date и end_date теперь опциональны (по умолчанию за всё время)
-
         Args:
             store: Магазин
-            start_date: Начальная дата (опционально, по умолчанию с начала времён)
-            end_date: Конечная дата (опционально, по умолчанию до сегодня)
+            start_date: Начало периода (опционально)
+            end_date: Конец периода (опционально)
 
         Returns:
-            List[Dict] с историей магазина
+            List[Dict] с историей по дням
         """
-        from orders.models import OrderHistory, OrderType
-        from django.db.models import Min
+        from orders.models import StoreOrderItem, OrderHistory, OrderType
 
-        # =========================================================================
-        # ОПРЕДЕЛЕНИЕ ДИАПАЗОНА ДАТ (если не указаны)
-        # =========================================================================
+        # Получаем заказы магазина
+        orders_qs = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.ACCEPTED
+        ).order_by('confirmed_at')
 
-        if not start_date:
-            # Берём дату первого заказа магазина
-            first_order = StoreOrder.objects.filter(
-                store=store
-            ).order_by('created_at').first()
+        # Применяем фильтр по датам
+        if start_date:
+            orders_qs = orders_qs.filter(confirmed_at__date__gte=start_date)
 
-            if first_order:
-                start_date = first_order.created_at.date()
-            else:
-                # Если заказов нет - берём сегодня
-                start_date = timezone.now().date()
+        if end_date:
+            orders_qs = orders_qs.filter(confirmed_at__date__lte=end_date)
 
-        if not end_date:
-            # До сегодняшнего дня
-            end_date = timezone.now().date()
-
+        # Группируем заказы по дням
         history = []
 
-        # =========================================================================
-        # 1. ЗАКАЗЫ МАГАЗИНА
-        # =========================================================================
-        orders = StoreOrder.objects.filter(
-            store=store,
-            status=StoreOrderStatus.ACCEPTED,
-            confirmed_at__date__gte=start_date,
-            confirmed_at__date__lte=end_date
-        ).prefetch_related(
-            'items__product',
-            'debt_payments',
-        ).select_related('partner')
+        for order in orders_qs:
+            order_date = order.confirmed_at.date()
 
-        for order in orders:
-            day_data = {
-                'type': 'order',
-                'date': order.confirmed_at.date().isoformat(),
+            # Ищем существующую запись за этот день
+            day_data = next(
+                (item for item in history if item['date'] == str(order_date)),
+                None
+            )
+
+            if not day_data:
+                day_data = {
+                    'date': str(order_date),
+                    'orders': [],
+                    'products': [],
+                    'bonus_products': [],
+                    'defective_products': [],
+                    'debt_payments': [],
+                    'status_history': [],
+                    'total_amount': 0.0,
+                    'total_debt': 0.0,
+                }
+                history.append(day_data)
+
+            # Добавляем информацию о заказе
+            day_data['orders'].append({
                 'order_id': order.id,
-                'partner_name': order.partner.get_full_name() if order.partner else None,
-                'products': [],
-                'bonus_products': [],
-                'defective_products': [],
+                'total_amount': float(order.total_amount),
+                'debt_amount': float(order.debt_amount),
                 'prepayment_amount': float(order.prepayment_amount),
-                'debt': float(order.debt_amount),
-                'paid': float(order.paid_amount),
-                'outstanding_debt': float(order.outstanding_debt),
-            }
+                'partner_name': order.partner.get_full_name() if order.partner else 'Не назначен',
+            })
 
-            # Полученные товары
-            for item in order.items.all():
+            day_data['total_amount'] += float(order.total_amount)
+            day_data['total_debt'] += float(order.debt_amount)
+
+            # Товары заказа
+            items = order.items.all().select_related('product')
+
+            for item in items:
                 product_data = {
                     'name': item.product.name,
                     'quantity': float(item.quantity),
@@ -507,11 +566,11 @@ class ReportService:
 
             # Погашения долга по этому заказу
             debt_payments_list = []
-            for payment in order.debt_payments.all().order_by('created_at'):  # ✅ ИСПРАВЛЕНО
+            for payment in order.debt_payments.all().order_by('created_at'):
                 debt_payments_list.append({
                     'payment_id': payment.id,
                     'amount': float(payment.amount),
-                    'created_at': payment.created_at.isoformat(),  # ✅ ИСПРАВЛЕНО
+                    'created_at': payment.created_at.isoformat(),
                     'paid_by': payment.paid_by.get_full_name() if payment.paid_by else None,
                     'received_by': payment.received_by.get_full_name() if payment.received_by else None,
                     'comment': payment.comment or '',
@@ -524,104 +583,17 @@ class ReportService:
             order_history = OrderHistory.objects.filter(
                 order_type=OrderType.STORE,
                 order_id=order.id
-            ).order_by('created_at')  # ✅ ИСПРАВЛЕНО: changed_at → created_at
+            ).order_by('created_at')
 
             for history_entry in order_history:
                 status_history_list.append({
                     'old_status': history_entry.old_status,
                     'new_status': history_entry.new_status,
                     'changed_by': history_entry.changed_by.get_full_name() if history_entry.changed_by else None,
-                    'created_at': history_entry.created_at.isoformat(),  # ✅ ИСПРАВЛЕНО
+                    'created_at': history_entry.created_at.isoformat(),
                     'comment': history_entry.comment or '',
                 })
 
             day_data['status_history'] = status_history_list
 
-            history.append(day_data)
-
-        # =========================================================================
-        # 2. ОТДЕЛЬНЫЕ ПОГАШЕНИЯ ДОЛГА (без привязки к заказу)
-        # =========================================================================
-
-        # Погашения которые были сделаны напрямую
-        standalone_payments = DebtPayment.objects.filter(
-            order__store=store,
-            created_at__date__gte=start_date,  # ✅ ИСПРАВЛЕНО
-            created_at__date__lte=end_date  # ✅ ИСПРАВЛЕНО
-        ).select_related('order', 'paid_by', 'received_by').order_by('created_at')  # ✅ ИСПРАВЛЕНО
-
-        # Группируем по дням
-        from collections import defaultdict
-        payments_by_date = defaultdict(list)
-
-        for payment in standalone_payments:
-            payment_date = payment.created_at.date()  # ✅ ИСПРАВЛЕНО
-
-            payments_by_date[payment_date].append({
-                'payment_id': payment.id,
-                'order_id': payment.order.id if payment.order else None,
-                'amount': float(payment.amount),
-                'created_at': payment.created_at.isoformat(),  # ✅ ИСПРАВЛЕНО
-                'paid_by': payment.paid_by.get_full_name() if payment.paid_by else None,
-                'received_by': payment.received_by.get_full_name() if payment.received_by else None,
-                'comment': payment.comment or '',
-            })
-
-        # Добавляем дни с погашениями в историю
-        for payment_date, payments_list in payments_by_date.items():
-            history.append({
-                'type': 'payment',
-                'date': payment_date.isoformat(),
-                'payments': payments_list,
-                'total_amount': sum(p['amount'] for p in payments_list),
-            })
-
-        # Сортируем всю историю по дате
-        history.sort(key=lambda x: x['date'], reverse=True)
-
         return history
-
-    @classmethod
-    def get_partner_expenses_summary(
-            cls,
-            partner_id: Optional[int] = None,
-            start_date: Optional[date] = None,
-            end_date: Optional[date] = None,
-    ) -> Dict[str, Any]:
-        """
-        Сводка по расходам партнёров.
-
-        Args:
-            partner_id: ID партнёра (опционально, если None - все партнёры)
-            start_date: Начальная дата
-            end_date: Конечная дата
-
-        Returns:
-            Dict с суммой и количеством расходов
-        """
-        today = timezone.now().date()
-        start_date = start_date or today.replace(day=1)
-        end_date = end_date or today
-
-        expenses_qs = PartnerExpense.objects.filter(
-            date__gte=start_date,
-            date__lte=end_date
-        )
-
-        if partner_id:
-            expenses_qs = expenses_qs.filter(partner_id=partner_id)
-
-        stats = expenses_qs.aggregate(
-            total_amount=Sum('amount'),
-            count=Count('id')
-        )
-
-        return {
-            'period': {
-                'start_date': str(start_date),
-                'end_date': str(end_date),
-            },
-            'partner_id': partner_id,
-            'total_amount': float(stats['total_amount'] or 0),
-            'expenses_count': stats['count'] or 0,
-        }

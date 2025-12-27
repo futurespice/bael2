@@ -37,7 +37,7 @@ API ENDPOINTS:
 from decimal import Decimal
 from typing import Any, Dict
 
-from django.db.models import QuerySet
+from django.db.models import QuerySet, Q  # ✅ Добавлен Q
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -46,6 +46,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
 from django.core.exceptions import ValidationError
+
+# ✅ ДОБАВЛЕНЫ ИМПОРТЫ drf-spectacular
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
+from drf_spectacular.types import OpenApiTypes
+
 from .permissions import IsPartner
 
 from .models import (
@@ -100,6 +105,30 @@ class StandardPagination(PageNumberPagination):
 # ГЕОГРАФИЯ (РЕГИОНЫ И ГОРОДА)
 # =============================================================================
 
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список регионов",
+        description="Получить список всех регионов Кыргызстана",
+
+    ),
+    create=extend_schema(
+        summary="Создать регион",
+        description="Создать новый регион (только админ)",
+
+    ),
+    retrieve=extend_schema(
+        summary="Детали региона",
+    ),
+    update=extend_schema(
+        summary="Обновить регион",
+    ),
+    partial_update=extend_schema(
+        summary="Частично обновить регион",
+    ),
+    destroy=extend_schema(
+        summary="Удалить регион",
+    ),
+)
 class RegionViewSet(viewsets.ModelViewSet):
     """
     ViewSet для управления регионами (только админ).
@@ -121,6 +150,28 @@ class RegionViewSet(viewsets.ModelViewSet):
         serializer.instance = region
 
 
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список городов",
+        description="Получить список всех городов",
+        parameters=[
+            OpenApiParameter(
+                name='region',
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='Фильтр по региону'
+            )
+        ],
+    ),
+    create=extend_schema(
+        summary="Создать город",
+        description="Создать новый город (только админ)",
+
+    ),
+    retrieve=extend_schema(
+        summary="Детали города",
+    ),
+)
 class CityViewSet(viewsets.ModelViewSet):
     """
     ViewSet для управления городами (только админ).
@@ -148,6 +199,36 @@ class CityViewSet(viewsets.ModelViewSet):
 # МАГАЗИНЫ
 # =============================================================================
 
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список магазинов",
+        description="Получить список магазинов с поиском и фильтрацией",
+        parameters=[
+            OpenApiParameter('search', OpenApiTypes.STR, description='Поиск по ИНН, названию, городу'),
+            OpenApiParameter('region_id', OpenApiTypes.INT, description='Фильтр по региону'),
+            OpenApiParameter('city_id', OpenApiTypes.INT, description='Фильтр по городу'),
+            OpenApiParameter('is_active', OpenApiTypes.BOOL, description='Фильтр по активности'),
+        ],
+
+    ),
+    create=extend_schema(
+        summary="Регистрация магазина",
+        description="Зарегистрировать новый магазин",
+
+    ),
+    retrieve=extend_schema(
+        summary="Детали магазина",
+
+    ),
+    update=extend_schema(
+        summary="Обновить магазин",
+
+    ),
+    partial_update=extend_schema(
+        summary="Частично обновить магазин",
+
+    ),
+)
 class StoreViewSet(viewsets.ModelViewSet):
     """
     ViewSet для работы с магазинами.
@@ -162,7 +243,19 @@ class StoreViewSet(viewsets.ModelViewSet):
     pagination_class = StandardPagination
 
     def get_queryset(self) -> QuerySet[Store]:
-        """Получение списка магазинов в зависимости от роли."""
+        """
+        Получение списка магазинов в зависимости от роли.
+
+        ✅ ИСПРАВЛЕНО: Добавлена защита от swagger_fake_view
+        """
+        # Для Swagger документации
+        if getattr(self, 'swagger_fake_view', False):
+            return Store.objects.none()
+
+        # Защита от AnonymousUser
+        if not self.request.user.is_authenticated:
+            return Store.objects.none()
+
         user = self.request.user
 
         if user.role == 'admin':
@@ -183,7 +276,26 @@ class StoreViewSet(viewsets.ModelViewSet):
         else:
             queryset = Store.objects.none()
 
-        return queryset.select_related('region', 'city').order_by('name')
+        # Поиск и фильтрация
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(
+                Q(inn__icontains=search) |
+                Q(name__icontains=search) |
+                Q(city__name__icontains=search)
+            )
+
+        region_id = self.request.query_params.get('region_id')
+        if region_id:
+            queryset = queryset.filter(region_id=region_id)
+
+        city_id = self.request.query_params.get('city_id')
+        if city_id:
+            queryset = queryset.filter(city_id=city_id)
+
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
 
         return queryset.select_related('region', 'city').order_by('-created_at')
 
@@ -259,41 +371,32 @@ class StoreViewSet(viewsets.ModelViewSet):
         output_serializer = StoreSerializer(store)
         return Response(output_serializer.data)
 
+    # =========================================================================
+    # ✅ ИСПРАВЛЕНО: FREEZE С @extend_schema И @action
+    # =========================================================================
 
+    @extend_schema(
+        summary="Заморозить магазин",
+        description="Заблокировать магазин (только админ)",
+        request=StoreFreezeSerializer,
+        responses={
+            200: StoreSerializer,
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Недостаточно прав"),
+        },
+
+    )
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='freeze',
+        permission_classes=[IsAuthenticated, IsAdmin]
+    )
     def freeze(self, request: Request, pk=None) -> Response:
         """
         Заморозить (заблокировать) магазин.
 
         Только для администраторов.
-
-        POST /api/stores/{id}/freeze/
-
-        Request Body:
-            {
-                "reason": "Нарушение условий работы"  // опционально
-            }
-
-        Response (Success):
-            {
-                "message": "Магазин 'Название' заморожен",
-                "store": {
-                    "id": 1,
-                    "name": "Название",
-                    "is_active": false,
-                    ...
-                }
-            }
-
-        Response (Error):
-            {
-                "error": "Только администратор может замораживать магазины"
-            }
-
-        Статус коды:
-        - 200: Успешно заморожен
-        - 400: Ошибка валидации (например, уже заморожен)
-        - 403: Недостаточно прав
-        - 404: Магазин не найден
         """
         store = self.get_object()
 
@@ -339,6 +442,16 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @extend_schema(
+        summary="Разморозить магазин",
+        description="Разблокировать магазин (только админ)",
+        request=StoreUnfreezeSerializer,
+        responses={
+            200: StoreSerializer,
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Недостаточно прав"),
+        },
+    )
     @action(
         detail=True,
         methods=['post'],
@@ -350,35 +463,6 @@ class StoreViewSet(viewsets.ModelViewSet):
         Разморозить (разблокировать) магазин.
 
         Только для администраторов.
-
-        POST /api/stores/{id}/unfreeze/
-
-        Request Body:
-            {
-                "comment": "Нарушение устранено"  // опционально
-            }
-
-        Response (Success):
-            {
-                "message": "Магазин 'Название' разморожен",
-                "store": {
-                    "id": 1,
-                    "name": "Название",
-                    "is_active": true,
-                    ...
-                }
-            }
-
-        Response (Error):
-            {
-                "error": "Только администратор может размораживать магазины"
-            }
-
-        Статус коды:
-        - 200: Успешно разморожен
-        - 400: Ошибка валидации (например, уже активен)
-        - 403: Недостаточно прав
-        - 404: Магазин не найден
         """
         store = self.get_object()
 
@@ -424,7 +508,6 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-
     @action(detail=True, methods=['get'], url_path='inventory')
     def inventory(self, request: Request, pk=None) -> Response:
         """
@@ -443,13 +526,13 @@ class StoreViewSet(viewsets.ModelViewSet):
         if user.role == 'store':
             # Импортируем здесь чтобы избежать circular import
             from orders.models import StoreOrder, StoreOrderStatus
-            
+
             # Проверяем есть ли заказы со статусом IN_TRANSIT
             has_in_transit = StoreOrder.objects.filter(
                 store=store,
                 status=StoreOrderStatus.IN_TRANSIT
             ).exists()
-            
+
             if has_in_transit:
                 return Response(
                     {
@@ -494,12 +577,12 @@ class StoreViewSet(viewsets.ModelViewSet):
         # Проверка для магазина: инвентарь скрыт при IN_TRANSIT
         if user.role == 'store':
             from orders.models import StoreOrder, StoreOrderStatus
-            
+
             has_in_transit = StoreOrder.objects.filter(
                 store=store,
                 status=StoreOrderStatus.IN_TRANSIT
             ).exists()
-            
+
             if has_in_transit:
                 return Response(
                     {
@@ -1002,8 +1085,6 @@ class StoreViewSet(viewsets.ModelViewSet):
             'store_debt_after': float(store.debt)
         }, status=status.HTTP_201_CREATED)
 
-
-
     @action(
         detail=True,
         methods=['post'],
@@ -1170,6 +1251,8 @@ class StoreViewSet(viewsets.ModelViewSet):
     # from rest_framework.permissions import IsAuthenticated
     # from orders.models import DebtPayment, StoreOrder, StoreOrderStatus
     # from stores.models import Store
+
+
 # =============================================================================
 # ВЫБОР МАГАЗИНА
 # =============================================================================
@@ -1178,15 +1261,42 @@ class SelectStoreView(APIView):
     """
     Выбрать магазин для работы (только для role='store').
 
-    POST /api/stores/select/
-    Body: {"store_id": 1}
+    ✅ ИСПРАВЛЕНО: Поддерживает store_id из body И query params.
     """
 
     permission_classes = [IsAuthenticated, IsStore]
 
+    @extend_schema(
+        summary="Выбрать магазин",
+        description="Выбрать магазин для работы. Store_id можно передать в body или query параметре.",
+        request=StoreSelectionCreateSerializer,
+        responses={
+            200: StoreSelectionSerializer,
+            400: OpenApiResponse(description="Магазин не найден или заблокирован"),
+        },
+        parameters=[
+            OpenApiParameter(
+                name='store_id',
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='ID магазина (альтернатива передаче в body)',
+                required=False
+            )
+        ],
+    )
     def post(self, request: Request) -> Response:
         """Выбрать магазин."""
-        serializer = StoreSelectionCreateSerializer(data=request.data)
+        # ✅ ИСПРАВЛЕНО: Поддержка store_id из query params ИЛИ body
+        store_id = request.query_params.get('store_id') or request.data.get('store_id')
+
+        if not store_id:
+            return Response(
+                {'error': 'store_id обязателен (в body или query params)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Валидация
+        serializer = StoreSelectionCreateSerializer(data={'store_id': store_id})
         serializer.is_valid(raise_exception=True)
 
         selection = StoreSelectionService.select_store(
@@ -1201,12 +1311,20 @@ class SelectStoreView(APIView):
 class DeselectStoreView(APIView):
     """
     Отменить выбор текущего магазина (только для role='store').
-
-    POST /api/stores/deselect/
     """
 
     permission_classes = [IsAuthenticated, IsStore]
 
+    @extend_schema(
+        summary="Отменить выбор магазина",
+        description="Отменить выбор текущего магазина",
+        request=None,
+        responses={
+            200: OpenApiResponse(description="Выбор отменён"),
+            404: OpenApiResponse(description="Активный магазин не найден"),
+        },
+
+    )
     def post(self, request: Request) -> Response:
         """Отменить выбор магазина."""
         deselected = StoreSelectionService.deselect_store(request.user)
@@ -1227,6 +1345,15 @@ class DeselectStoreView(APIView):
 # ФУНКЦИОНАЛЬНЫЕ VIEWS
 # =============================================================================
 
+@extend_schema(
+    summary="Текущий магазин",
+    description="Получить профиль текущего выбранного магазина",
+    responses={
+        200: StoreSerializer,
+        404: OpenApiResponse(description="Магазин не выбран"),
+    },
+    tags=['Магазины']
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, IsStore])
 def get_current_store_profile(request: Request) -> Response:
@@ -1247,6 +1374,12 @@ def get_current_store_profile(request: Request) -> Response:
     return Response(serializer.data)
 
 
+@extend_schema(
+    summary="Пользователи в магазине",
+    description="Получить список пользователей, работающих в магазине",
+    responses={200: {'type': 'array', 'items': {'type': 'object'}}},
+    tags=['Магазины']
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_users_in_store(request: Request, pk: int) -> Response:

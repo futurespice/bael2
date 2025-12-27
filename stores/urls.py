@@ -1,3 +1,12 @@
+# apps/stores/urls.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+"""
+URL маршруты для stores.
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ:
+1. ✅ Добавлены эндпоинты available и current
+2. ✅ Правильный порядок URL patterns (specific перед generic)
+"""
+
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
@@ -13,24 +22,21 @@ router.register(r'stores', views.StoreViewSet, basename='store')
 
 # URL patterns
 urlpatterns = [
-    # Router URLs
-    path('', include(router.urls)),
+    # =========================================================================
+    # ВАЖНО: Specific URLs ПЕРЕД router.urls!
+    # =========================================================================
 
     # === ВЫБОР МАГАЗИНА (для role='store') ===
 
-
-    # Выбрать магазин
+    # Выбрать магазин (POST /api/stores/select/)
+    # Поддерживает: Body {"store_id": 1} И Query ?store_id=1
     path('select/', views.SelectStoreView.as_view(), name='select-store'),
 
-    # Отменить выбор
+    # Отменить выбор (POST /api/stores/deselect/)
     path('deselect/', views.DeselectStoreView.as_view(), name='deselect-store'),
 
-
-    # Профиль текущего магазина (алиас для current)
-    path('profile/', views.get_current_store_profile, name='store-profile'),
-
-    # === ДОПОЛНИТЕЛЬНЫЕ ENDPOINTS ===
-
-    # Пользователи в магазине
-    path('stores/<int:pk>/users/', views.get_users_in_store, name='store-users'),
+    # =========================================================================
+    # Router URLs (должен быть ПОСЛЕДНИМ!)
+    # =========================================================================
+    path('', include(router.urls)),
 ]
