@@ -12,8 +12,6 @@ from .models import (
     StoreOrder,
     StoreOrderItem,
     StoreOrderStatus,
-    PartnerOrder,
-    PartnerOrderItem,
     DebtPayment,
     DefectiveProduct,
     OrderHistory,
@@ -280,75 +278,6 @@ class PayDebtSerializer(serializers.Serializer):
         allow_blank=True,
         max_length=500
     )
-
-
-# =============================================================================
-# DEFECTIVE PRODUCT SERIALIZERS
-# =============================================================================
-
-class DefectiveProductSerializer(serializers.ModelSerializer):
-    """Сериализатор бракованного товара."""
-
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    status_display = serializers.CharField(
-        source='get_status_display',
-        read_only=True
-    )
-    reported_by_name = serializers.SerializerMethodField()
-    reviewed_by_name = serializers.SerializerMethodField()
-
-    class Meta:
-        model = DefectiveProduct
-        fields = [
-            'id',
-            'order',
-            'product',
-            'product_name',
-            'quantity',
-            'price',
-            'total_amount',
-            'status',
-            'status_display',
-            'reason',
-            'reported_by',
-            'reported_by_name',
-            'reviewed_by',
-            'reviewed_by_name',
-            'created_at',
-            'updated_at'
-        ]
-        read_only_fields = [
-            'id',
-            'total_amount',
-            'status',
-            'reviewed_by',
-            'created_at',
-            'updated_at'
-        ]
-
-    def get_reported_by_name(self, obj: DefectiveProduct) -> str:
-        return obj.reported_by.get_full_name() if obj.reported_by else None
-
-    def get_reviewed_by_name(self, obj: DefectiveProduct) -> str:
-        return obj.reviewed_by.get_full_name() if obj.reviewed_by else None
-
-
-class ReportDefectSerializer(serializers.Serializer):
-    """Заявка о браке."""
-
-    product_id = serializers.IntegerField(min_value=1)
-    quantity = serializers.DecimalField(
-        max_digits=10,
-        decimal_places=3,
-        min_value=Decimal('0.001')
-    )
-    price = serializers.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        min_value=Decimal('0')
-    )
-    reason = serializers.CharField(max_length=500)
-
 
 # =============================================================================
 # ORDER HISTORY SERIALIZER

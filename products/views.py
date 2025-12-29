@@ -46,6 +46,7 @@ from .serializers import (
     ProductExpenseRelationCreateSerializer,
     CostCalculationRequestSerializer,
     CostCalculationResultSerializer, ProductAdminListSerializer, ProductAdminDetailSerializer,
+    ProductSetManualPriceSerializer,
 )
 from .services import (
     ExpenseService,
@@ -441,7 +442,224 @@ class ProductViewSet(viewsets.ModelViewSet):
         output = CostCalculationResultSerializer(result)
         return Response(output.data)
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def set_manual_price(self, request, pk=None):
+        """
+        Установить ручную цену товара (только админ).
 
+        POST /api/products/products/{id}/set-manual-price/
+        Body: {"manual_price": "100.00"}
+
+        Если manual_price установлена:
+        - Используется вместо автоматического расчёта
+        - final_price = manual_price
+
+        Чтобы вернуться к автоматическому расчёту:
+        - Установите manual_price = null или 0
+
+        ✅ НОВОЕ v2.1
+        """
+        from decimal import Decimal
+        from rest_framework import status
+
+        product = self.get_object()
+
+        # Валидация входных данных
+        serializer = ProductSetManualPriceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        manual_price = serializer.validated_data.get('manual_price')
+
+        # Обновляем товар
+        old_price = product.final_price
+        old_manual = product.manual_price
+
+        if manual_price is None or manual_price == 0:
+            # Сброс ручной цены - возврат к автоматическому расчёту
+            product.manual_price = None
+            product.save()
+
+            return Response({
+                'success': True,
+                'message': 'Ручная цена сброшена. Цена рассчитывается автоматически.',
+                'product_id': product.id,
+                'old_manual_price': float(old_manual) if old_manual else None,
+                'new_manual_price': None,
+                'old_final_price': float(old_price),
+                'new_final_price': float(product.final_price),
+                'calculation_mode': 'automatic',
+                'average_cost_price': float(product.average_cost_price),
+                'markup_percentage': float(product.markup_percentage),
+            })
+        else:
+            # Установка ручной цены
+            product.manual_price = manual_price
+            product.save()
+
+            return Response({
+                'success': True,
+                'message': f'Ручная цена установлена: {product.final_price} сом',
+                'product_id': product.id,
+                'old_manual_price': float(old_manual) if old_manual else None,
+                'new_manual_price': float(product.manual_price),
+                'old_final_price': float(old_price),
+                'new_final_price': float(product.final_price),
+                'calculation_mode': 'manual',
+            })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def clear_manual_price(self, request, pk=None):
+        """
+        Сбросить ручную цену и вернуться к автоматическому расчёту.
+
+        POST /api/products/products/{id}/clear-manual-price/
+
+        Эквивалентно: set_manual_price с manual_price = null
+
+        ✅ НОВОЕ v2.1
+        """
+        product = self.get_object()
+
+        old_price = product.final_price
+        old_manual = product.manual_price
+
+        if product.manual_price is None:
+            return Response({
+                'success': True,
+                'message': 'Ручная цена уже не установлена',
+                'product_id': product.id,
+                'final_price': float(product.final_price),
+                'calculation_mode': 'automatic',
+            })
+
+        product.manual_price = None
+        product.save()
+
+        return Response({
+            'success': True,
+            'message': 'Ручная цена сброшена. Цена рассчитывается автоматически.',
+            'product_id': product.id,
+            'old_manual_price': float(old_manual) if old_manual else None,
+            'old_final_price': float(old_price),
+            'new_final_price': float(product.final_price),
+            'calculation_mode': 'automatic',
+            'average_cost_price': float(product.average_cost_price),
+            'markup_percentage': float(product.markup_percentage),
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def add_expenses(self, request, pk=None):
+        """
+        Добавить расходы к товару.
+
+        POST /api/products/products/{id}/add-expenses/
+        Body: {
+            "expense_ids": [1, 2, 3],
+            "proportions": {"1": 0.5, "2": 0.3}  // опционально
+        }
+
+        ✅ НОВОЕ v2.1
+        """
+        from .models import ProductExpenseRelation, Expense
+        from decimal import Decimal
+
+        product = self.get_object()
+
+        expense_ids = request.data.get('expense_ids', [])
+        proportions = request.data.get('proportions', {})
+
+        if not expense_ids:
+            return Response(
+                {'error': 'Укажите expense_ids'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Валидация расходов
+        existing_expenses = Expense.objects.filter(
+            id__in=expense_ids,
+            is_active=True
+        )
+        existing_ids = set(existing_expenses.values_list('id', flat=True))
+
+        invalid_ids = set(expense_ids) - existing_ids
+        if invalid_ids:
+            return Response(
+                {'error': f'Расходы не найдены: {list(invalid_ids)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Добавляем связи
+        created_relations = []
+        skipped_relations = []
+
+        for expense_id in expense_ids:
+            proportion = proportions.get(str(expense_id))
+            if proportion:
+                try:
+                    proportion = Decimal(str(proportion))
+                except (ValueError, TypeError):
+                    proportion = None
+
+            relation, created = ProductExpenseRelation.objects.get_or_create(
+                product=product,
+                expense_id=expense_id,
+                defaults={'proportion': proportion}
+            )
+
+            if created:
+                created_relations.append({
+                    'expense_id': expense_id,
+                    'expense_name': relation.expense.name,
+                    'proportion': float(proportion) if proportion else None
+                })
+            else:
+                skipped_relations.append({
+                    'expense_id': expense_id,
+                    'expense_name': relation.expense.name,
+                    'reason': 'already_exists'
+                })
+
+        return Response({
+            'success': True,
+            'product_id': product.id,
+            'created': created_relations,
+            'skipped': skipped_relations,
+            'total_expenses': product.expense_relations.count()
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def remove_expenses(self, request, pk=None):
+        """
+        Удалить расходы из товара.
+
+        POST /api/products/products/{id}/remove-expenses/
+        Body: {"expense_ids": [1, 2, 3]}
+
+        ✅ НОВОЕ v2.1
+        """
+        from .models import ProductExpenseRelation
+
+        product = self.get_object()
+
+        expense_ids = request.data.get('expense_ids', [])
+
+        if not expense_ids:
+            return Response(
+                {'error': 'Укажите expense_ids'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        deleted_count, _ = ProductExpenseRelation.objects.filter(
+            product=product,
+            expense_id__in=expense_ids
+        ).delete()
+
+        return Response({
+            'success': True,
+            'product_id': product.id,
+            'deleted_count': deleted_count,
+            'remaining_expenses': product.expense_relations.count()
+        })
 
 
 # =============================================================================

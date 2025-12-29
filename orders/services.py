@@ -35,9 +35,6 @@ from .models import (
     StoreOrder,
     StoreOrderItem,
     StoreOrderStatus,
-    PartnerOrder,
-    PartnerOrderItem,
-    PartnerOrderStatus,
     DebtPayment,
     DefectiveProduct,
     OrderHistory,
@@ -801,77 +798,3 @@ class DebtService:
 # =============================================================================
 # DEFECTIVE PRODUCT SERVICE
 # =============================================================================
-
-class DefectiveProductService:
-    """Сервис для работы с бракованными товарами."""
-
-    # @classmethod
-    # @transaction.atomic
-    # def report_defect(
-    #         cls,
-    #         *,
-    #         order: StoreOrder,
-    #         product: Product,
-    #         quantity: Decimal,
-    #         price: Decimal,
-    #         reason: str,
-    #         reported_by: 'User',
-    # ) -> DefectiveProduct:
-    #     """
-    #     Магазин заявляет о браке.
-    #
-    #     Args:
-    #         order: Заказ
-    #         product: Товар
-    #         quantity: Количество брака
-    #         price: Цена
-    #         reason: Причина
-    #         reported_by: Кто сообщил
-    #
-    #     Returns:
-    #         DefectiveProduct
-    #     """
-    #     defect = DefectiveProduct.objects.create(
-    #         order=order,
-    #         product=product,
-    #         quantity=quantity,
-    #         price=price,
-    #         reason=reason,
-    #         reported_by=reported_by,
-    #         status=DefectiveProduct.DefectStatus.PENDING
-    #     )
-    #
-    #     return defect
-    #
-    # @classmethod
-    # @transaction.atomic
-    # def approve_defect(
-    #         cls,
-    #         *,
-    #         defect: DefectiveProduct,
-    #         approved_by: 'User',
-    # ) -> DefectiveProduct:
-    #     """
-    #     Партнёр подтверждает брак → уменьшается долг.
-    #
-    #     Args:
-    #         defect: Бракованный товар
-    #         approved_by: Партнёр
-    #
-    #     Returns:
-    #         DefectiveProduct
-    #     """
-    #     if approved_by.role != 'partner':
-    #         raise ValidationError("Только партнёр может подтверждать брак")
-    #
-    #     defect.approve(approved_by=approved_by)
-    #
-    #     return defect
-    #
-    # @classmethod
-    # def get_pending_defects(cls, order: StoreOrder) -> QuerySet[DefectiveProduct]:
-    #     """Ожидающие проверки дефекты."""
-    #     return DefectiveProduct.objects.filter(
-    #         order=order,
-    #         status=DefectiveProduct.DefectStatus.PENDING
-    #     )

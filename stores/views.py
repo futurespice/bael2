@@ -36,7 +36,7 @@ API ENDPOINTS:
 
 from decimal import Decimal
 from typing import Any, Dict
-
+from django.db import transaction
 from django.db.models import QuerySet, Q  # ✅ Добавлен Q
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action, api_view, permission_classes
@@ -613,46 +613,45 @@ class StoreViewSet(viewsets.ModelViewSet):
         url_path='inventory/confirm',
         permission_classes=[IsPartner]
     )
+    @transaction.atomic
     def confirm_inventory(self, request: Request, pk=None) -> Response:
         """
-        Партнёр подтверждает ВЕСЬ инвентарь магазина одним действием (ТЗ v2.0).
+        Партнёр подтверждает ВЕСЬ инвентарь магазина одним действием (ТЗ v2.1).
 
         POST /api/stores/{store_id}/inventory/confirm/
 
         Body: {
-            "prepayment_amount": 5000000,
-            "items_to_remove": [
-                {
-                    "product_id": 1,
-                    "quantity": 100
-                }
+            "prepayment_amount": 5000,
+            "items_to_remove": [1, 3, 5],
+            "items_to_modify": [
+                {"product_id": 2, "new_quantity": 10},
+                {"product_id": 4, "new_quantity": 5}
             ]
         }
 
-        Параметры:
-        - prepayment_amount: Предоплата (может быть 0, не больше суммы инвентаря)
-        - items_to_remove: Массив товаров для удаления (опционально, может быть пустым)
-          - product_id: ID товара
-          - quantity: Количество для удаления
+        ПАРАМЕТРЫ:
+        - prepayment_amount: Предоплата (0 по умолчанию, не больше суммы инвентаря)
+        - items_to_remove: ID товаров для полного удаления из инвентаря
+        - items_to_modify: Изменение количества товаров (NEW v2.1)
 
-        Результат:
-        - Удаляет указанные товары из инвентаря
-        - ВСЕ заказы магазина "В пути" → "Принят"
-        - Долг магазина = сумма инвентаря - предоплата
+        Workflow:
+        1. Партнёр может удалить товары из инвентаря
+        2. Партнёр может изменить количество товаров (NEW v2.1)
+        3. Указывает предоплату
+        4. ВСЕ заказы магазина "В пути" → "Принят"
+        5. Долг = сумма инвентаря - предоплата
         """
         from decimal import Decimal
         from django.db.models import F, Sum
         from django.utils import timezone
         from rest_framework import status
-        from orders.models import (
-            StoreOrder,
-            StoreOrderStatus,
-            OrderHistory,
-            OrderType,
-            StoreOrderItem
-        )
-        from stores.models import StoreInventory, Store
-        from stores.services import BonusCalculationService, StoreInventoryService
+
+        from orders.models import StoreOrder, StoreOrderStatus, OrderHistory, OrderType
+        from stores.models import Store, StoreInventory
+        from stores.services import BonusCalculationService
+
+        import logging
+        logger = logging.getLogger(__name__)
 
         store = self.get_object()
 
@@ -663,9 +662,22 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Валидация данных
-        prepayment_amount = Decimal(str(request.data.get('prepayment_amount', 0)))
+        # =========================================================================
+        # ПОЛУЧЕНИЕ ПАРАМЕТРОВ
+        # =========================================================================
+
+        prepayment_amount = request.data.get('prepayment_amount', 0)
         items_to_remove = request.data.get('items_to_remove', [])
+        items_to_modify = request.data.get('items_to_modify', [])  # ✅ НОВОЕ v2.1
+
+        # Валидация предоплаты
+        try:
+            prepayment_amount = Decimal(str(prepayment_amount))
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Некорректное значение prepayment_amount'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if prepayment_amount < 0:
             return Response(
@@ -673,118 +685,136 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Получаем все заказы "В пути"
+        # =========================================================================
+        # ПРОВЕРКА ЗАКАЗОВ
+        # =========================================================================
+
         in_transit_orders = StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        ).prefetch_related('items__product')
+        ).select_related('partner').prefetch_related('items__product')
 
         if not in_transit_orders.exists():
             return Response(
-                {'error': 'Нет заказов для подтверждения'},
+                {
+                    'error': 'Нет заказов для подтверждения',
+                    'message': 'У магазина нет заказов со статусом "В пути"'
+                },
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         # =========================================================================
-        # УДАЛЕНИЕ ТОВАРОВ ИЗ ИНВЕНТАРЯ (если указаны)
+        # УДАЛЕНИЕ ТОВАРОВ ИЗ ИНВЕНТАРЯ
         # =========================================================================
 
         removed_items_info = []
 
-        if items_to_remove:
-            for item_data in items_to_remove:
-                try:
-                    product_id = int(item_data['product_id'])
-                    quantity_to_remove = Decimal(str(item_data['quantity']))
+        for product_id in items_to_remove:
+            try:
+                inventory_item = StoreInventory.objects.get(
+                    store=store,
+                    product_id=product_id
+                )
+                removed_items_info.append({
+                    'product_id': product_id,
+                    'product_name': inventory_item.product.name,
+                    'quantity_removed': float(inventory_item.quantity),
+                    'action': 'removed'
+                })
+                inventory_item.delete()
 
-                    if quantity_to_remove <= 0:
-                        continue
+                logger.info(
+                    f"Удалён товар из инвентаря | Store: {store.id} | "
+                    f"Product: {product_id} | Partner: {request.user.id}"
+                )
 
-                    # Находим товар в инвентаре
-                    inventory_item = StoreInventory.objects.filter(
-                        store=store,
-                        product_id=product_id
-                    ).first()
+            except StoreInventory.DoesNotExist:
+                logger.warning(
+                    f"Товар не найден в инвентаре | Store: {store.id} | Product: {product_id}"
+                )
+                continue
 
-                    if not inventory_item:
-                        continue
+        # =========================================================================
+        # ✅ НОВОЕ v2.1: ИЗМЕНЕНИЕ КОЛИЧЕСТВА ТОВАРОВ
+        # =========================================================================
 
-                    # Определяем сколько удалить
-                    current_quantity = inventory_item.quantity
+        modified_items_info = []
 
-                    if quantity_to_remove >= current_quantity:
-                        # Удаляем весь товар
-                        actual_removed = current_quantity
+        for item_data in items_to_modify:
+            product_id = item_data.get('product_id')
+            new_quantity = item_data.get('new_quantity')
 
-                        # Удаляем из инвентаря
-                        inventory_item.delete()
+            if not product_id or new_quantity is None:
+                continue
 
-                        # Удаляем из всех заказов
-                        StoreOrderItem.objects.filter(
-                            order__in=in_transit_orders,
-                            product_id=product_id
-                        ).delete()
+            try:
+                new_quantity = Decimal(str(new_quantity))
+            except (ValueError, TypeError):
+                continue
 
-                    else:
-                        # Удаляем частично
-                        actual_removed = quantity_to_remove
+            try:
+                inventory_item = StoreInventory.objects.select_related('product').get(
+                    store=store,
+                    product_id=product_id
+                )
 
-                        # Уменьшаем количество в инвентаре
-                        inventory_item.quantity -= quantity_to_remove
-                        inventory_item.save()
+                old_quantity = inventory_item.quantity
 
-                        # Уменьшаем в заказах пропорционально
-                        order_items = StoreOrderItem.objects.filter(
-                            order__in=in_transit_orders,
-                            product_id=product_id
-                        )
-
-                        # Распределяем удаление по заказам
-                        remaining_to_remove = quantity_to_remove
-
-                        for order_item in order_items:
-                            if remaining_to_remove <= 0:
-                                break
-
-                            if order_item.quantity <= remaining_to_remove:
-                                # Удаляем всю позицию
-                                remaining_to_remove -= order_item.quantity
-                                order_item.delete()
-                            else:
-                                # Уменьшаем количество
-                                order_item.quantity -= remaining_to_remove
-                                order_item.total = order_item.quantity * order_item.price
-                                order_item.save()
-                                remaining_to_remove = Decimal('0')
-
-                    removed_items_info.append({
-                        'product_id': product_id,
-                        'product_name': inventory_item.product.name,
-                        'requested_quantity': float(quantity_to_remove),
-                        'actual_removed': float(actual_removed)
-                    })
-
-                except (KeyError, ValueError, TypeError) as e:
-                    # Пропускаем некорректные данные
+                # Валидация: новое количество не может превышать текущее
+                if new_quantity > old_quantity:
+                    logger.warning(
+                        f"Попытка увеличить количество | Store: {store.id} | "
+                        f"Product: {product_id} | Old: {old_quantity} | New: {new_quantity}"
+                    )
                     continue
 
-        # Пересчитываем суммы заказов после удаления товаров
-        for order in in_transit_orders:
-            order.recalc_total()
+                if new_quantity <= 0:
+                    # Удаляем товар если количество 0 или меньше
+                    modified_items_info.append({
+                        'product_id': product_id,
+                        'product_name': inventory_item.product.name,
+                        'old_quantity': float(old_quantity),
+                        'new_quantity': 0,
+                        'action': 'removed'
+                    })
+                    inventory_item.delete()
+                else:
+                    # Обновляем количество
+                    modified_items_info.append({
+                        'product_id': product_id,
+                        'product_name': inventory_item.product.name,
+                        'old_quantity': float(old_quantity),
+                        'new_quantity': float(new_quantity),
+                        'action': 'modified'
+                    })
+                    inventory_item.quantity = new_quantity
+                    inventory_item.save(update_fields=['quantity', 'last_updated'])
 
-        # Вычисляем общую сумму всех заказов
-        total_amount_data = in_transit_orders.aggregate(
-            total=Sum('total_amount')
-        )
-        total_inventory_amount = total_amount_data['total'] or Decimal('0')
+                logger.info(
+                    f"Изменено количество | Store: {store.id} | Product: {product_id} | "
+                    f"Old: {old_quantity} | New: {new_quantity} | Partner: {request.user.id}"
+                )
 
-        if total_inventory_amount == 0:
-            return Response(
-                {'error': 'Инвентарь пуст после удаления товаров'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            except StoreInventory.DoesNotExist:
+                logger.warning(
+                    f"Товар для изменения не найден | Store: {store.id} | Product: {product_id}"
+                )
+                continue
 
-        # Проверка предоплаты
+        # =========================================================================
+        # РАСЧЁТ СУММЫ ИНВЕНТАРЯ (после удаления/изменения)
+        # =========================================================================
+
+        inventory_items = StoreInventory.objects.filter(
+            store=store
+        ).select_related('product')
+
+        total_inventory_amount = Decimal('0')
+        for item in inventory_items:
+            if item.product and item.product.final_price:
+                total_inventory_amount += item.quantity * item.product.final_price
+
+        # Валидация предоплаты
         if prepayment_amount > total_inventory_amount:
             return Response(
                 {
@@ -849,13 +879,31 @@ class StoreViewSet(viewsets.ModelViewSet):
                 )
             )
 
-        # ✅ ИСПРАВЛЕНО: Обновляем долг магазина через update()
+            logger.info(
+                f"Заказ подтверждён | Order: {order.id} | Store: {store.id} | "
+                f"Amount: {order.total_amount} | Prepayment: {order_prepayment} | "
+                f"Debt: {order_debt} | Partner: {request.user.id}"
+            )
+
+        # =========================================================================
+        # ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
+        # =========================================================================
+
         Store.objects.filter(pk=store.pk).update(
             debt=F('debt') + total_debt
         )
         store.refresh_from_db()
 
-        # Получаем обновлённый инвентарь
+        logger.info(
+            f"Инвентарь подтверждён | Store: {store.id} | "
+            f"Orders: {confirmed_count} | Total Debt: {total_debt} | "
+            f"Partner: {request.user.id}"
+        )
+
+        # =========================================================================
+        # ПОЛУЧЕНИЕ ОБНОВЛЁННОГО ИНВЕНТАРЯ С БОНУСАМИ
+        # =========================================================================
+
         inventory = BonusCalculationService.get_inventory_with_bonuses(store)
 
         return Response({
@@ -867,6 +915,7 @@ class StoreViewSet(viewsets.ModelViewSet):
             'total_debt_created': float(total_debt),
             'store_total_debt': float(store.debt),
             'removed_items': removed_items_info,
+            'modified_items': modified_items_info,  # ✅ НОВОЕ v2.1
             'inventory': inventory
         })
 
