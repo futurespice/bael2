@@ -37,7 +37,7 @@ API ENDPOINTS:
 from decimal import Decimal
 from typing import Any, Dict
 from django.db import transaction
-from django.db.models import QuerySet, Q  # ✅ Добавлен Q
+from django.db.models import QuerySet, Q, F  # ✅ Добавлен Q
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -46,7 +46,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
 from django.core.exceptions import ValidationError
-
+from django.utils import timezone
 # ✅ ДОБАВЛЕНЫ ИМПОРТЫ drf-spectacular
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
 from drf_spectacular.types import OpenApiTypes
@@ -88,8 +88,14 @@ from .services import (
     StoreSearchFilters,
 )
 from .permissions import IsAdmin, IsStore, IsAdminOrReadOnly
-
-
+from orders.models import (
+    StoreOrder,
+    StoreOrderStatus,
+    StoreOrderItem,
+    OrderHistory,
+    OrderType,
+    DefectiveProduct,  # ✅ Статус внутри: DefectiveProduct.DefectStatus
+)
 # =============================================================================
 # PAGINATION
 # =============================================================================
@@ -508,169 +514,199 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-    @action(detail=True, methods=['get'], url_path='inventory')
-    def inventory(self, request: Request, pk=None) -> Response:
+    @extend_schema(
+        summary="Корзина магазина",
+        description="""
+            Получить корзину магазина (все товары из IN_TRANSIT заказов).
+
+            Корзина = товары из заказов, одобренных админом, но ещё не подтверждённых партнёром.
+            Партнёр видит агрегированные товары и может их подтвердить.
+            """,
+        responses={
+            200: OpenApiResponse(description="Корзина магазина"),
+            403: OpenApiResponse(description="Доступ запрещён"),
+        },
+    )
+    @action(detail=True, methods=['get'], url_path='basket')
+    def basket(self, request: Request, pk=None) -> Response:
         """
-        Инвентарь магазина.
+        Корзина магазина (товары из IN_TRANSIT заказов).
 
-        GET /api/stores/{id}/inventory/
-
-        КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2.0 (требование #11):
-        - Магазин НЕ видит инвентарь, пока есть заказы со статусом "В пути"
-        - Инвентарь становится виден только после статуса "Принят"
-        """
-        store = self.get_object()
-        user = request.user
-
-        # ✅ КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2.0: Проверка для магазина
-        if user.role == 'store':
-            # Импортируем здесь чтобы избежать circular import
-            from orders.models import StoreOrder, StoreOrderStatus
-
-            # Проверяем есть ли заказы со статусом IN_TRANSIT
-            has_in_transit = StoreOrder.objects.filter(
-                store=store,
-                status=StoreOrderStatus.IN_TRANSIT
-            ).exists()
-
-            if has_in_transit:
-                return Response(
-                    {
-                        'error': 'Инвентарь недоступен',
-                        'message': 'У вас есть заказы в статусе "В пути". '
-                                   'Инвентарь станет доступен после подтверждения заказов партнёром.'
-                    },
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-        inventory = StoreInventoryService.get_inventory(store)
-
-        page = self.paginate_queryset(inventory)
-        if page is not None:
-            serializer = StoreInventoryListSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = StoreInventoryListSerializer(inventory, many=True)
-        return Response(serializer.data)
-
-    @action(detail=True, methods=['get'], url_path='inventory-with-bonuses')
-    def inventory_with_bonuses(self, request: Request, pk=None) -> Response:
-        """
-        Инвентарь магазина с расчётом бонусов (ТЗ v2.0).
-
-        GET /api/stores/{id}/inventory-with-bonuses/
-
-        ЛОГИКА БОНУСОВ:
-        - Каждый 21-й товар бесплатно (20 платных + 1 бонусный)
-        - Бонусы только для штучных товаров с is_bonus=True
-        - Бонусы считаются по НАКОПЛЕННОМУ количеству в инвентаре
-
-        ПРИМЕР:
-        - Товар "Мороженое" (is_bonus=True)
-        - Заказ #1: 15 шт, Заказ #2: 10 шт → Инвентарь: 25
-        - Бонусы = 25 // 21 = 1 бонусный
-        - Платных = 25 - 1 = 24 шт
+        GET /api/stores/stores/{id}/basket/
         """
         store = self.get_object()
         user = request.user
 
-        # Проверка для магазина: инвентарь скрыт при IN_TRANSIT
+        # Магазин не должен видеть корзину
         if user.role == 'store':
-            from orders.models import StoreOrder, StoreOrderStatus
+            return Response(
+                {'error': 'Корзина доступна только для партнёров'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
-            has_in_transit = StoreOrder.objects.filter(
-                store=store,
-                status=StoreOrderStatus.IN_TRANSIT
-            ).exists()
+        # Получаем все IN_TRANSIT заказы
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.IN_TRANSIT
+        ).prefetch_related('items__product__images').order_by('created_at')
 
-            if has_in_transit:
-                return Response(
-                    {
-                        'error': 'Инвентарь недоступен',
-                        'message': 'У вас есть заказы в статусе "В пути". '
-                                   'Инвентарь станет доступен после подтверждения заказов партнёром.'
-                    },
-                    status=status.HTTP_403_FORBIDDEN
-                )
+        if not orders.exists():
+            return Response({
+                'store_id': store.id,
+                'store_name': store.name,
+                'owner_name': store.owner_name,
+                'store_phone': store.phone,
+                'is_empty': True,
+                'orders_count': 0,
+                'items': [],
+                'totals': {
+                    'piece_count': 0,
+                    'weight_total': '0',
+                    'total_amount': '0',
+                }
+            })
 
-        # Получаем инвентарь с бонусами
-        inventory_data = BonusCalculationService.get_inventory_with_bonuses(store)
-        summary = BonusCalculationService.get_total_bonuses_summary(store)
+        # Агрегируем товары из всех заказов
+        items_map = {}
+
+        for order in orders:
+            for item in order.items.all():
+                product = item.product
+                product_id = product.id
+
+                if product_id not in items_map:
+                    main_image = None
+                    if hasattr(product, 'images'):
+                        first_image = product.images.first()
+                        if first_image and first_image.image:
+                            main_image = first_image.image.url
+
+                    items_map[product_id] = {
+                        'product_id': product_id,
+                        'product_name': product.name,
+                        'product_image': main_image,
+                        'is_weight_based': product.is_weight_based,
+                        'is_bonus_product': product.is_bonus,
+                        'unit': product.unit,
+                        'price': item.price,
+                        'quantity': Decimal('0'),
+                        'total': Decimal('0'),
+                        'order_ids': [],
+                    }
+
+                items_map[product_id]['quantity'] += item.quantity
+                items_map[product_id]['total'] += item.total
+                if order.id not in items_map[product_id]['order_ids']:
+                    items_map[product_id]['order_ids'].append(order.id)
+
+        # Форматируем результат
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
+
+        for product_id, data in items_map.items():
+            if data['is_weight_based']:
+                qty = data['quantity']
+                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+                weight_total += data['quantity']
+            else:
+                quantity_display = f"{int(data['quantity'])} шт"
+                piece_count += int(data['quantity'])
+
+            total_amount += data['total']
+
+            items.append({
+                'product_id': data['product_id'],
+                'product_name': data['product_name'],
+                'product_image': data['product_image'],
+                'is_weight_based': data['is_weight_based'],
+                'is_bonus_product': data['is_bonus_product'],
+                'unit': data['unit'],
+                'quantity': str(data['quantity']),
+                'quantity_display': quantity_display,
+                'price': str(data['price']),
+                'total': str(data['total']),
+                'order_ids': data['order_ids'],
+            })
 
         return Response({
             'store_id': store.id,
             'store_name': store.name,
-            'inventory': inventory_data,
-            'bonus_summary': summary
+            'owner_name': store.owner_name,
+            'store_phone': store.phone,
+            'is_empty': False,
+            'orders_count': orders.count(),
+            'order_ids': list(orders.values_list('id', flat=True)),
+            'items': items,
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+                'total_amount': str(total_amount),
+            }
         })
 
-    # Файл: stores/views.py
-    # Добавить этот action в StoreViewSet
+    @extend_schema(
+        summary="Подтвердить корзину",
+        description="""
+            Партнёр подтверждает корзину магазина.
 
-    @action(
-        detail=True,
-        methods=['post'],
-        url_path='inventory/confirm',
-        permission_classes=[IsPartner]
+            WORKFLOW:
+            1. Партнёр может удалить товары (items_to_remove)
+            2. Партнёр может изменить количество (items_to_modify)
+            3. Партнёр вводит предоплату
+            4. Все IN_TRANSIT заказы → ACCEPTED
+            5. Товары переносятся в инвентарь магазина
+            6. Корзина очищается
+            7. Создаётся долг магазина
+            """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'prepayment_amount': {'type': 'number', 'default': 0},
+                    'items_to_remove': {'type': 'array', 'items': {'type': 'integer'}},
+                    'items_to_modify': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'product_id': {'type': 'integer'},
+                                'new_quantity': {'type': 'number'}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Корзина подтверждена"),
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Только партнёры"),
+        },
     )
+    @action(detail=True, methods=['post'], url_path='basket/confirm')
     @transaction.atomic
-    def confirm_inventory(self, request: Request, pk=None) -> Response:
+    def confirm_basket(self, request: Request, pk=None) -> Response:
         """
-        Партнёр подтверждает ВЕСЬ инвентарь магазина одним действием (ТЗ v2.1).
+        Партнёр подтверждает корзину магазина.
 
-        POST /api/stores/{store_id}/inventory/confirm/
-
-        Body: {
-            "prepayment_amount": 5000,
-            "items_to_remove": [1, 3, 5],
-            "items_to_modify": [
-                {"product_id": 2, "new_quantity": 10},
-                {"product_id": 4, "new_quantity": 5}
-            ]
-        }
-
-        ПАРАМЕТРЫ:
-        - prepayment_amount: Предоплата (0 по умолчанию, не больше суммы инвентаря)
-        - items_to_remove: ID товаров для полного удаления из инвентаря
-        - items_to_modify: Изменение количества товаров (NEW v2.1)
-
-        Workflow:
-        1. Партнёр может удалить товары из инвентаря
-        2. Партнёр может изменить количество товаров (NEW v2.1)
-        3. Указывает предоплату
-        4. ВСЕ заказы магазина "В пути" → "Принят"
-        5. Долг = сумма инвентаря - предоплата
+        POST /api/stores/stores/{id}/basket/confirm/
         """
-        from decimal import Decimal
-        from django.db.models import F, Sum
-        from django.utils import timezone
-        from rest_framework import status
-
-        from orders.models import StoreOrder, StoreOrderStatus, OrderHistory, OrderType
-        from stores.models import Store, StoreInventory
-        from stores.services import BonusCalculationService
-
-        import logging
-        logger = logging.getLogger(__name__)
-
         store = self.get_object()
+        user = request.user
 
-        # Валидация партнёра
-        if request.user.role != 'partner':
+        if user.role != 'partner':
             return Response(
-                {'error': 'Только партнёры могут подтверждать инвентарь'},
+                {'error': 'Только партнёры могут подтверждать корзину'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # =========================================================================
-        # ПОЛУЧЕНИЕ ПАРАМЕТРОВ
-        # =========================================================================
-
+        # Параметры
         prepayment_amount = request.data.get('prepayment_amount', 0)
         items_to_remove = request.data.get('items_to_remove', [])
-        items_to_modify = request.data.get('items_to_modify', [])  # ✅ НОВОЕ v2.1
+        items_to_modify = request.data.get('items_to_modify', [])
 
-        # Валидация предоплаты
         try:
             prepayment_amount = Decimal(str(prepayment_amount))
         except (ValueError, TypeError):
@@ -685,64 +721,49 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # =========================================================================
-        # ПРОВЕРКА ЗАКАЗОВ
-        # =========================================================================
-
-        in_transit_orders = StoreOrder.objects.filter(
+        # Получаем IN_TRANSIT заказы
+        orders = StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        ).select_related('partner').prefetch_related('items__product')
+        ).select_for_update().prefetch_related('items__product')
 
-        if not in_transit_orders.exists():
+        if not orders.exists():
             return Response(
-                {
-                    'error': 'Нет заказов для подтверждения',
-                    'message': 'У магазина нет заказов со статусом "В пути"'
-                },
+                {'error': 'Нет заказов для подтверждения'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # =========================================================================
-        # УДАЛЕНИЕ ТОВАРОВ ИЗ ИНВЕНТАРЯ
-        # =========================================================================
+        removed_info = []
+        modified_info = []
 
-        removed_items_info = []
-
+        # =====================================================================
+        # 1. УДАЛЕНИЕ ТОВАРОВ
+        # =====================================================================
         for product_id in items_to_remove:
-            try:
-                inventory_item = StoreInventory.objects.get(
-                    store=store,
-                    product_id=product_id
-                )
-                removed_items_info.append({
+            deleted_items = StoreOrderItem.objects.filter(
+                order__in=orders,
+                product_id=product_id
+            ).select_related('product')
+
+            for item in deleted_items:
+                removed_info.append({
                     'product_id': product_id,
-                    'product_name': inventory_item.product.name,
-                    'quantity_removed': float(inventory_item.quantity),
-                    'action': 'removed'
+                    'product_name': item.product.name,
+                    'quantity': float(item.quantity),
+                    'order_id': item.order_id,
                 })
-                inventory_item.delete()
+                # Возвращаем товар на склад
+                item.product.stock_quantity += item.quantity
+                item.product.save(update_fields=['stock_quantity'])
 
-                logger.info(
-                    f"Удалён товар из инвентаря | Store: {store.id} | "
-                    f"Product: {product_id} | Partner: {request.user.id}"
-                )
+            deleted_items.delete()
 
-            except StoreInventory.DoesNotExist:
-                logger.warning(
-                    f"Товар не найден в инвентаре | Store: {store.id} | Product: {product_id}"
-                )
-                continue
-
-        # =========================================================================
-        # ✅ НОВОЕ v2.1: ИЗМЕНЕНИЕ КОЛИЧЕСТВА ТОВАРОВ
-        # =========================================================================
-
-        modified_items_info = []
-
-        for item_data in items_to_modify:
-            product_id = item_data.get('product_id')
-            new_quantity = item_data.get('new_quantity')
+        # =====================================================================
+        # 2. ИЗМЕНЕНИЕ КОЛИЧЕСТВА
+        # =====================================================================
+        for mod in items_to_modify:
+            product_id = mod.get('product_id')
+            new_quantity = mod.get('new_quantity')
 
             if not product_id or new_quantity is None:
                 continue
@@ -752,238 +773,271 @@ class StoreViewSet(viewsets.ModelViewSet):
             except (ValueError, TypeError):
                 continue
 
-            try:
-                inventory_item = StoreInventory.objects.select_related('product').get(
-                    store=store,
-                    product_id=product_id
-                )
+            items = StoreOrderItem.objects.filter(
+                order__in=orders,
+                product_id=product_id
+            ).select_related('product')
 
-                old_quantity = inventory_item.quantity
-
-                # Валидация: новое количество не может превышать текущее
-                if new_quantity > old_quantity:
-                    logger.warning(
-                        f"Попытка увеличить количество | Store: {store.id} | "
-                        f"Product: {product_id} | Old: {old_quantity} | New: {new_quantity}"
-                    )
-                    continue
-
-                if new_quantity <= 0:
-                    # Удаляем товар если количество 0 или меньше
-                    modified_items_info.append({
-                        'product_id': product_id,
-                        'product_name': inventory_item.product.name,
-                        'old_quantity': float(old_quantity),
-                        'new_quantity': 0,
-                        'action': 'removed'
-                    })
-                    inventory_item.delete()
-                else:
-                    # Обновляем количество
-                    modified_items_info.append({
-                        'product_id': product_id,
-                        'product_name': inventory_item.product.name,
-                        'old_quantity': float(old_quantity),
-                        'new_quantity': float(new_quantity),
-                        'action': 'modified'
-                    })
-                    inventory_item.quantity = new_quantity
-                    inventory_item.save(update_fields=['quantity', 'last_updated'])
-
-                logger.info(
-                    f"Изменено количество | Store: {store.id} | Product: {product_id} | "
-                    f"Old: {old_quantity} | New: {new_quantity} | Partner: {request.user.id}"
-                )
-
-            except StoreInventory.DoesNotExist:
-                logger.warning(
-                    f"Товар для изменения не найден | Store: {store.id} | Product: {product_id}"
-                )
+            if not items.exists():
                 continue
 
-        # =========================================================================
-        # РАСЧЁТ СУММЫ ИНВЕНТАРЯ (после удаления/изменения)
-        # =========================================================================
+            current_total = sum(item.quantity for item in items)
 
-        inventory_items = StoreInventory.objects.filter(
-            store=store
-        ).select_related('product')
+            if new_quantity >= current_total:
+                continue  # Нельзя увеличивать
 
-        total_inventory_amount = Decimal('0')
-        for item in inventory_items:
-            if item.product and item.product.final_price:
-                total_inventory_amount += item.quantity * item.product.final_price
+            if new_quantity <= 0:
+                # Удаляем все позиции
+                for item in items:
+                    item.product.stock_quantity += item.quantity
+                    item.product.save(update_fields=['stock_quantity'])
+                    removed_info.append({
+                        'product_id': product_id,
+                        'product_name': item.product.name,
+                        'quantity': float(item.quantity),
+                        'order_id': item.order_id,
+                    })
+                items.delete()
+                continue
 
-        # Валидация предоплаты
-        if prepayment_amount > total_inventory_amount:
+            # Уменьшаем количество
+            difference = current_total - new_quantity
+            first_item = items.first()
+            product = first_item.product
+
+            if first_item.quantity >= difference:
+                old_qty = first_item.quantity
+                first_item.quantity -= difference
+                first_item.total = first_item.quantity * first_item.price
+                first_item.save(update_fields=['quantity', 'total'])
+
+                product.stock_quantity += difference
+                product.save(update_fields=['stock_quantity'])
+
+                modified_info.append({
+                    'product_id': product_id,
+                    'product_name': product.name,
+                    'old_quantity': float(old_qty),
+                    'new_quantity': float(first_item.quantity),
+                    'order_id': first_item.order_id,
+                })
+
+        # =====================================================================
+        # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ
+        # =====================================================================
+        for order in orders:
+            order.refresh_from_db()
+            new_total = sum(item.total for item in order.items.all())
+            order.total_amount = new_total
+            order.save(update_fields=['total_amount'])
+
+        # =====================================================================
+        # 4. РАСЧЁТ ОБЩЕЙ СУММЫ И ДОЛГА
+        # =====================================================================
+        total_amount = sum(order.total_amount for order in orders)
+
+        if prepayment_amount > total_amount:
             return Response(
                 {
-                    'error': f'Предоплата ({prepayment_amount} сом) не может превышать '
-                             f'сумму инвентаря ({total_inventory_amount} сом)'
+                    'error': f'Предоплата ({prepayment_amount} сом) превышает '
+                             f'сумму заказов ({total_amount} сом)'
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # =========================================================================
-        # ПОДТВЕРЖДЕНИЕ ВСЕХ ЗАКАЗОВ
-        # =========================================================================
+        total_debt = total_amount - prepayment_amount
 
-        confirmed_count = 0
-        total_debt = Decimal('0')
+        # =====================================================================
+        # 5. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
+        # =====================================================================
+        confirmed_orders = []
 
-        # Распределяем предоплату пропорционально между заказами
-        orders_list = list(in_transit_orders)
-        remaining_prepayment = prepayment_amount
-
-        for idx, order in enumerate(orders_list):
-            # Рассчитываем долю предоплаты для этого заказа
-            if idx == len(orders_list) - 1:
-                # Последний заказ получает остаток
-                order_prepayment = remaining_prepayment
+        for order in orders:
+            if total_amount > 0:
+                order_prepayment = (order.total_amount / total_amount) * prepayment_amount
             else:
-                # Пропорционально сумме заказа
-                if total_inventory_amount > 0:
-                    ratio = order.total_amount / total_inventory_amount
-                    order_prepayment = (prepayment_amount * ratio).quantize(Decimal('0.01'))
-                else:
-                    order_prepayment = Decimal('0')
-                remaining_prepayment -= order_prepayment
+                order_prepayment = Decimal('0')
 
-            # Рассчитываем долг
             order_debt = order.total_amount - order_prepayment
 
-            # Обновляем заказ
+            old_status = order.status
+            order.status = StoreOrderStatus.ACCEPTED
+            order.partner = user
+            order.confirmed_by = user
+            order.confirmed_at = timezone.now()
             order.prepayment_amount = order_prepayment
             order.debt_amount = order_debt
-            order.status = StoreOrderStatus.ACCEPTED
-            order.partner = request.user
-            order.confirmed_by = request.user
-            order.confirmed_at = timezone.now()
-            order.save()
 
-            total_debt += order_debt
-            confirmed_count += 1
+            order.save(update_fields=[
+                'status', 'partner', 'confirmed_by', 'confirmed_at',
+                'prepayment_amount', 'debt_amount'
+            ])
+
+            # ✅ КРИТИЧНО: Переносим товары в инвентарь ЗДЕСЬ
+            for item in order.items.all():
+                StoreInventoryService.add_to_inventory(
+                    store=store,
+                    product=item.product,
+                    quantity=item.quantity
+                )
 
             # История
             OrderHistory.objects.create(
                 order_type=OrderType.STORE,
                 order_id=order.id,
-                old_status=StoreOrderStatus.IN_TRANSIT,
+                old_status=old_status,
                 new_status=StoreOrderStatus.ACCEPTED,
-                changed_by=request.user,
+                changed_by=user,
                 comment=(
-                    f'Подтверждено партнёром через инвентарь. '
-                    f'Сумма заказа: {order.total_amount} сом. '
+                    f'Заказ подтверждён партнёром. '
+                    f'Сумма: {order.total_amount} сом. '
                     f'Предоплата: {order_prepayment} сом. '
                     f'Долг: {order_debt} сом.'
                 )
             )
 
-            logger.info(
-                f"Заказ подтверждён | Order: {order.id} | Store: {store.id} | "
-                f"Amount: {order.total_amount} | Prepayment: {order_prepayment} | "
-                f"Debt: {order_debt} | Partner: {request.user.id}"
-            )
+            confirmed_orders.append({
+                'order_id': order.id,
+                'total_amount': float(order.total_amount),
+                'prepayment': float(order_prepayment),
+                'debt': float(order_debt),
+            })
 
-        # =========================================================================
-        # ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
-        # =========================================================================
-
-        Store.objects.filter(pk=store.pk).update(
-            debt=F('debt') + total_debt
-        )
+        # =====================================================================
+        # 6. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
+        # =====================================================================
+        Store.objects.filter(pk=store.pk).update(debt=F('debt') + total_debt)
         store.refresh_from_db()
-
-        logger.info(
-            f"Инвентарь подтверждён | Store: {store.id} | "
-            f"Orders: {confirmed_count} | Total Debt: {total_debt} | "
-            f"Partner: {request.user.id}"
-        )
-
-        # =========================================================================
-        # ПОЛУЧЕНИЕ ОБНОВЛЁННОГО ИНВЕНТАРЯ С БОНУСАМИ
-        # =========================================================================
-
-        inventory = BonusCalculationService.get_inventory_with_bonuses(store)
 
         return Response({
             'success': True,
-            'message': f'Инвентарь подтверждён. Принято заказов: {confirmed_count}',
-            'confirmed_orders_count': confirmed_count,
-            'total_inventory_amount': float(total_inventory_amount),
-            'prepayment_amount': float(prepayment_amount),
-            'total_debt_created': float(total_debt),
-            'store_total_debt': float(store.debt),
-            'removed_items': removed_items_info,
-            'modified_items': modified_items_info,  # ✅ НОВОЕ v2.1
-            'inventory': inventory
+            'message': f'Корзина подтверждена. Заказов: {len(confirmed_orders)}',
+            'confirmed_orders': confirmed_orders,
+            'totals': {
+                'total_amount': float(total_amount),
+                'prepayment': float(prepayment_amount),
+                'debt_created': float(total_debt),
+            },
+            'store_debt': float(store.debt),
+            'removed_items': removed_info,
+            'modified_items': modified_info,
         })
 
-    # Файл: stores/views.py
-    # Добавить этот action в StoreViewSet
+    @extend_schema(
+        summary="Инвентарь магазина",
+        description="""
+            Получить инвентарь магазина (товары из ACCEPTED заказов).
 
-    @action(
-        detail=True,
-        methods=['post'],
-        url_path='inventory/report-defect',
-        permission_classes=[IsPartner]  # ✅ ИСПРАВЛЕНО: Только партнёр!
+            Инвентарь = история всех доставленных товаров.
+            Используется для выбора бракованных товаров.
+
+            ВАЖНО: Магазин не видит инвентарь, пока есть заказы в статусе IN_TRANSIT.
+            """,
+        responses={
+            200: StoreInventoryListSerializer(many=True),
+            403: OpenApiResponse(description="Инвентарь недоступен"),
+        },
+
     )
-    def report_defect_from_inventory(self, request: Request, pk=None) -> Response:
+    @action(detail=True, methods=['get'], url_path='inventory')
+    def inventory(self, request: Request, pk=None) -> Response:
         """
-        Партнёр выявляет бракованные товары из инвентаря магазина (ТЗ v2.0).
+        Инвентарь магазина (товары из ACCEPTED заказов).
 
-        POST /api/stores/{store_id}/inventory/report-defect/
-
-        Body: {
-            "product_id": 1,
-            "quantity": 50,
-            "reason": "Товар испорчен при транспортировке"
-        }
-
-        ВАЖНО:
-        - ПАРТНЁР выявляет брак (не магазин!)
-        - Товар выбирается из ИНВЕНТАРЯ магазина
-        - Брак сразу ОДОБРЯЕТСЯ (статус APPROVED)
-        - Долг магазина СРАЗУ уменьшается
-
-        Workflow:
-        1. Партнёр доставил товары магазину
-        2. Партнёр обнаружил брак в инвентаре
-        3. Партнёр отмечает бракованные товары
-        4. Долг магазина автоматически уменьшается
+        GET /api/stores/stores/{id}/inventory/
         """
-        from decimal import Decimal
-        from django.db.models import F
-        from rest_framework import status
-        from orders.models import DefectiveProduct, StoreOrder, StoreOrderStatus
-        from stores.models import StoreInventory, Store
-
         store = self.get_object()
+        user = request.user
 
-        # Валидация партнёра
-        if request.user.role != 'partner':
+        # Магазин не видит инвентарь пока есть IN_TRANSIT заказы
+        if user.role == 'store':
+            has_in_transit = StoreOrder.objects.filter(
+                store=store,
+                status=StoreOrderStatus.IN_TRANSIT
+            ).exists()
+
+            if has_in_transit:
+                return Response(
+                    {
+                        'error': 'Инвентарь недоступен',
+                        'message': 'Дождитесь подтверждения заказов партнёром'
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        inventory = StoreInventoryService.get_inventory(store)
+
+        page = self.paginate_queryset(inventory)
+        if page is not None:
+            serializer = StoreInventoryListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreInventoryListSerializer(inventory, many=True)
+        return Response(serializer.data)
+
+    # =========================================================================
+    # ОТМЕТКА БРАКА ИЗ ИНВЕНТАРЯ
+    # =========================================================================
+
+    @extend_schema(
+        summary="Отметить брак",
+        description="""
+            Партнёр отмечает бракованные товары из инвентаря.
+
+            Брак сразу одобряется и долг магазина уменьшается.
+            """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'required': ['product_id', 'quantity', 'reason'],
+                'properties': {
+                    'product_id': {'type': 'integer', 'description': 'ID товара из инвентаря'},
+                    'quantity': {'type': 'number', 'description': 'Количество брака'},
+                    'reason': {'type': 'string', 'description': 'Причина брака'}
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Брак зафиксирован"),
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Только партнёры"),
+            404: OpenApiResponse(description="Товар не найден"),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='inventory/report-defect')
+    @transaction.atomic
+    def report_defect(self, request: Request, pk=None) -> Response:
+        """
+        Партнёр отмечает бракованные товары из инвентаря.
+
+        POST /api/stores/stores/{id}/inventory/report-defect/
+        """
+        store = self.get_object()
+        user = request.user
+
+        if user.role != 'partner':
             return Response(
-                {'error': 'Только партнёры могут выявлять бракованные товары'},
+                {'error': 'Только партнёры могут отмечать брак'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # =========================================================================
-        # ВАЛИДАЦИЯ ДАННЫХ
-        # =========================================================================
-
         product_id = request.data.get('product_id')
         quantity = request.data.get('quantity')
-        reason = request.data.get('reason', '')
+        reason = request.data.get('reason', '').strip()
 
         if not product_id:
             return Response(
                 {'error': 'Укажите product_id'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
         if not quantity:
             return Response(
                 {'error': 'Укажите quantity'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not reason:
+            return Response(
+                {'error': 'Укажите причину брака'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -1001,16 +1055,7 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if not reason or not reason.strip():
-            return Response(
-                {'error': 'Укажите причину брака'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # =========================================================================
-        # ПРОВЕРКА НАЛИЧИЯ ТОВАРА В ИНВЕНТАРЕ
-        # =========================================================================
-
+        # Проверка наличия товара в инвентаре
         try:
             inventory_item = StoreInventory.objects.select_related('product').get(
                 store=store,
@@ -1022,117 +1067,67 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Проверяем что количество не превышает имеющееся
+        product = inventory_item.product
+
         if quantity > inventory_item.quantity:
             return Response(
-                {
-                    'error': f'В инвентаре только {inventory_item.quantity} единиц товара "{inventory_item.product.name}", '
-                             f'а вы заявляете о {quantity}'
-                },
+                {'error': f'Недостаточно товара. Доступно: {inventory_item.quantity}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # =========================================================================
-        # ПОИСК ЗАКАЗА ДЛЯ СВЯЗИ
-        # =========================================================================
+        price = product.final_price
+        defect_amount = quantity * price
 
-        # Находим последний подтверждённый заказ магазина с этим товаром
+        # Находим последний ACCEPTED заказ
         last_order = StoreOrder.objects.filter(
             store=store,
-            status=StoreOrderStatus.ACCEPTED,
-            items__product_id=product_id
+            status=StoreOrderStatus.ACCEPTED
         ).order_by('-confirmed_at').first()
 
         if not last_order:
             return Response(
-                {
-                    'error': f'Не найден подтверждённый заказ с товаром "{inventory_item.product.name}". '
-                             'Брак можно отметить только по подтверждённым товарам.'
-                },
+                {'error': 'Нет подтверждённых заказов для привязки брака'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # =========================================================================
-        # СОЗДАНИЕ ЗАПИСИ О БРАКЕ
-        # =========================================================================
-
-        # Берём цену из продукта
-        price = inventory_item.product.final_price
-        total_amount = quantity * price
-
-        # Создаём запись о браке со статусом APPROVED (сразу одобрено партнёром)
+        # Создаём запись о браке
         defect = DefectiveProduct.objects.create(
             order=last_order,
-            product=inventory_item.product,
+            product=product,
             quantity=quantity,
             price=price,
-            total_amount=total_amount,
-            reason=reason.strip(),
-            reported_by=request.user,
-            reviewed_by=request.user,  # ✅ Партнёр сам выявил и одобрил
-            status=DefectiveProduct.DefectStatus.APPROVED  # ✅ Сразу APPROVED
+            total_amount=defect_amount,
+            reason=reason,
+            status=DefectiveProduct.DefectStatus.APPROVED,
+            reported_by=user,
+            reviewed_by=user,
         )
 
-        # =========================================================================
-        # УМЕНЬШЕНИЕ ДОЛГА МАГАЗИНА
-        # =========================================================================
-
-        # ✅ Уменьшаем долг заказа
-        StoreOrder.objects.filter(pk=last_order.pk).update(
-            debt_amount=F('debt_amount') - total_amount
-        )
-        last_order.refresh_from_db()
-
-        # ✅ Уменьшаем долг магазина
-        Store.objects.filter(pk=store.pk).update(
-            debt=F('debt') - total_amount
-        )
-        store.refresh_from_db()
-
-        # =========================================================================
-        # УМЕНЬШЕНИЕ КОЛИЧЕСТВА В ИНВЕНТАРЕ
-        # =========================================================================
-
-        # Уменьшаем количество бракованного товара в инвентаре
-        if quantity >= inventory_item.quantity:
-            # Удаляем весь товар из инвентаря
+        # Уменьшаем инвентарь
+        inventory_item.quantity -= quantity
+        if inventory_item.quantity <= 0:
             inventory_item.delete()
         else:
-            # Уменьшаем количество
-            inventory_item.quantity -= quantity
-            inventory_item.save()
+            inventory_item.save(update_fields=['quantity', 'last_updated'])
 
-        # =========================================================================
-        # ИСТОРИЯ ЗАКАЗА
-        # =========================================================================
-
-        from orders.models import OrderHistory, OrderType
-        OrderHistory.objects.create(
-            order_type=OrderType.STORE,
-            order_id=last_order.id,
-            old_status=last_order.status,
-            new_status=last_order.status,
-            changed_by=request.user,
-            comment=f'Партнёр выявил брак: {inventory_item.product.name} x {quantity} = {total_amount} сом. Долг магазина уменьшен.'
-        )
-
-        # =========================================================================
-        # ОТВЕТ
-        # =========================================================================
-
-        from orders.serializers import DefectiveProductSerializer
-        serializer = DefectiveProductSerializer(defect)
+        # Уменьшаем долг магазина
+        Store.objects.filter(pk=store.pk).update(debt=F('debt') - defect_amount)
+        store.refresh_from_db()
 
         return Response({
             'success': True,
-            'message': 'Бракованный товар отмечен. Долг магазина уменьшен.',
-            'defect': serializer.data,
-            'total_defect_amount': float(total_amount),
-            'order_debt_before': float(last_order.debt_amount + total_amount),
-            'order_debt_after': float(last_order.debt_amount),
-            'store_debt_before': float(store.debt + total_amount),
-            'store_debt_after': float(store.debt)
-        }, status=status.HTTP_201_CREATED)
+            'message': f'Брак зафиксирован. Долг уменьшен на {defect_amount} сом.',
+            'defect': {
+                'id': defect.id,
+                'product_id': product_id,
+                'product_name': product.name,
+                'quantity': float(quantity),
+                'price': float(price),
+                'total_amount': float(defect_amount),
+                'reason': reason,
+            },
+            'store_debt': float(store.debt),
+        })
 
     @action(
         detail=True,

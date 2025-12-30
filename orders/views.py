@@ -1,19 +1,19 @@
-# apps/orders/views.py - ОЧИЩЕННАЯ ВЕРСИЯ v2.1
+# apps/orders/views.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.2
 """
-Views для orders согласно ТЗ v2.0.
+Views для orders согласно ТЗ v2.0 и дизайну.
 
-ОЧИСТКА v2.1:
-1. УДАЛЁН DefectiveProductViewSet (брак через stores)
-2. УДАЛЁН order_history action (дубль my_orders)
-3. УДАЛЁН весь закомментированный код
-4. Добавлен http_method_names для запрета PUT/PATCH/DELETE
-5. Добавлена проверка статуса в approve/reject
+ИЗМЕНЕНИЯ v2.2:
+1. Добавлен endpoint GET /api/orders/store-orders/my-orders/{id}/
+2. Обновлены сериализаторы для соответствия дизайну
+3. Убраны лишние поля (partner/partner_name из списков)
+4. Добавлены поля owner_name, store_phone, items_summary
 
 API ENDPOINTS:
-- GET /api/orders/store-orders/ - список заказов
+- GET /api/orders/store-orders/ - список заказов (админ)
 - POST /api/orders/store-orders/ - создание заказа (магазин)
-- GET /api/orders/store-orders/{id}/ - детали заказа
-- GET /api/orders/store-orders/my-orders/ - заказы магазина
+- GET /api/orders/store-orders/{id}/ - детали заказа (админ)
+- GET /api/orders/store-orders/my-orders/ - список заказов магазина
+- GET /api/orders/store-orders/my-orders/{id}/ - детали заказа магазина (НОВОЕ!)
 - POST /api/orders/store-orders/{id}/approve/ - админ одобряет
 - POST /api/orders/store-orders/{id}/reject/ - админ отклоняет
 """
@@ -37,10 +37,15 @@ from .models import (
     StoreOrderStatus,
 )
 from .serializers import (
+    # Админ
     StoreOrderListSerializer,
     StoreOrderDetailSerializer,
+    # Магазин
+    StoreOrderForStoreListSerializer,
+    StoreOrderDetailForStoreSerializer,
+    # Создание
     StoreOrderCreateSerializer,
-    StoreOrderForStoreSerializer,
+    # Actions
     OrderApproveSerializer,
     OrderRejectSerializer,
 )
@@ -76,24 +81,19 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
     - Магазин: создание заказа, свои заказы
 
     API:
-    - GET /api/orders/store-orders/ - список
+    - GET /api/orders/store-orders/ - список (админ)
     - POST /api/orders/store-orders/ - создание (магазин)
-    - GET /api/orders/store-orders/{id}/ - детали
+    - GET /api/orders/store-orders/{id}/ - детали (админ)
     - GET /api/orders/store-orders/my-orders/ - мои заказы (магазин)
+    - GET /api/orders/store-orders/my-orders/{id}/ - детали моего заказа (магазин) [НОВОЕ!]
     - POST /api/orders/store-orders/{id}/approve/ - одобрить (админ)
     - POST /api/orders/store-orders/{id}/reject/ - отклонить (админ)
-
-    ВАЖНО (ТЗ v2.0):
-    - Магазин НЕ может редактировать заказ после создания
-    - Подтверждение партнёром через /api/stores/{id}/inventory/confirm/
-    - Погашение долга через /api/stores/{id}/pay-debt/
-    - Отметка брака через /api/stores/{id}/inventory/report-defect/
     """
 
     permission_classes = [IsAuthenticated]
     pagination_class = StandardPagination
 
-    # ✅ НОВОЕ v2.1: Запрет PUT/PATCH/DELETE
+    # Запрет PUT/PATCH/DELETE
     http_method_names = ['get', 'post', 'head', 'options']
 
     def get_queryset(self) -> QuerySet[StoreOrder]:
@@ -103,16 +103,15 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         if user.role == 'admin':
             return StoreOrder.objects.all().select_related(
                 'store', 'partner', 'reviewed_by', 'confirmed_by'
-            ).prefetch_related('items__product').order_by('-created_at')
+            ).prefetch_related('items__product__images').order_by('-created_at')
 
         elif user.role == 'partner':
-            # Партнёр видит только IN_TRANSIT (для информации)
-            # Основная работа через stores/.../inventory/
+            # Партнёр видит только IN_TRANSIT
             return StoreOrder.objects.filter(
                 status=StoreOrderStatus.IN_TRANSIT
             ).select_related(
                 'store', 'reviewed_by'
-            ).prefetch_related('items__product').order_by('-created_at')
+            ).prefetch_related('items__product__images').order_by('-created_at')
 
         elif user.role == 'store':
             # Магазин видит свои заказы
@@ -121,20 +120,22 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
                 return StoreOrder.objects.filter(
                     store=store
                 ).select_related(
-                    'partner', 'reviewed_by', 'confirmed_by'
-                ).prefetch_related('items__product').order_by('-created_at')
+                    'store', 'partner', 'reviewed_by', 'confirmed_by'
+                ).prefetch_related('items__product__images').order_by('-created_at')
             return StoreOrder.objects.none()
 
         return StoreOrder.objects.none()
 
     def get_serializer_class(self):
-        """Выбор сериализатора."""
+        """Выбор сериализатора в зависимости от action."""
         if self.action == 'list':
             return StoreOrderListSerializer
         elif self.action == 'create':
             return StoreOrderCreateSerializer
         elif self.action == 'my_orders':
-            return StoreOrderForStoreSerializer
+            return StoreOrderForStoreListSerializer
+        elif self.action == 'my_order_detail':
+            return StoreOrderDetailForStoreSerializer
         return StoreOrderDetailSerializer
 
     # =========================================================================
@@ -143,11 +144,29 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
 
     def list(self, request: Request) -> Response:
         """
-        Список заказов с пагинацией.
+        Список заказов с пагинацией (для АДМИНА).
 
         GET /api/orders/store-orders/
         GET /api/orders/store-orders/?status=pending
         GET /api/orders/store-orders/?status=in_transit
+        GET /api/orders/store-orders/?store_id=5
+
+        Response по дизайну:
+        {
+            "id": 1,
+            "store": 5,
+            "store_name": "Магазин №1",
+            "owner_name": "Эргешов Тынчтык",    // ФИО владельца
+            "store_phone": "+996 999 888 777",  // Телефон магазина
+            "status": "pending",
+            "status_display": "В ожидании",
+            "total_amount": "450.00",
+            "items_summary": "Запрос на 900 шт 20кг",  // Сводка
+            "piece_count": 900,
+            "weight_total": "20",
+            "items_count": 5,
+            "created_at": "2024-05-28T10:00:00Z"
+        }
         """
         queryset = self.get_queryset()
 
@@ -224,9 +243,40 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
 
     def retrieve(self, request: Request, pk=None) -> Response:
         """
-        Детали заказа.
+        Детали заказа (для АДМИНА).
 
         GET /api/orders/store-orders/{id}/
+
+        Response по дизайну:
+        {
+            "id": 1,
+            "store": 5,
+            "store_name": "Магазин №1",
+            "store_inn": "12345678901234",
+            "owner_name": "Сыдыков Тариэл Кнатбекович",
+            "store_phone": "+996777999666",
+            "store_address": "ул. Примерная, 123",
+            "status": "pending",
+            "status_display": "В ожидании",
+            "items": [
+                {
+                    "id": 1,
+                    "product": 10,
+                    "product_name": "Пельмени Красные",
+                    "is_weight_based": false,
+                    "quantity": "1",
+                    "quantity_display": "1 шт",
+                    "price": "450.00",
+                    "total": "450.00",
+                    "is_bonus": false,
+                    "bonus_percent": "0%"
+                }
+            ],
+            "items_summary": "3 шт",
+            "total_items_count": 3,
+            "total_amount": "450.00",
+            ...
+        }
         """
         order = self.get_object()
         serializer = StoreOrderDetailSerializer(order)
@@ -244,14 +294,29 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
     )
     def my_orders(self, request: Request) -> Response:
         """
-        Заказы текущего магазина (ТЗ v2.0).
+        Список заказов текущего магазина (ТЗ v2.0).
 
         GET /api/orders/store-orders/my-orders/
         GET /api/orders/store-orders/my-orders/?status=pending
         GET /api/orders/store-orders/my-orders/?status=accepted
         GET /api/orders/store-orders/my-orders/?start_date=2024-01-01&end_date=2024-12-31
 
-        Возвращает все заказы текущего магазина с полным содержимым.
+        Response по дизайну:
+        {
+            "id": 1,
+            "store": 5,
+            "store_name": "Магазин №1",
+            "owner_name": "Эргешов Тынчтык",
+            "store_phone": "+996 999 888 777",
+            "status": "pending",
+            "status_display": "В ожидании",
+            "total_amount": "450.00",
+            "items_summary": "Запрос на 900 шт 20кг",
+            "piece_count": 900,
+            "weight_total": "20",
+            "items_count": 5,
+            "created_at": "2024-05-28T10:00:00Z"
+        }
         """
         store = StoreSelectionService.get_current_store(request.user)
         if not store:
@@ -262,7 +327,7 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
 
         orders = StoreOrder.objects.filter(
             store=store
-        ).select_related('partner').prefetch_related('items__product').order_by('-created_at')
+        ).select_related('store').prefetch_related('items__product__images').order_by('-created_at')
 
         # Фильтрация по статусу
         status_filter = request.query_params.get('status')
@@ -281,10 +346,90 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         # Пагинация
         page = self.paginate_queryset(orders)
         if page is not None:
-            serializer = StoreOrderForStoreSerializer(page, many=True)
+            serializer = StoreOrderForStoreListSerializer(page, many=True)
             return self.get_paginated_response(serializer.data)
 
-        serializer = StoreOrderForStoreSerializer(orders, many=True)
+        serializer = StoreOrderForStoreListSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='my-orders/(?P<order_id>[^/.]+)',
+        permission_classes=[IsAuthenticated, IsStore]
+    )
+    def my_order_detail(self, request: Request, order_id=None) -> Response:
+        """
+        Детали заказа для магазина (НОВОЕ! v2.2).
+
+        GET /api/orders/store-orders/my-orders/{id}/
+
+        Response по дизайну (формат каталога товаров):
+        {
+            "id": 1,
+            "store": 5,
+            "store_name": "Магазин №1",
+            "owner_name": "Эргешов Тынчтык",
+            "store_phone": "+996 999 888 777",
+            "status": "in_transit",
+            "status_display": "В пути",
+            "items": [
+                {
+                    "id": 1,
+                    "product_id": 10,
+                    "product_name": "Курица",
+                    "product_image": "/media/products/chicken.jpg",
+                    "is_weight_based": true,
+                    "is_bonus_product": false,
+                    "requested": "5 кг",          // Запрошено
+                    "quantity": "5.000",
+                    "price": "450.00",
+                    "total": "2250.00",
+                    "is_bonus_item": false
+                },
+                {
+                    "id": 2,
+                    "product_id": 15,
+                    "product_name": "Зеленые Красные",
+                    "product_image": "/media/products/green.jpg",
+                    "is_weight_based": false,
+                    "is_bonus_product": true,     // Звёздочка
+                    "requested": "545 шт",        // Запрошено
+                    "quantity": "545",
+                    "price": "450.00",
+                    "total": "245250.00",
+                    "is_bonus_item": false
+                }
+            ],
+            "items_summary": "545 шт 5 кг",
+            "total_items_count": 546,
+            "total_amount": "247500.00",
+            ...
+        }
+        """
+        store = StoreSelectionService.get_current_store(request.user)
+        if not store:
+            return Response(
+                {'error': 'Выберите магазин для работы'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            order = StoreOrder.objects.select_related(
+                'store'
+            ).prefetch_related(
+                'items__product__images'
+            ).get(
+                pk=order_id,
+                store=store
+            )
+        except StoreOrder.DoesNotExist:
+            return Response(
+                {'error': 'Заказ не найден'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = StoreOrderDetailForStoreSerializer(order)
         return Response(serializer.data)
 
     # =========================================================================
@@ -310,7 +455,7 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         """
         order = self.get_object()
 
-        # ✅ НОВОЕ v2.1: Проверка статуса
+        # Проверка статуса
         if order.status != StoreOrderStatus.PENDING:
             return Response(
                 {
@@ -357,7 +502,7 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         Админ отклоняет заказ.
 
         POST /api/orders/store-orders/{id}/reject/
-        Body: {"reason": "Товар закончился"}
+        Body: {"reason": "Товара нет в наличии"}
 
         После отклонения:
         - Статус: PENDING → REJECTED
@@ -365,7 +510,7 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         """
         order = self.get_object()
 
-        # ✅ НОВОЕ v2.1: Проверка статуса
+        # Проверка статуса
         if order.status != StoreOrderStatus.PENDING:
             return Response(
                 {
@@ -382,18 +527,47 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         order = OrderWorkflowService.admin_reject_order(
             order=order,
             admin_user=request.user,
-            reason=serializer.validated_data['reason']
+            reason=serializer.validated_data.get('reason', '')
         )
 
         output = StoreOrderDetailSerializer(order)
         return Response(output.data)
 
-# =============================================================================
-# УДАЛЁННЫЕ VIEWSETS (v2.1)
-# =============================================================================
-#
-# DefectiveProductViewSet - УДАЛЁН
-# Причина: Брак теперь отмечается через stores:
-#   POST /api/stores/{id}/inventory/report-defect/
-#
-# =============================================================================
+    # =========================================================================
+    # УДАЛЕНИЕ ЗАКАЗА (опционально, по дизайну есть иконка корзины)
+    # =========================================================================
+
+    @action(
+        detail=True,
+        methods=['delete'],
+        permission_classes=[IsAuthenticated, IsAdmin]
+    )
+    def delete_order(self, request: Request, pk=None) -> Response:
+        """
+        Админ удаляет заказ (только PENDING).
+
+        DELETE /api/orders/store-orders/{id}/delete_order/
+
+        По дизайну: иконка корзины с подтверждением
+        "Вы уверены, что хотите удалить этот запрос? Это потом нельзя вернуть"
+        """
+        order = self.get_object()
+
+        # Можно удалить только PENDING заказы
+        if order.status != StoreOrderStatus.PENDING:
+            return Response(
+                {
+                    'error': f'Невозможно удалить заказ в статусе "{order.get_status_display()}"',
+                    'message': 'Удалить можно только заказы в статусе "В ожидании"'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        order_id = order.id
+        store_name = order.store.name
+        order.delete()
+
+        return Response({
+            'success': True,
+            'message': f'Заказ #{order_id} от магазина "{store_name}" удалён'
+        })

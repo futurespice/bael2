@@ -1,80 +1,63 @@
-# apps/orders/services.py - ПОЛНАЯ ВЕРСИЯ v2.0
+# apps/orders/services.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.3
 """
-Сервисы для работы с заказами согласно ТЗ v2.0.
+Сервисы для orders согласно ТЗ v2.0.
 
-ОСНОВНОЙ СЕРВИС:
-- OrderWorkflowService: Workflow магазин → админ → партнёр
+ИСПРАВЛЕНИЯ v2.3:
+1. admin_approve_order - НЕ добавляет товары в StoreInventory (только меняет статус)
+2. Товары в StoreInventory добавляются ТОЛЬКО при подтверждении партнёром
+3. Корзина магазина = заказы IN_TRANSIT (StoreOrderItem)
+4. Инвентарь = товары из ACCEPTED заказов
 
-ДОПОЛНИТЕЛЬНЫЕ СЕРВИСЫ:
-- PartnerOrderService: Заказы партнёра у админа
-- DebtService: Управление долгами
-- DefectiveProductService: Бракованные товары
-
-ТЗ v2.0 WORKFLOW:
+WORKFLOW:
 1. Магазин создаёт заказ → PENDING
-2. Админ одобряет → IN_TRANSIT, товары → инвентарь
-3. Партнёр подтверждает → ACCEPTED, создаётся долг
+2. Админ одобряет → IN_TRANSIT (товары в корзине = StoreOrderItem)
+3. Партнёр подтверждает корзину → ACCEPTED (товары → StoreInventory)
+4. Брак выбирается из StoreInventory
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import QuerySet, F, Sum
+from django.db.models import F
 from django.utils import timezone
 
+from products.models import Product
 from stores.models import Store, StoreInventory
 from stores.services import StoreInventoryService
-from products.models import Product
 
 from .models import (
     StoreOrder,
     StoreOrderItem,
     StoreOrderStatus,
-    DebtPayment,
-    DefectiveProduct,
     OrderHistory,
     OrderType,
 )
 
 
-# =============================================================================
-# DATA CLASSES
-# =============================================================================
-
 @dataclass
 class OrderItemData:
-    """Данные позиции заказа."""
+    """Данные для создания позиции заказа."""
     product_id: int
     quantity: Decimal
-    price: Optional[Decimal] = None  # Если None, берётся из Product.final_price
+    price: Optional[Decimal] = None
     is_bonus: bool = False
 
 
-# =============================================================================
-# ORDER WORKFLOW SERVICE (ОСНОВНОЙ)
-# =============================================================================
-
 class OrderWorkflowService:
     """
-    Сервис для работы с workflow заказов магазина (ТЗ v2.0).
+    Сервис workflow заказов (ТЗ v2.0).
 
     WORKFLOW:
-    1. create_store_order() - Магазин создаёт заказ
-    2. admin_approve_order() - Админ одобряет
-    3. partner_confirm_order() - Партнёр подтверждает
-
-    ДОПОЛНИТЕЛЬНО:
-    - store_cancel_items() - Магазин отменяет товары до IN_TRANSIT
-    - admin_reject_order() - Админ отклоняет
+    1. Магазин создаёт заказ → PENDING
+    2. Админ одобряет → IN_TRANSIT (товары остаются в StoreOrderItem - "корзина")
+    3. Партнёр подтверждает → ACCEPTED (товары → StoreInventory)
     """
 
     # =========================================================================
-    # 1. СОЗДАНИЕ ЗАКАЗА МАГАЗИНОМ
+    # СОЗДАНИЕ ЗАКАЗА (МАГАЗИН)
     # =========================================================================
 
     @classmethod
@@ -84,372 +67,190 @@ class OrderWorkflowService:
             *,
             store: Store,
             items_data: List[OrderItemData],
-            created_by: Optional['User'] = None,
-            idempotency_key: Optional[str] = None,
+            created_by,
+            idempotency_key: Optional[str] = None
     ) -> StoreOrder:
         """
-        Магазин создаёт заказ у админа (ТЗ v2.0).
-
-        КРИТИЧЕСКИЕ ПРОВЕРКИ (ИСПРАВЛЕНИЯ #4 и #5):
-        ✅ 1. Магазин должен быть активным (is_active=True)
-        ✅ 2. Магазин должен быть одобрен (approval_status=APPROVED)
-        ✅ 3. Товар должен быть в наличии (stock_quantity >= quantity)
-        ✅ 4. Товар должен быть активным (is_active=True)
-        ✅ 5. Для весовых товаров: минимум 1 кг, шаг 0.1 кг
-
-        WORKFLOW:
-        1. Магазин создаёт заказ → статус PENDING
-        2. Товары НЕ уходят из инвентаря сразу
-        3. Товары добавляются в инвентарь только после одобрения админом
+        Магазин создаёт заказ (ТЗ v2.0).
 
         Args:
-            store: Магазин, создающий заказ
-            items_data: Список товаров для заказа
-            created_by: Пользователь (опционально)
-            idempotency_key: Ключ для защиты от дублирования (опционально)
+            store: Магазин
+            items_data: Список товаров
+            created_by: Пользователь
+            idempotency_key: Ключ идемпотентности
 
         Returns:
-            StoreOrder: Созданный заказ в статусе PENDING
-
-        Raises:
-            ValidationError: При нарушении любого из бизнес-правил
-
-        Example:
-            >>> items = [
-            ...     OrderItemData(product_id=1, quantity=Decimal('10')),
-            ...     OrderItemData(product_id=2, quantity=Decimal('2.5')),
-            ... ]
-            >>> order = OrderWorkflowService.create_store_order(
-            ...     store=my_store,
-            ...     items_data=items,
-            ...     created_by=user
-            ... )
+            StoreOrder
         """
-
-        # =========================================================================
-        # ✅ КРИТИЧЕСКАЯ ПРОВЕРКА #4: Магазин должен быть активным
-        # =========================================================================
-        if not store.is_active:
-            raise ValidationError(
-                f"Магазин '{store.name}' заблокирован и не может создавать заказы. "
-                f"Обратитесь к администратору для разблокировки. "
-                f"Причина блокировки может быть связана с нарушением условий работы или задолженностью."
-            )
-
-        # =========================================================================
-        # ✅ ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Магазин должен быть одобрен
-        # =========================================================================
-        if store.approval_status != Store.ApprovalStatus.APPROVED:
-            raise ValidationError(
-                f"Магазин '{store.name}' не одобрен администратором. "
-                f"Текущий статус: {store.get_approval_status_display()}. "
-                f"Дождитесь одобрения администратором перед созданием заказов. "
-                f"Для ускорения процесса обратитесь в службу поддержки."
-            )
-
-        # =========================================================================
-        # ПРОВЕРКА IDEMPOTENCY (защита от дублирования)
-        # =========================================================================
+        # Проверка идемпотентности
         if idempotency_key:
-            existing_order = StoreOrder.objects.filter(
+            existing = StoreOrder.objects.filter(
                 idempotency_key=idempotency_key
             ).first()
+            if existing:
+                return existing
 
-            if existing_order:
-                # Заказ с таким ключом уже существует - возвращаем его
-                return existing_order
-
-        # =========================================================================
-        # ✅ КРИТИЧЕСКАЯ ПРОВЕРКА #5: Проверка товаров
-        # =========================================================================
-
-        # Проверка что есть хотя бы один товар
-        if not items_data or len(items_data) == 0:
+        # Проверка магазина
+        if not store.can_interact:
             raise ValidationError(
-                "Заказ должен содержать хотя бы один товар. "
-                "Добавьте товары в заказ и попробуйте снова."
+                f'Магазин "{store.name}" не может создавать заказы. '
+                f'Статус: {store.get_approval_status_display()}'
             )
 
-        # Собираем ID всех товаров из заказа
-        product_ids = [item.product_id for item in items_data]
-
-        # Загружаем все товары одним запросом (оптимизация N+1)
-        products = Product.objects.filter(pk__in=product_ids)
-        products_dict = {p.id: p for p in products}
-
-        # Проверяем каждый товар в заказе
-        for item in items_data:
-            product_id = item.product_id
-
-            # ✅ ПРОВЕРКА #5a: Товар существует
-            if product_id not in products_dict:
-                raise ValidationError(
-                    f"Товар с ID={product_id} не найден в каталоге. "
-                    f"Возможно, товар был удалён администратором. "
-                    f"Обновите список товаров и попробуйте снова."
-                )
-
-            product = products_dict[product_id]
-
-            # ✅ ПРОВЕРКА #5b: Товар активен
-            if not product.is_active:
-                raise ValidationError(
-                    f"Товар '{product.name}' недоступен для заказа. "
-                    f"Товар был деактивирован администратором. "
-                    f"Пожалуйста, выберите другой товар из каталога."
-                )
-
-            # ✅ ПРОВЕРКА #5c: Наличие на складе (stock_quantity)
-            if product.stock_quantity < item.quantity:
-                # Для весовых товаров
-                if product.is_weight_based:
-                    raise ValidationError(
-                        f"Недостаточно товара '{product.name}' на складе. "
-                        f"Запрошено: {item.quantity} кг, "
-                        f"доступно: {product.stock_quantity} кг. "
-                        f"Пожалуйста, уменьшите количество в заказе или выберите другой товар."
-                    )
-                # Для штучных товаров
-                else:
-                    raise ValidationError(
-                        f"Недостаточно товара '{product.name}' на складе. "
-                        f"Запрошено: {int(item.quantity)} шт., "
-                        f"доступно: {int(product.stock_quantity)} шт. "
-                        f"Пожалуйста, уменьшите количество в заказе или выберите другой товар."
-                    )
-
-            # ✅ ПРОВЕРКА #5d: Для весовых товаров - минимальное количество и шаг
-            if product.is_weight_based:
-                # Определяем минимум в зависимости от остатка
-                if product.stock_quantity < Decimal('1'):
-                    min_quantity = Decimal('0.1')
-                else:
-                    min_quantity = Decimal('1')
-
-                # Проверка минимума
-                if item.quantity < min_quantity:
-                    raise ValidationError(
-                        f"Для товара '{product.name}' минимальное количество: {min_quantity} кг. "
-                        f"Вы указали: {item.quantity} кг. "
-                        f"Увеличьте количество до {min_quantity} кг или более."
-                    )
-
-                # Проверка шага (должно быть кратно 0.1 кг = 100 грамм)
-                # Умножаем на 10 и проверяем остаток от деления на 1
-                remainder = (item.quantity * 10) % 1
-                if remainder != 0:
-                    raise ValidationError(
-                        f"Количество для '{product.name}' должно быть кратно 0.1 кг (100 грамм). "
-                        f"Вы указали: {item.quantity} кг. "
-                        f"Примеры корректных значений: 1.0, 1.1, 1.2, 1.3, 2.5 кг и т.д."
-                    )
-
-            # ✅ ПРОВЕРКА #5e: Для штучных товаров - целое число
-            if not product.is_weight_based:
-                if item.quantity != int(item.quantity):
-                    raise ValidationError(
-                        f"Для товара '{product.name}' количество должно быть целым числом. "
-                        f"Вы указали: {item.quantity}. "
-                        f"Используйте только целые числа: 1, 2, 3, 10 и т.д."
-                    )
-
-        # =========================================================================
-        # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - СОЗДАЁМ ЗАКАЗ
-        # =========================================================================
-
-        # Создаём заказ в статусе PENDING
-        order = StoreOrder.objects.create(
-            store=store,
-            partner=None,  # Партнёр будет назначен позже админом
-            created_by=created_by,
-            status=StoreOrderStatus.PENDING,
-            idempotency_key=idempotency_key,
-            total_amount=Decimal('0'),  # Будет пересчитано ниже
-            debt_amount=Decimal('0'),
-            prepayment_amount=Decimal('0'),
-            paid_amount=Decimal('0'),
-        )
-
-        # Добавляем позиции в заказ
+        # Валидация и создание позиций
         total_amount = Decimal('0')
+        items_to_create = []
 
         for item_data in items_data:
-            product = products_dict[item_data.product_id]
+            try:
+                product = Product.objects.get(
+                    pk=item_data.product_id,
+                    is_active=True
+                )
+            except Product.DoesNotExist:
+                raise ValidationError(
+                    f'Товар с ID {item_data.product_id} не найден или неактивен'
+                )
 
-            # Определяем цену (из item_data или берём из Product)
-            price = item_data.price if item_data.price is not None else product.final_price
+            quantity = Decimal(str(item_data.quantity))
 
-            # Создаём позицию заказа
-            order_item = StoreOrderItem.objects.create(
+            # Валидация весовых товаров
+            if product.is_weight_based:
+                cls._validate_weight_quantity(product, quantity)
+
+            # Проверка наличия на складе
+            if product.stock_quantity < quantity:
+                raise ValidationError(
+                    f'Недостаточно товара "{product.name}" на складе. '
+                    f'Доступно: {product.stock_quantity}, запрошено: {quantity}'
+                )
+
+            # Цена
+            price = item_data.price or product.final_price
+            item_total = quantity * price
+
+            items_to_create.append({
+                'product': product,
+                'quantity': quantity,
+                'price': price,
+                'total': item_total,
+                'is_bonus': item_data.is_bonus,
+            })
+
+            total_amount += item_total
+
+        # Создание заказа
+        order = StoreOrder.objects.create(
+            store=store,
+            status=StoreOrderStatus.PENDING,
+            total_amount=total_amount,
+            idempotency_key=idempotency_key,
+            created_by=created_by,
+        )
+
+        # Создание позиций
+        for item in items_to_create:
+            StoreOrderItem.objects.create(
                 order=order,
-                product=product,
-                quantity=item_data.quantity,
-                price=price,
-                is_bonus=item_data.is_bonus,
-                # total вычисляется автоматически в save() модели
+                product=item['product'],
+                quantity=item['quantity'],
+                price=item['price'],
+                total=item['total'],
+                is_bonus=item['is_bonus'],
             )
 
-            # Суммируем общую стоимость
-            total_amount += order_item.total
-
-        # Обновляем общую сумму заказа
-        order.total_amount = total_amount
-        order.save(update_fields=['total_amount'])
-
-        # =========================================================================
-        # СОЗДАЁМ ЗАПИСЬ В ИСТОРИИ
-        # =========================================================================
+        # История
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
-            old_status='',  # Нет предыдущего статуса
+            old_status=None,
             new_status=StoreOrderStatus.PENDING,
             changed_by=created_by,
-            comment=(
-                f"Заказ создан магазином '{store.name}'. "
-                f"Количество позиций: {len(items_data)}. "
-                f"Общая сумма: {total_amount} сом."
-            )
+            comment=f'Заказ создан магазином "{store.name}"'
         )
+
         return order
 
+    @classmethod
+    def _validate_weight_quantity(cls, product: Product, quantity: Decimal) -> None:
+        """Валидация количества для весовых товаров."""
+        # Минимум 1 кг (или 0.1 кг если остаток < 1 кг)
+        min_qty = Decimal('1') if product.stock_quantity >= 1 else Decimal('0.1')
+        if quantity < min_qty:
+            raise ValidationError(
+                f'Минимальное количество для "{product.name}" - {min_qty} кг'
+            )
+
+        # Шаг 0.1 кг
+        if (quantity * 10) % 1 != 0:
+            raise ValidationError(
+                f'Количество для "{product.name}" должно быть кратно 0.1 кг'
+            )
+
     # =========================================================================
-    # 2. АДМИН ОДОБРЯЕТ ЗАКАЗ
+    # ОДОБРЕНИЕ АДМИНОМ (PENDING → IN_TRANSIT)
     # =========================================================================
+
     @classmethod
     @transaction.atomic
     def admin_approve_order(
             cls,
             *,
             order: StoreOrder,
-            admin_user: 'User',
-            assign_to_partner: Optional['User'] = None,
+            admin_user,
+            assign_to_partner=None
     ) -> StoreOrder:
         """
         Админ одобряет заказ (ТЗ v2.0).
 
-        КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ (ERROR-9):
-        ✅ 1. ПЕРЕД одобрением проверяем наличие товаров на складе
-        ✅ 2. УМЕНЬШАЕМ stock_quantity при одобрении
-        ✅ 3. Обновляем is_available если товар закончился
-        ✅ 4. ОТКАТЫВАЕМ транзакцию если товара недостаточно
-
-        Действия:
-        1. Проверка прав и статуса
-        2. ✅ НОВОЕ: Проверка наличия товаров на складе
-        3. ✅ НОВОЕ: Уменьшение stock_quantity
-        4. Добавление товаров в инвентарь магазина
-        5. Изменение статуса на IN_TRANSIT
-        6. Опционально назначение партнёра
+        ВАЖНО: Товары НЕ добавляются в StoreInventory!
+        Они остаются в StoreOrderItem и образуют "корзину" для партнёра.
 
         Args:
-            order: Заказ для одобрения
-            admin_user: Администратор
+            order: Заказ
+            admin_user: Админ
             assign_to_partner: Партнёр (опционально)
 
         Returns:
-            StoreOrder в статусе IN_TRANSIT
-
-        Raises:
-            ValidationError: Если недостаточно товаров на складе
+            StoreOrder
         """
-        # =========================================================================
-        # ПРОВЕРКА ПРАВ И СТАТУСА
-        # =========================================================================
-        if admin_user.role != 'admin':
-            raise ValidationError("Только администратор может одобрять заказы")
-
         if order.status != StoreOrderStatus.PENDING:
             raise ValidationError(
-                f"Можно одобрить только заказы в статусе 'В ожидании'. "
-                f"Текущий статус: {order.get_status_display()}"
+                f'Невозможно одобрить заказ в статусе "{order.get_status_display()}"'
             )
 
-        # =========================================================================
-        # ✅ КРИТИЧЕСКОЕ ДОБАВЛЕНИЕ ERROR-9: ПРОВЕРКА НАЛИЧИЯ НА СКЛАДЕ
-        # =========================================================================
-
-        # Загружаем все товары заказа с блокировкой (для избежания гонки)
-        order_items = order.items.select_related('product').select_for_update()
-
-        # Проверяем КАЖДЫЙ товар ДО одобрения
-        insufficient_products = []
+        # Проверка наличия товаров на складе и уменьшение остатков
+        order_items = order.items.select_related('product').all()
 
         for item in order_items:
             product = item.product
 
-            # Проверка наличия
             if product.stock_quantity < item.quantity:
-                insufficient_products.append({
-                    'product_name': product.name,
-                    'requested': item.quantity,
-                    'available': product.stock_quantity,
-                    'missing': item.quantity - product.stock_quantity,
-                })
+                raise ValidationError(
+                    f'Недостаточно товара "{product.name}" на складе. '
+                    f'Доступно: {product.stock_quantity}, требуется: {item.quantity}'
+                )
 
-        # Если хотя бы один товар отсутствует - ОТКАТЫВАЕМ всю транзакцию
-        if insufficient_products:
-            error_details = "\n".join([
-                f"- {p['product_name']}: "
-                f"нужно {p['requested']}, "
-                f"на складе {p['available']}, "
-                f"не хватает {p['missing']}"
-                for p in insufficient_products
-            ])
-
-            raise ValidationError(
-                f"Недостаточно товаров на складе для одобрения заказа #{order.id}:\n"
-                f"{error_details}\n\n"
-                f"Пожалуйста, пополните склад или уменьшите количество в заказе."
-            )
-
-        # =========================================================================
-        # ✅ КРИТИЧЕСКОЕ ДОБАВЛЕНИЕ ERROR-9: УМЕНЬШЕНИЕ STOCK_QUANTITY
-        # =========================================================================
-
-        # Все проверки пройдены - уменьшаем остатки
+        # Уменьшаем остатки на складе
         for item in order_items:
             product = item.product
-
-            # Уменьшаем количество на складе
             product.stock_quantity -= item.quantity
 
-            # Если товар закончился - помечаем как недоступный
             if product.stock_quantity <= Decimal('0'):
                 product.stock_quantity = Decimal('0')
                 product.is_available = False
 
-            # Сохраняем изменения
             product.save(update_fields=['stock_quantity', 'is_available'])
 
-            # Логирование для аудита
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(
-                f"Склад обновлён | Товар: {product.name} | "
-                f"Заказ #{order.id} | Списано: {item.quantity} | "
-                f"Остаток: {product.stock_quantity}"
-            )
+        # ❌ УБРАНО: Добавление в StoreInventory
+        # Товары остаются в StoreOrderItem и образуют "корзину"
 
-        # =========================================================================
-        # ДОБАВЛЕНИЕ ТОВАРОВ В ИНВЕНТАРЬ МАГАЗИНА
-        # =========================================================================
-        for item in order_items:
-            StoreInventoryService.add_to_inventory(
-                store=order.store,
-                product=item.product,
-                quantity=item.quantity
-            )
-
-        # =========================================================================
-        # ИЗМЕНЕНИЕ СТАТУСА ЗАКАЗА
-        # =========================================================================
+        # Изменение статуса
         old_status = order.status
         order.status = StoreOrderStatus.IN_TRANSIT
         order.reviewed_by = admin_user
         order.reviewed_at = timezone.now()
 
-        # Назначаем партнёра (опционально)
         if assign_to_partner:
             if assign_to_partner.role != 'partner':
                 raise ValidationError("Можно назначить только партнёра")
@@ -457,9 +258,7 @@ class OrderWorkflowService:
 
         order.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'partner'])
 
-        # =========================================================================
-        # ИСТОРИЯ ЗАКАЗА
-        # =========================================================================
+        # История
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
@@ -468,15 +267,15 @@ class OrderWorkflowService:
             changed_by=admin_user,
             comment=(
                 f'Заказ одобрен админом. '
-                f'Товары добавлены в инвентарь магазина "{order.store.name}". '
-                f'Остатки на складе обновлены.'
+                f'Товары в корзине магазина "{order.store.name}". '
+                f'Ожидает подтверждения партнёром.'
             )
         )
 
         return order
 
     # =========================================================================
-    # 3. АДМИН ОТКЛОНЯЕТ ЗАКАЗ
+    # ОТКЛОНЕНИЕ АДМИНОМ (PENDING → REJECTED)
     # =========================================================================
 
     @classmethod
@@ -485,316 +284,477 @@ class OrderWorkflowService:
             cls,
             *,
             order: StoreOrder,
-            admin_user: 'User',
-            reason: str = '',
+            admin_user,
+            reason: str = ''
     ) -> StoreOrder:
-        """Админ отклоняет заказ."""
-        if admin_user.role != 'admin':
-            raise ValidationError("Только администратор может отклонять заказы")
+        """
+        Админ отклоняет заказ.
 
+        Args:
+            order: Заказ
+            admin_user: Админ
+            reason: Причина отклонения
+
+        Returns:
+            StoreOrder
+        """
         if order.status != StoreOrderStatus.PENDING:
-            raise ValidationError("Можно отклонить только заказы в статусе 'В ожидании'")
+            raise ValidationError(
+                f'Невозможно отклонить заказ в статусе "{order.get_status_display()}"'
+            )
 
         old_status = order.status
         order.status = StoreOrderStatus.REJECTED
         order.reviewed_by = admin_user
         order.reviewed_at = timezone.now()
-        order.save(update_fields=['status', 'reviewed_by', 'reviewed_at'])
+        order.reject_reason = reason
 
-        OrderHistory.objects.create(
-            order_type=OrderType.STORE,
-            order_id=order.id,
-            old_status=old_status,
-            new_status=StoreOrderStatus.REJECTED,
-            changed_by=admin_user,
-            comment=f'Заказ отклонён. Причина: {reason or "Не указана"}'
-        )
-
-        return order
-
-    # =========================================================================
-    # 4. ПАРТНЁР ПОДТВЕРЖДАЕТ ЗАКАЗ
-    # =========================================================================
-
-    @classmethod
-    @transaction.atomic
-    def partner_confirm_order(
-            cls,
-            *,
-            order: StoreOrder,
-            partner_user: 'User',
-            prepayment_amount: Decimal = Decimal('0'),
-            items_to_remove_from_inventory: Optional[List[int]] = None,
-    ) -> StoreOrder:
-        """Партнёр подтверждает заказ."""
-
-        # Проверки
-        if partner_user.role != 'partner':
-            raise ValidationError("Только партнёр может подтверждать заказы")
-
-        if order.status != StoreOrderStatus.IN_TRANSIT:
-            raise ValidationError("Можно подтвердить только заказы в статусе 'В пути'")
-
-        if prepayment_amount < Decimal('0'):
-            raise ValidationError("Предоплата не может быть отрицательной")
-
-        if prepayment_amount > order.total_amount:
-            raise ValidationError(
-                f"Предоплата ({prepayment_amount}) не может превышать "
-                f"сумму заказа ({order.total_amount})"
-            )
-
-        # Удаляем товары из инвентаря (если партнёр отменил)
-        if items_to_remove_from_inventory:
-            for product_id in items_to_remove_from_inventory:
-                try:
-                    order_item = order.items.filter(product_id=product_id).first()
-                    if order_item:
-                        # Удаляем из инвентаря
-                        StoreInventoryService.remove_from_inventory(
-                            store=order.store,
-                            product=order_item.product,
-                            quantity=order_item.quantity
-                        )
-                        # Удаляем позицию из заказа
-                        order_item.delete()
-                except Exception:
-                    pass
-
-            # Пересчитываем сумму
-            order.recalc_total()
-
-        # Применяем предоплату
-        order.prepayment_amount = prepayment_amount
-        order.debt_amount = order.total_amount - prepayment_amount
-
-        # ✅ ИСПРАВЛЕНО: Обновляем долг магазина через update()
-        Store.objects.filter(pk=order.store.pk).update(
-            debt=F('debt') + order.debt_amount
-        )
-        order.store.refresh_from_db()
-
-        # Меняем статус
-        old_status = order.status
-        order.status = StoreOrderStatus.ACCEPTED
-        order.partner = partner_user
-        order.confirmed_by = partner_user
-        order.confirmed_at = timezone.now()
-        order.save()
+        order.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'reject_reason'])
 
         # История
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
             old_status=old_status,
-            new_status=StoreOrderStatus.ACCEPTED,
-            changed_by=partner_user,
-            comment=(
-                f'Заказ подтверждён партнёром. '
-                f'Предоплата: {prepayment_amount} сом. '
-                f'Долг: {order.debt_amount} сом.'
-            )
+            new_status=StoreOrderStatus.REJECTED,
+            changed_by=admin_user,
+            comment=f'Заказ отклонён. Причина: {reason}' if reason else 'Заказ отклонён'
         )
 
         return order
 
-    # =========================================================================
-    # 5. МАГАЗИН ОТМЕНЯЕТ ТОВАРЫ ДО IN_TRANSIT
-    # =========================================================================
+
+class BasketService:
+    """
+    Сервис "Корзины магазина" для партнёра (ТЗ v2.0).
+
+    Корзина = все товары из заказов со статусом IN_TRANSIT.
+
+    WORKFLOW:
+    1. Партнёр видит корзину (товары из IN_TRANSIT заказов)
+    2. Может удалить товары, изменить количество
+    3. Вводит предоплату
+    4. Подтверждает → заказы становятся ACCEPTED
+    5. Товары переносятся в StoreInventory
+    6. Корзина очищается (т.к. нет больше IN_TRANSIT заказов)
+    """
 
     @classmethod
-    @transaction.atomic
-    def store_cancel_items(
-            cls,
-            *,
-            order: StoreOrder,
-            item_ids_to_cancel: List[int],
-            cancelled_by: 'User',
-    ) -> StoreOrder:
+    def get_basket(cls, store: Store) -> dict:
         """
-        Магазин отменяет товары до IN_TRANSIT (ТЗ v2.0).
+        Получить корзину магазина (все IN_TRANSIT заказы).
 
         Args:
-            order: Заказ
-            item_ids_to_cancel: ID позиций
-            cancelled_by: Пользователь
+            store: Магазин
 
         Returns:
-            Обновлённый StoreOrder
+            dict с товарами корзины
         """
-        if order.status not in [StoreOrderStatus.PENDING]:
-            raise ValidationError(
-                "Отменить товары можно только в статусе 'В ожидании'"
-            )
+        from django.db.models import Sum
 
-        # Удаляем позиции
-        cancelled_items = order.items.filter(id__in=item_ids_to_cancel)
-        cancelled_count = cancelled_items.count()
-        cancelled_items.delete()
-
-        # Пересчитываем сумму
-        order.recalc_total()
-
-        # Если все товары отменены
-        if not order.items.exists():
-            order.status = StoreOrderStatus.REJECTED
-            order.save(update_fields=['status'])
-
-            OrderHistory.objects.create(
-                order_type=OrderType.STORE,
-                order_id=order.id,
-                old_status=StoreOrderStatus.PENDING,
-                new_status=StoreOrderStatus.REJECTED,
-                changed_by=cancelled_by,
-                comment='Заказ отменён - все товары удалены'
-            )
-        else:
-            OrderHistory.objects.create(
-                order_type=OrderType.STORE,
-                order_id=order.id,
-                old_status=order.status,
-                new_status=order.status,
-                changed_by=cancelled_by,
-                comment=f'Магазин отменил {cancelled_count} позиций'
-            )
-
-        return order
-
-    # =========================================================================
-    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
-    # =========================================================================
-
-    @classmethod
-    def get_orders_for_partner(
-            cls,
-            partner: 'User',
-            status: Optional[StoreOrderStatus] = None,
-    ) -> QuerySet[StoreOrder]:
-        """
-        Получить заказы для партнёра.
-
-        ТЗ: "Партнёр видит только заказы в статусе IN_TRANSIT"
-        """
-        if partner.role != 'partner':
-            raise ValidationError("Только партнёр может просматривать заказы")
-
-        queryset = StoreOrder.objects.filter(
+        # Получаем все IN_TRANSIT заказы
+        orders = StoreOrder.objects.filter(
+            store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        )
+        ).prefetch_related('items__product__images').order_by('created_at')
 
-        if status:
-            queryset = queryset.filter(status=status)
+        if not orders.exists():
+            return {
+                'store_id': store.id,
+                'store_name': store.name,
+                'is_empty': True,
+                'orders_count': 0,
+                'items': [],
+                'totals': {
+                    'piece_count': 0,
+                    'weight_total': '0',
+                    'total_amount': '0',
+                }
+            }
 
-        return queryset.select_related('store', 'reviewed_by')
+        # Агрегируем товары из всех заказов
+        items_map = {}  # product_id -> aggregated data
 
-    @classmethod
-    def get_store_orders(
-            cls,
-            store: Store,
-            status: Optional[StoreOrderStatus] = None,
-    ) -> QuerySet[StoreOrder]:
-        """Получить заказы магазина."""
-        queryset = StoreOrder.objects.filter(store=store)
+        for order in orders:
+            for item in order.items.all():
+                product = item.product
+                product_id = product.id
 
-        if status:
-            queryset = queryset.filter(status=status)
+                if product_id not in items_map:
+                    # Получаем изображение
+                    main_image = None
+                    if hasattr(product, 'images'):
+                        first_image = product.images.first()
+                        if first_image and first_image.image:
+                            main_image = first_image.image.url
 
-        return queryset.select_related('partner', 'reviewed_by', 'confirmed_by')
+                    items_map[product_id] = {
+                        'product_id': product_id,
+                        'product_name': product.name,
+                        'product_image': main_image,
+                        'is_weight_based': product.is_weight_based,
+                        'is_bonus_product': product.is_bonus,
+                        'unit': product.unit,
+                        'price': item.price,  # Цена из заказа (зафиксированная)
+                        'quantity': Decimal('0'),
+                        'total': Decimal('0'),
+                        'order_ids': [],  # Из каких заказов
+                    }
 
-    def validate_weight_based_quantity(product: Product, quantity: Decimal) -> None:
-        """
-        Валидация количества для весового товара.
+                items_map[product_id]['quantity'] += item.quantity
+                items_map[product_id]['total'] += item.total
+                if order.id not in items_map[product_id]['order_ids']:
+                    items_map[product_id]['order_ids'].append(order.id)
 
-        Правила (ТЗ v2.0):
-        - Минимум: 1 кг (или 0.1 кг если остаток < 1 кг)
-        - Шаг: 0.1 кг (100 грамм)
-        - Максимум: stock_quantity
+        # Форматируем результат
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
 
-        Args:
-            product: Товар
-            quantity: Запрошенное количество
+        for product_id, data in items_map.items():
+            # Форматируем количество
+            if data['is_weight_based']:
+                qty = data['quantity']
+                if qty == int(qty):
+                    quantity_display = f"{int(qty)} кг"
+                else:
+                    quantity_display = f"{qty} кг"
+                weight_total += data['quantity']
+            else:
+                quantity_display = f"{int(data['quantity'])} шт"
+                piece_count += int(data['quantity'])
 
-        Raises:
-            ValidationError: Если количество некорректно
-        """
-        if not product.is_weight_based:
-            return  # Не весовой товар
+            total_amount += data['total']
 
-        # Определяем минимум
-        if product.stock_quantity < Decimal('1'):
-            min_quantity = Decimal('0.1')
-        else:
-            min_quantity = Decimal('1')
+            items.append({
+                'product_id': data['product_id'],
+                'product_name': data['product_name'],
+                'product_image': data['product_image'],
+                'is_weight_based': data['is_weight_based'],
+                'is_bonus_product': data['is_bonus_product'],
+                'unit': data['unit'],
+                'quantity': str(data['quantity']),
+                'quantity_display': quantity_display,
+                'price': str(data['price']),
+                'total': str(data['total']),
+                'order_ids': data['order_ids'],
+            })
 
-        # Проверка минимума
-        if quantity < min_quantity:
-            raise ValidationError(
-                f"Минимальное количество для '{product.name}': {min_quantity} кг"
-            )
-
-        # Проверка шага (должно быть кратно 0.1)
-        remainder = (quantity * 10) % 1
-        if remainder != 0:
-            raise ValidationError(
-                f"Количество для '{product.name}' должно быть кратно 0.1 кг (100 грамм). "
-                f"Например: 1.0, 1.1, 1.2, 1.3 кг и т.д."
-            )
-
-
-# =============================================================================
-# DEBT SERVICE
-# =============================================================================
-
-class DebtService:
-    """Сервис для управления долгами."""
+        return {
+            'store_id': store.id,
+            'store_name': store.name,
+            'is_empty': False,
+            'orders_count': orders.count(),
+            'order_ids': list(orders.values_list('id', flat=True)),
+            'items': items,
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(weight_total) if weight_total == int(weight_total) else str(weight_total),
+                'total_amount': str(total_amount),
+            }
+        }
 
     @classmethod
     @transaction.atomic
-    def pay_order_debt(
+    def confirm_basket(
             cls,
             *,
-            order: StoreOrder,
-            amount: Decimal,
-            paid_by: Optional['User'] = None,
-            received_by: Optional['User'] = None,
-            comment: str = '',
-    ) -> DebtPayment:
-        """Погашение долга по заказу."""
-        return order.pay_debt(
-            amount=amount,
-            paid_by=paid_by,
-            received_by=received_by,
-            comment=comment
-        )
+            store: Store,
+            partner_user,
+            prepayment_amount: Decimal = Decimal('0'),
+            items_to_remove: List[int] = None,
+            items_to_modify: List[dict] = None,
+    ) -> dict:
+        """
+        Партнёр подтверждает корзину магазина.
 
-    @classmethod
-    def get_store_total_debt(cls, store: Store) -> Decimal:
-        """Общий долг магазина."""
-        return store.debt
+        Args:
+            store: Магазин
+            partner_user: Партнёр
+            prepayment_amount: Предоплата
+            items_to_remove: ID товаров для удаления
+            items_to_modify: Изменение количества [{"product_id": 1, "new_quantity": 10}]
 
-    @classmethod
-    def get_store_debt_by_orders(cls, store: Store) -> List[Dict[str, Any]]:
-        """Долги магазина по заказам."""
+        Returns:
+            dict с результатом
+
+        WORKFLOW:
+        1. Удаляем/изменяем товары в StoreOrderItem
+        2. Пересчитываем суммы заказов
+        3. Меняем статус заказов: IN_TRANSIT → ACCEPTED
+        4. Добавляем товары в StoreInventory
+        5. Создаём долг
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        items_to_remove = items_to_remove or []
+        items_to_modify = items_to_modify or []
+
+        # Проверка партнёра
+        if partner_user.role != 'partner':
+            raise ValidationError('Только партнёры могут подтверждать корзину')
+
+        # Получаем IN_TRANSIT заказы
         orders = StoreOrder.objects.filter(
             store=store,
-            status=StoreOrderStatus.ACCEPTED
-        ).annotate(
-            outstanding=F('debt_amount') - F('paid_amount')
-        ).filter(outstanding__gt=Decimal('0'))
+            status=StoreOrderStatus.IN_TRANSIT
+        ).select_for_update().prefetch_related('items__product')
 
-        return [
-            {
+        if not orders.exists():
+            raise ValidationError('Нет заказов для подтверждения')
+
+        # =====================================================================
+        # 1. УДАЛЕНИЕ ТОВАРОВ
+        # =====================================================================
+        removed_info = []
+
+        for product_id in items_to_remove:
+            # Удаляем из ВСЕХ заказов
+            deleted_items = StoreOrderItem.objects.filter(
+                order__in=orders,
+                product_id=product_id
+            )
+
+            for item in deleted_items:
+                removed_info.append({
+                    'product_id': product_id,
+                    'product_name': item.product.name,
+                    'quantity': float(item.quantity),
+                    'order_id': item.order_id,
+                })
+
+                # Возвращаем товар на склад
+                item.product.stock_quantity += item.quantity
+                item.product.save(update_fields=['stock_quantity'])
+
+            deleted_items.delete()
+
+            logger.info(f"Удалён товар {product_id} из корзины магазина {store.id}")
+
+        # =====================================================================
+        # 2. ИЗМЕНЕНИЕ КОЛИЧЕСТВА
+        # =====================================================================
+        modified_info = []
+
+        for mod in items_to_modify:
+            product_id = mod.get('product_id')
+            new_quantity = mod.get('new_quantity')
+
+            if not product_id or new_quantity is None:
+                continue
+
+            new_quantity = Decimal(str(new_quantity))
+
+            # Находим все позиции с этим товаром
+            items = StoreOrderItem.objects.filter(
+                order__in=orders,
+                product_id=product_id
+            ).select_related('product')
+
+            if not items.exists():
+                continue
+
+            # Считаем текущее общее количество
+            current_total = sum(item.quantity for item in items)
+
+            if new_quantity >= current_total:
+                # Нельзя увеличивать
+                continue
+
+            if new_quantity <= 0:
+                # Удаляем все позиции
+                for item in items:
+                    item.product.stock_quantity += item.quantity
+                    item.product.save(update_fields=['stock_quantity'])
+
+                    removed_info.append({
+                        'product_id': product_id,
+                        'product_name': item.product.name,
+                        'quantity': float(item.quantity),
+                        'order_id': item.order_id,
+                    })
+                items.delete()
+                continue
+
+            # Уменьшаем количество пропорционально или в первом заказе
+            difference = current_total - new_quantity
+            first_item = items.first()
+            product = first_item.product
+
+            if first_item.quantity >= difference:
+                # Достаточно уменьшить первую позицию
+                old_qty = first_item.quantity
+                first_item.quantity -= difference
+                first_item.total = first_item.quantity * first_item.price
+                first_item.save(update_fields=['quantity', 'total'])
+
+                # Возвращаем на склад
+                product.stock_quantity += difference
+                product.save(update_fields=['stock_quantity'])
+
+                modified_info.append({
+                    'product_id': product_id,
+                    'product_name': product.name,
+                    'old_quantity': float(old_qty),
+                    'new_quantity': float(first_item.quantity),
+                    'order_id': first_item.order_id,
+                })
+            else:
+                # Нужно удалить несколько позиций
+                remaining_to_remove = difference
+                for item in items:
+                    if remaining_to_remove <= 0:
+                        break
+
+                    if item.quantity <= remaining_to_remove:
+                        # Удаляем полностью
+                        remaining_to_remove -= item.quantity
+                        product.stock_quantity += item.quantity
+                        product.save(update_fields=['stock_quantity'])
+                        item.delete()
+                    else:
+                        # Уменьшаем частично
+                        old_qty = item.quantity
+                        item.quantity -= remaining_to_remove
+                        item.total = item.quantity * item.price
+                        item.save(update_fields=['quantity', 'total'])
+
+                        product.stock_quantity += remaining_to_remove
+                        product.save(update_fields=['stock_quantity'])
+
+                        modified_info.append({
+                            'product_id': product_id,
+                            'product_name': product.name,
+                            'old_quantity': float(old_qty),
+                            'new_quantity': float(item.quantity),
+                            'order_id': item.order_id,
+                        })
+                        remaining_to_remove = 0
+
+            logger.info(
+                f"Изменено количество товара {product_id} в корзине магазина {store.id}: "
+                f"{current_total} → {new_quantity}"
+            )
+
+        # =====================================================================
+        # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ
+        # =====================================================================
+        for order in orders:
+            order.refresh_from_db()
+            new_total = sum(
+                item.total for item in order.items.all()
+            )
+            order.total_amount = new_total
+            order.save(update_fields=['total_amount'])
+
+        # =====================================================================
+        # 4. РАСЧЁТ ОБЩЕЙ СУММЫ И ДОЛГА
+        # =====================================================================
+        total_amount = sum(order.total_amount for order in orders)
+
+        # Валидация предоплаты
+        if prepayment_amount < 0:
+            raise ValidationError('Предоплата не может быть отрицательной')
+
+        if prepayment_amount > total_amount:
+            raise ValidationError(
+                f'Предоплата ({prepayment_amount} сом) не может превышать '
+                f'сумму заказов ({total_amount} сом)'
+            )
+
+        # Долг = сумма - предоплата
+        total_debt = total_amount - prepayment_amount
+
+        # Распределяем предоплату по заказам пропорционально
+        remaining_prepayment = prepayment_amount
+
+        # =====================================================================
+        # 5. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
+        # =====================================================================
+        confirmed_orders = []
+
+        for order in orders:
+            # Рассчитываем предоплату для этого заказа
+            if total_amount > 0:
+                order_prepayment = (order.total_amount / total_amount) * prepayment_amount
+            else:
+                order_prepayment = Decimal('0')
+
+            order_debt = order.total_amount - order_prepayment
+
+            # Обновляем заказ
+            old_status = order.status
+            order.status = StoreOrderStatus.ACCEPTED
+            order.partner = partner_user
+            order.confirmed_by = partner_user
+            order.confirmed_at = timezone.now()
+            order.prepayment_amount = order_prepayment
+            order.debt_amount = order_debt
+
+            order.save(update_fields=[
+                'status', 'partner', 'confirmed_by', 'confirmed_at',
+                'prepayment_amount', 'debt_amount'
+            ])
+
+            # Переносим товары в инвентарь
+            for item in order.items.all():
+                StoreInventoryService.add_to_inventory(
+                    store=store,
+                    product=item.product,
+                    quantity=item.quantity
+                )
+
+            # История
+            OrderHistory.objects.create(
+                order_type=OrderType.STORE,
+                order_id=order.id,
+                old_status=old_status,
+                new_status=StoreOrderStatus.ACCEPTED,
+                changed_by=partner_user,
+                comment=(
+                    f'Заказ подтверждён партнёром. '
+                    f'Сумма: {order.total_amount} сом. '
+                    f'Предоплата: {order_prepayment} сом. '
+                    f'Долг: {order_debt} сом.'
+                )
+            )
+
+            confirmed_orders.append({
                 'order_id': order.id,
-                'total_amount': order.total_amount,
-                'debt_amount': order.debt_amount,
-                'paid_amount': order.paid_amount,
-                'outstanding_debt': order.outstanding_debt,
-                'created_at': order.created_at
-            }
-            for order in orders
-        ]
+                'total_amount': float(order.total_amount),
+                'prepayment': float(order_prepayment),
+                'debt': float(order_debt),
+            })
 
+            logger.info(
+                f"Заказ #{order.id} подтверждён | Store: {store.id} | "
+                f"Amount: {order.total_amount} | Debt: {order_debt}"
+            )
 
-# =============================================================================
-# DEFECTIVE PRODUCT SERVICE
-# =============================================================================
+        # =====================================================================
+        # 6. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
+        # =====================================================================
+        store = Store.objects.select_for_update().get(pk=store.pk)
+        store.debt += total_debt
+        store.save(update_fields=['debt'])
+
+        logger.info(
+            f"Корзина подтверждена | Store: {store.id} | "
+            f"Orders: {len(confirmed_orders)} | Total Debt: {total_debt}"
+        )
+
+        return {
+            'success': True,
+            'message': f'Корзина подтверждена. Заказов: {len(confirmed_orders)}',
+            'confirmed_orders': confirmed_orders,
+            'totals': {
+                'total_amount': float(total_amount),
+                'prepayment': float(prepayment_amount),
+                'debt_created': float(total_debt),
+            },
+            'store_debt': float(store.debt),
+            'removed_items': removed_info,
+            'modified_items': modified_info,
+        }

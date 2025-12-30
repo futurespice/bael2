@@ -601,3 +601,259 @@ class StoreUnfreezeSerializer(serializers.Serializer):
         if value and len(value.strip()) == 0:
             return ''  # Пустая строка вместо пробелов
         return value.strip() if value else ''
+
+
+# =============================================================================
+# ПАТЧ ДЛЯ stores/serializers.py - ДОБАВИТЬ В КОНЕЦ ФАЙЛА
+# =============================================================================
+#
+# Новые сериализаторы для корзины магазина (basket).
+# Существующие сериализаторы БЕЗ ИЗМЕНЕНИЙ.
+#
+# ДОБАВИТЬ:
+# 1. BasketItemSerializer - товар в корзине
+# 2. BasketTotalsSerializer - итоги корзины
+# 3. BasketSerializer - полная корзина
+# 4. BasketConfirmRequestSerializer - запрос на подтверждение
+# 5. BasketConfirmResponseSerializer - ответ на подтверждение
+# 6. ReportDefectRequestSerializer - запрос на отметку брака
+# =============================================================================
+
+
+# =============================================================================
+# КОРЗИНА МАГАЗИНА (НОВОЕ v2.3)
+# =============================================================================
+
+class BasketItemSerializer(serializers.Serializer):
+    """
+    Сериализатор товара в корзине.
+
+    Корзина = агрегированные товары из IN_TRANSIT заказов.
+    """
+
+    product_id = serializers.IntegerField(help_text='ID товара')
+    product_name = serializers.CharField(help_text='Название товара')
+    product_image = serializers.CharField(
+        allow_null=True,
+        help_text='URL изображения товара'
+    )
+    is_weight_based = serializers.BooleanField(help_text='Весовой товар')
+    is_bonus_product = serializers.BooleanField(help_text='Бонусный товар')
+    unit = serializers.CharField(help_text='Единица измерения')
+    quantity = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        help_text='Количество'
+    )
+    quantity_display = serializers.CharField(help_text='Отображение: "5 кг" или "100 шт"')
+    price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        help_text='Цена за единицу'
+    )
+    total = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        help_text='Сумма = количество × цена'
+    )
+    order_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text='ID заказов, содержащих этот товар'
+    )
+
+
+class BasketTotalsSerializer(serializers.Serializer):
+    """Сериализатор итогов корзины."""
+
+    piece_count = serializers.IntegerField(help_text='Общее количество штучных товаров')
+    weight_total = serializers.CharField(help_text='Общий вес весовых товаров (кг)')
+    total_amount = serializers.CharField(help_text='Общая сумма')
+
+
+class BasketSerializer(serializers.Serializer):
+    """
+    Сериализатор корзины магазина.
+
+    GET /api/stores/stores/{id}/basket/
+    """
+
+    store_id = serializers.IntegerField(help_text='ID магазина')
+    store_name = serializers.CharField(help_text='Название магазина')
+    owner_name = serializers.CharField(help_text='Владелец магазина')
+    store_phone = serializers.CharField(help_text='Телефон магазина')
+    is_empty = serializers.BooleanField(help_text='Корзина пуста')
+    orders_count = serializers.IntegerField(help_text='Количество заказов в корзине')
+    order_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        help_text='ID заказов'
+    )
+    items = BasketItemSerializer(many=True, help_text='Товары в корзине')
+    totals = BasketTotalsSerializer(help_text='Итоги')
+
+
+class BasketConfirmRequestSerializer(serializers.Serializer):
+    """
+    Сериализатор запроса на подтверждение корзины.
+
+    POST /api/stores/stores/{id}/basket/confirm/
+    """
+
+    prepayment_amount = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0'),
+        min_value=Decimal('0'),
+        help_text='Сумма предоплаты'
+    )
+    items_to_remove = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=list,
+        help_text='ID товаров для полного удаления из корзины'
+    )
+    items_to_modify = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list,
+        help_text='Изменение количества: [{"product_id": 1, "new_quantity": 10}]'
+    )
+
+    def validate_items_to_modify(self, value):
+        """Валидация items_to_modify."""
+        validated = []
+
+        for i, item in enumerate(value):
+            product_id = item.get('product_id')
+            new_quantity = item.get('new_quantity')
+
+            if not product_id:
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: не указан product_id'
+                )
+
+            if new_quantity is None:
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: не указан new_quantity'
+                )
+
+            try:
+                new_quantity = Decimal(str(new_quantity))
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: некорректное значение new_quantity'
+                )
+
+            if new_quantity < 0:
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: new_quantity не может быть отрицательным'
+                )
+
+            validated.append({
+                'product_id': int(product_id),
+                'new_quantity': new_quantity,
+            })
+
+        return validated
+
+
+class ConfirmedOrderSerializer(serializers.Serializer):
+    """Сериализатор подтверждённого заказа."""
+
+    order_id = serializers.IntegerField()
+    total_amount = serializers.FloatField()
+    prepayment = serializers.FloatField()
+    debt = serializers.FloatField()
+
+
+class BasketConfirmTotalsSerializer(serializers.Serializer):
+    """Итоги подтверждения корзины."""
+
+    total_amount = serializers.FloatField()
+    prepayment = serializers.FloatField()
+    debt_created = serializers.FloatField()
+
+
+class RemovedItemSerializer(serializers.Serializer):
+    """Удалённый товар."""
+
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    quantity = serializers.FloatField()
+    order_id = serializers.IntegerField()
+
+
+class ModifiedItemSerializer(serializers.Serializer):
+    """Изменённый товар."""
+
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    old_quantity = serializers.FloatField()
+    new_quantity = serializers.FloatField()
+    order_id = serializers.IntegerField()
+
+
+class BasketConfirmResponseSerializer(serializers.Serializer):
+    """
+    Сериализатор ответа на подтверждение корзины.
+    """
+
+    success = serializers.BooleanField()
+    message = serializers.CharField()
+    confirmed_orders = ConfirmedOrderSerializer(many=True)
+    totals = BasketConfirmTotalsSerializer()
+    store_debt = serializers.FloatField()
+    removed_items = RemovedItemSerializer(many=True)
+    modified_items = ModifiedItemSerializer(many=True)
+
+
+# =============================================================================
+# ОТМЕТКА БРАКА (НОВОЕ v2.3)
+# =============================================================================
+
+class ReportDefectRequestSerializer(serializers.Serializer):
+    """
+    Сериализатор запроса на отметку брака.
+
+    POST /api/stores/stores/{id}/inventory/report-defect/
+    """
+
+    product_id = serializers.IntegerField(help_text='ID товара из инвентаря')
+    quantity = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        min_value=Decimal('0.001'),
+        help_text='Количество бракованного товара'
+    )
+    reason = serializers.CharField(
+        max_length=500,
+        help_text='Причина брака'
+    )
+
+    def validate_reason(self, value):
+        """Валидация причины."""
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError('Причина брака обязательна')
+        return value
+
+
+class DefectInfoSerializer(serializers.Serializer):
+    """Информация о созданном браке."""
+
+    id = serializers.IntegerField()
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    quantity = serializers.FloatField()
+    price = serializers.FloatField()
+    total_amount = serializers.FloatField()
+    reason = serializers.CharField()
+
+
+class ReportDefectResponseSerializer(serializers.Serializer):
+    """Сериализатор ответа на отметку брака."""
+
+    success = serializers.BooleanField()
+    message = serializers.CharField()
+    defect = DefectInfoSerializer()
+    store_debt = serializers.FloatField()
