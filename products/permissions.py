@@ -1,68 +1,32 @@
-# apps/products/permissions.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
-"""
-Permissions для products.
-
-КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
-1. Добавлен IsPartner
-2. Добавлен IsPartnerOrAdmin
-"""
+# apps/products/permissions.py
+"""Permissions для products (БЕЗ ИЗМЕНЕНИЙ)."""
 
 from rest_framework import permissions
 
 
 class IsAdmin(permissions.BasePermission):
-    """Только админы."""
+    """Только админ."""
 
     def has_permission(self, request, view):
-        return (
-                request.user and
-                request.user.is_authenticated and
-                request.user.role == 'admin'
-        )
+        return request.user.is_authenticated and request.user.role == 'admin'
 
 
 class IsPartner(permissions.BasePermission):
-    """Только партнёры."""
+    """Только партнёр."""
 
     def has_permission(self, request, view):
-        return (
-                request.user and
-                request.user.is_authenticated and
-                request.user.role == 'partner'
-        )
+        return request.user.is_authenticated and request.user.role == 'partner'
 
 
-class IsPartnerOrAdmin(permissions.BasePermission):
-    """
-    Партнёры или админы.
-    
-    Используется для:
-    - PartnerExpenseViewSet (партнёр создаёт, админ видит всё)
-    """
+class IsStore(permissions.BasePermission):
+    """Только магазин."""
 
     def has_permission(self, request, view):
-        if not request.user or not request.user.is_authenticated:
-            return False
-
-        return request.user.role in ['admin', 'partner']
+        return request.user.is_authenticated and request.user.role == 'store'
 
 
-class IsAdminOrReadOnly(permissions.BasePermission):
-    """
-    Админы: полный доступ
-    Партнёры и магазины: только чтение
-    """
+class IsAdminOrPartner(permissions.BasePermission):
+    """Админ или партнёр."""
 
     def has_permission(self, request, view):
-        if not request.user or not request.user.is_authenticated:
-            return False
-
-        # Админ: полный доступ
-        if request.user.role == 'admin':
-            return True
-
-        # Партнёры и магазины: только чтение
-        if request.user.role in ['partner', 'store']:
-            return request.method in permissions.SAFE_METHODS
-
-        return False
+        return request.user.is_authenticated and request.user.role in ['admin', 'partner']

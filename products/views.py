@@ -1,60 +1,53 @@
-# apps/products/views.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.0
+# apps/products/views.py - ПОЛНАЯ ВЕРСИЯ v3.0
 """
-Views для products.
+Views для products (на основе правильной архитектуры).
 
-КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.0:
-1. Добавлен PartnerExpenseViewSet (расходы партнёра)
-2. Добавлен ProductExpenseRelationViewSet (связь товар-расход)
-3. Добавлен эндпоинт calculate_cost для расчёта себестоимости
-4. Поддержка загрузки изображений при создании товара
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v3.0:
+1. ExpenseViewSet - управление всеми расходами (физические + накладные)
+2. ProductRecipeViewSet - управление рецептами товаров
+3. ProductViewSet.calculate_production - расчёт по двум сценариям
+4. ProductionBatchViewSet - создание партий от количества/Сюзерена
 """
 
-from decimal import Decimal
-from datetime import date
-
-from django.db.models import QuerySet
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from django.db import transaction
 
 from .models import (
-    Expense, 
-    PartnerExpense,
-    Product, 
-    ProductionBatch, 
+    Expense,
+    Product,
+    ProductRecipe,
+    ProductionBatch,
     ProductImage,
-    ProductExpenseRelation
+    ProductExpenseRelation,
+    PartnerExpense,
 )
 from .serializers import (
     ExpenseSerializer,
     ExpenseCreateSerializer,
-    ExpenseSummarySerializer,
-    PartnerExpenseSerializer,
-    PartnerExpenseCreateSerializer,
-    PartnerExpenseListSerializer,
-    PartnerExpenseSummarySerializer,
+    ExpenseListSerializer,
+    ProductRecipeSerializer,
+    ProductRecipeCreateSerializer,
     ProductListSerializer,
     ProductDetailSerializer,
     ProductCreateSerializer,
-    ProductUpdateMarkupSerializer,
     ProductionBatchSerializer,
+    ProductionCalculateSerializer,
     ProductionBatchCreateSerializer,
     ProductImageSerializer,
+    PartnerExpenseCreateSerializer,
+    PartnerExpenseListSerializer,
     ProductExpenseRelationSerializer,
-    ProductExpenseRelationCreateSerializer,
-    CostCalculationRequestSerializer,
-    CostCalculationResultSerializer, ProductAdminListSerializer, ProductAdminDetailSerializer,
-    ProductSetManualPriceSerializer,
 )
+from .permissions import IsAdmin, IsPartner, IsAdminOrPartner
 from .services import (
-    ExpenseService,
-    ProductService,
+    ProductionCalculator,
     ProductionService,
-    ProductImageService,
+    OverheadDistributor,
 )
-from .permissions import IsAdmin, IsAdminOrReadOnly, IsPartner, IsPartnerOrAdmin
 
 
 # =============================================================================
@@ -69,143 +62,104 @@ class StandardPagination(PageNumberPagination):
 
 
 # =============================================================================
-# EXPENSE (PRODUCTION) VIEWSET
+# EXPENSE VIEWSET
 # =============================================================================
 
 class ExpenseViewSet(viewsets.ModelViewSet):
     """
-    Расходы на производство.
+    Управление расходами (физические + накладные).
 
-    - Админ: CRUD
-    - Остальные: только чтение
+    API:
+    - POST /api/products/expenses/ - создать расход
+    - GET /api/products/expenses/ - список расходов
+    - GET /api/products/expenses/{id}/ - детали
+    - PUT /api/products/expenses/{id}/ - обновить
+    - DELETE /api/products/expenses/{id}/ - удалить
+
+    ФИЛЬТРЫ:
+    - ?expense_type=physical|overhead
+    - ?expense_status=suzerain|vassal|civilian
+    - ?is_active=true|false
     """
 
-    permission_classes = [IsAuthenticated, IsAdminOrReadOnly]
-    queryset = Expense.objects.all().order_by('-created_at')
+    permission_classes = [IsAuthenticated, IsAdmin]
+    queryset = Expense.objects.all().order_by('name')
     pagination_class = StandardPagination
 
     def get_serializer_class(self):
         if self.action == 'create':
             return ExpenseCreateSerializer
+        elif self.action == 'list':
+            return ExpenseListSerializer
         return ExpenseSerializer
 
-
-# =============================================================================
-# PARTNER EXPENSE VIEWSET (НОВОЕ v2.0)
-# =============================================================================
-
-class PartnerExpenseViewSet(viewsets.ModelViewSet):
-    """
-    Расходы партнёра (ТЗ v2.0).
-    
-    POST /api/products/partner-expenses/
-    Body: {"amount": 1000, "description": "Бензин"}
-    
-    - Партнёр: создание, просмотр своих
-    - Админ: просмотр всех
-    """
-
-    permission_classes = [IsAuthenticated, IsPartnerOrAdmin]
-    pagination_class = StandardPagination
-
     def get_queryset(self):
-        user = self.request.user
-        
-        if user.role == 'admin':
-            return PartnerExpense.objects.all().select_related('partner')
-        elif user.role == 'partner':
-            return PartnerExpense.objects.filter(partner=user)
-        
-        return PartnerExpense.objects.none()
+        """Фильтрация."""
+        queryset = super().get_queryset()
+
+        # Фильтр по типу
+        expense_type = self.request.query_params.get('expense_type')
+        if expense_type:
+            queryset = queryset.filter(expense_type=expense_type)
+
+        # Фильтр по статусу
+        expense_status = self.request.query_params.get('expense_status')
+        if expense_status:
+            queryset = queryset.filter(expense_status=expense_status)
+
+        # Фильтр по активности
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            is_active_bool = is_active.lower() == 'true'
+            queryset = queryset.filter(is_active=is_active_bool)
+
+        return queryset
+
+
+# =============================================================================
+# PRODUCT RECIPE VIEWSET
+# =============================================================================
+
+class ProductRecipeViewSet(viewsets.ModelViewSet):
+    """
+    Управление рецептами товаров.
+
+    API:
+    - POST /api/products/product-recipes/ - создать рецепт
+    - GET /api/products/product-recipes/ - список
+    - GET /api/products/product-recipes/{id}/ - детали
+    - PUT /api/products/product-recipes/{id}/ - обновить
+    - DELETE /api/products/product-recipes/{id}/ - удалить
+
+    ФИЛЬТРЫ:
+    - ?product_id=1
+    - ?expense_id=2
+    """
+
+    permission_classes = [IsAuthenticated, IsAdmin]
+    queryset = ProductRecipe.objects.all().select_related('product', 'expense')
+    pagination_class = StandardPagination
 
     def get_serializer_class(self):
         if self.action == 'create':
-            return PartnerExpenseCreateSerializer
-        elif self.action == 'list':
-            return PartnerExpenseListSerializer
-        return PartnerExpenseSerializer
+            return ProductRecipeCreateSerializer
+        return ProductRecipeSerializer
 
-    def create(self, request):
-        """
-        Партнёр создаёт расход.
-        
-        POST /api/products/partner-expenses/
-        Body: {"amount": 1000, "description": "Бензин"}
-        """
-        if request.user.role != 'partner':
-            return Response(
-                {'error': 'Только партнёры могут создавать расходы'},
-                status=status.HTTP_403_FORBIDDEN
-            )
+    def get_queryset(self):
+        """Фильтрация."""
+        queryset = super().get_queryset()
 
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        # Фильтр по товару
+        product_id = self.request.query_params.get('product_id')
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
 
-        expense = PartnerExpense.objects.create(
-            partner=request.user,
-            amount=serializer.validated_data['amount'],
-            description=serializer.validated_data['description'],
-            date=serializer.validated_data.get('date', date.today())
-        )
+        # Фильтр по расходу
+        expense_id = self.request.query_params.get('expense_id')
+        if expense_id:
+            queryset = queryset.filter(expense_id=expense_id)
 
-        output = PartnerExpenseSerializer(expense)
-        return Response(output.data, status=status.HTTP_201_CREATED)
-
-    @action(detail=False, methods=['get'])
-    def my_expenses(self, request):
-        """Мои расходы (только для партнёра)."""
-        if request.user.role != 'partner':
-            return Response(
-                {'error': 'Доступно только для партнёров'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        expenses = PartnerExpense.objects.filter(partner=request.user)
-        
-        # Фильтрация по датам
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-        
-        if start_date:
-            expenses = expenses.filter(date__gte=start_date)
-        if end_date:
-            expenses = expenses.filter(date__lte=end_date)
-
-        page = self.paginate_queryset(expenses)
-        if page is not None:
-            serializer = PartnerExpenseListSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = PartnerExpenseListSerializer(expenses, many=True)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['get'])
-    def summary(self, request):
-        """Сводка по расходам партнёров (для админа)."""
-        from django.db.models import Sum, Count
-        
-        queryset = self.get_queryset()
-        
-        # Фильтрация по датам
-        start_date = request.query_params.get('start_date', date.today().replace(day=1))
-        end_date = request.query_params.get('end_date', date.today())
-        
-        queryset = queryset.filter(date__gte=start_date, date__lte=end_date)
-        
-        stats = queryset.aggregate(
-            total_amount=Sum('amount'),
-            expenses_count=Count('id')
-        )
-        
-        data = {
-            'total_amount': stats['total_amount'] or Decimal('0'),
-            'expenses_count': stats['expenses_count'] or 0,
-            'period_start': start_date,
-            'period_end': end_date
-        }
-        
-        serializer = PartnerExpenseSummarySerializer(data)
-        return Response(serializer.data)
+        return queryset
 
 
 # =============================================================================
@@ -214,486 +168,225 @@ class PartnerExpenseViewSet(viewsets.ModelViewSet):
 
 class ProductViewSet(viewsets.ModelViewSet):
     """
-    Товары.
+    Управление товарами.
 
-    - Админ: CRUD
-    - Партнёры/Магазины: только чтение
+    API:
+    - POST /api/products/products/ - создать товар
+    - GET /api/products/products/ - список товаров
+    - GET /api/products/products/{id}/ - детали
+    - PUT /api/products/products/{id}/ - обновить
+    - DELETE /api/products/products/{id}/ - удалить
+
+    НОВЫЕ ЭНДПОИНТЫ v3.0:
+    - POST /api/products/products/{id}/calculate-production/ - расчёт производства
     """
 
-    permission_classes = [IsAuthenticated, IsAdminOrReadOnly]
-    queryset = Product.objects.filter(is_active=True).prefetch_related('images').order_by('name')
+    permission_classes = [IsAuthenticated]
+    queryset = Product.objects.all().prefetch_related('images', 'recipe_items__expense')
     pagination_class = StandardPagination
 
-    def get_queryset(self) -> QuerySet[Product]:
-        """Получение товаров (см. код выше)."""
-        user = self.request.user
-        queryset = Product.objects.prefetch_related('images')
-
-        if user.role == 'admin':
-            return queryset.all()
-
-        return queryset.filter(is_active=True)
-
     def get_serializer_class(self):
-        """Выбор сериализатора в зависимости от роли."""
-        user = self.request.user
-
-        # Для списка товаров
-        if self.action == 'list':
-            if user.role == 'admin':
-                return ProductAdminListSerializer  # Админ видит себестоимость
-            else:
-                return ProductListSerializer  # Партнёр/магазин видят только цену продажи
-
-        # Для детального просмотра товара
-        elif self.action == 'retrieve':
-            if user.role == 'admin':
-                return ProductAdminDetailSerializer  # Админ видит полную информацию
-            else:
-                return ProductDetailSerializer  # Партнёр/магазин видят ограниченную информацию
-
-        # Для создания товара
-        elif self.action == 'create':
+        if self.action == 'create':
             return ProductCreateSerializer
+        elif self.action == 'retrieve':
+            return ProductDetailSerializer
+        return ProductListSerializer
 
-        # Для обновления наценки
-        elif self.action == 'update_markup':
-            return ProductUpdateMarkupSerializer
+    def get_queryset(self):
+        """Фильтрация."""
+        queryset = super().get_queryset()
 
-        # По умолчанию
-        return ProductDetailSerializer
+        # Для не-админов показываем только активные
+        if self.request.user.role != 'admin':
+            queryset = queryset.filter(is_active=True, is_available=True)
 
-    def list(self, request):
-        """
-        Каталог товаров.
+        # Фильтры
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            is_active_bool = is_active.lower() == 'true'
+            queryset = queryset.filter(is_active=is_active_bool)
 
-        ✅ ИСПРАВЛЕНО: Теперь использует get_serializer_class()
-        для выбора правильного сериализатора в зависимости от роли.
-        """
-        # Если магазин - используем специальный метод
-        if request.user.role == 'store':
-            catalog = ProductService.get_catalog_for_stores()
-            return Response(catalog)
+        is_bonus = self.request.query_params.get('is_bonus')
+        if is_bonus is not None:
+            is_bonus_bool = is_bonus.lower() == 'true'
+            queryset = queryset.filter(is_bonus=is_bonus_bool)
 
-        # Получаем queryset
-        queryset = self.get_queryset()
+        # Поиск
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(name__icontains=search)
 
-        # ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Используем get_serializer_class()
-        # Это автоматически вернёт:
-        # - ProductAdminListSerializer для админа
-        # - ProductListSerializer для партнёра
-        serializer_class = self.get_serializer_class()
-
-        # Пагинация
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = serializer_class(
-                page,
-                many=True,
-                context={'request': request}
-            )
-            return self.get_paginated_response(serializer.data)
-
-        # Без пагинации
-        serializer = serializer_class(
-            queryset,
-            many=True,
-            context={'request': request}
-        )
-        return Response(serializer.data)
-
-
-    def retrieve(self, request, pk=None):
-        """Детали товара."""
-        product = self.get_object()
-        for_admin = request.user.role == 'admin'
-        data = ProductService.get_product_details(product.id, for_admin)
-        return Response(data)
+        return queryset
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def set_markup(self, request, pk=None):
+    def calculate_production(self, request, pk=None):
         """
-        Установить наценку (только админ).
+        Рассчитать производство (два сценария).
 
-        POST /api/products/products/{id}/set-markup/
-        {"markup_percentage": "15"}
+        POST /api/products/products/{id}/calculate-production/
+        Body: {
+            "input_type": "quantity",  // или "suzerain"
+            "quantity": 200,           // если input_type=quantity
+            "suzerain_quantity": 2.0   // если input_type=suzerain
+        }
+
+        Ответ:
+        {
+            "quantity_produced": 200,
+            "physical_expenses": [...],
+            "overhead_expenses": [...],
+            "total_physical_cost": 5000.00,
+            "total_overhead_cost": 1000.00,
+            "total_cost": 6000.00,
+            "cost_per_unit": 30.00,
+            "markup_percentage": 20.00,
+            "final_price": 36.00,
+            "profit_per_unit": 6.00
+        }
         """
         product = self.get_object()
-        serializer = ProductUpdateMarkupSerializer(data=request.data)
+
+        serializer = ProductionCalculateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        updated = ProductService.update_markup(
-            product.id,
-            serializer.validated_data['markup_percentage']
-        )
-
-        return Response({
-            'id': updated.id,
-            'markup_percentage': float(updated.markup_percentage),
-            'final_price': float(updated.final_price)
-        })
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def upload_images(self, request, pk=None):
-        """
-        Загрузить изображения (только админ).
-
-        POST /api/products/products/{id}/upload-images/
-        FormData: images=[file1, file2, file3]
-        """
-        product = self.get_object()
-        images = request.FILES.getlist('images')
-
-        if not images:
-            return Response(
-                {'error': 'Нет изображений'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        input_type = serializer.validated_data['input_type']
 
         try:
-            created = ProductImageService.add_images(product.id, images)
-            serializer = ProductImageSerializer(created, many=True)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        except Exception as e:
+            if input_type == 'quantity':
+                quantity = serializer.validated_data['quantity']
+                result = ProductionCalculator.calculate_from_quantity(product, quantity)
+            else:
+                suzerain_quantity = serializer.validated_data['suzerain_quantity']
+                result = ProductionCalculator.calculate_from_suzerain(product, suzerain_quantity)
+
+            # Форматируем ответ
+            return Response({
+                'quantity_produced': float(result.quantity_produced),
+                'physical_expenses': [
+                    {
+                        'expense_id': item.expense_id,
+                        'expense_name': item.expense_name,
+                        'quantity': float(item.quantity),
+                        'unit_price': float(item.unit_price),
+                        'total_cost': float(item.total_cost)
+                    }
+                    for item in result.physical_expenses
+                ],
+                'overhead_expenses': [
+                    {
+                        'expense_name': item.expense_name,
+                        'total_cost': float(item.total_cost)
+                    }
+                    for item in result.overhead_expenses
+                ],
+                'total_physical_cost': float(result.total_physical_cost),
+                'total_overhead_cost': float(result.total_overhead_cost),
+                'total_cost': float(result.total_cost),
+                'cost_per_unit': float(result.cost_per_unit),
+                'markup_percentage': float(result.markup_percentage),
+                'final_price': float(result.final_price),
+                'profit_per_unit': float(result.profit_per_unit)
+            })
+
+        except ValueError as e:
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def calculate_cost(self, request, pk=None):
-        """
-        Рассчитать себестоимость товара (ТЗ v2.0, требование #4).
-
-        POST /api/products/products/{id}/calculate-cost/
-        Body: {"quantity_produced": 1100, "date": "2024-12-05"}
-        
-        Возвращает:
-        - Общие дневные расходы
-        - Месячные расходы (на день)
-        - Себестоимость за единицу
-        - Рекомендуемая цена с наценкой
-        """
-        product = self.get_object()
-        
-        serializer = CostCalculationRequestSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        quantity = serializer.validated_data['quantity_produced']
-        calc_date = serializer.validated_data.get('date', date.today())
-        
-        # Получаем расходы, связанные с товаром
-        related_expenses = ProductExpenseRelation.objects.filter(
-            product=product
-        ).select_related('expense')
-        
-        # Расчёт дневных расходов
-        total_daily = Decimal('0')
-        for relation in related_expenses:
-            expense = relation.expense
-            if expense.is_active:
-                total_daily += expense.daily_amount
-        
-        # Универсальные расходы (применяются ко всем товарам)
-        universal_expenses = Expense.objects.filter(
-            apply_type='universal',
-            is_active=True
-        )
-        for expense in universal_expenses:
-            total_daily += expense.daily_amount
-        
-        # Месячные расходы → дневные (делим на 30)
-        total_monthly = Decimal('0')
-        for relation in related_expenses:
-            expense = relation.expense
-            if expense.is_active:
-                total_monthly += expense.monthly_amount
-        
-        for expense in universal_expenses:
-            total_monthly += expense.monthly_amount
-        
-        monthly_per_day = total_monthly / Decimal('30')
-        
-        # Общие расходы на день
-        total_expenses = total_daily + monthly_per_day
-        
-        # Себестоимость за единицу
-        if quantity > 0:
-            cost_per_unit = (total_expenses / quantity).quantize(Decimal('0.01'))
-        else:
-            cost_per_unit = Decimal('0')
-        
-        # Рекомендуемая цена с наценкой
-        suggested_price = cost_per_unit * (Decimal('1') + product.markup_percentage / Decimal('100'))
-        suggested_price = suggested_price.quantize(Decimal('0.01'))
-        
-        result = {
-            'product_id': product.id,
-            'product_name': product.name,
-            'quantity_produced': quantity,
-            'total_daily_expenses': total_daily,
-            'total_monthly_expenses_per_day': monthly_per_day,
-            'total_expenses': total_expenses,
-            'cost_price_per_unit': cost_per_unit,
-            'suggested_final_price': suggested_price,
-            'current_markup_percentage': product.markup_percentage
-        }
-        
-        output = CostCalculationResultSerializer(result)
-        return Response(output.data)
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def set_manual_price(self, request, pk=None):
-        """
-        Установить ручную цену товара (только админ).
-
-        POST /api/products/products/{id}/set-manual-price/
-        Body: {"manual_price": "100.00"}
-
-        Если manual_price установлена:
-        - Используется вместо автоматического расчёта
-        - final_price = manual_price
-
-        Чтобы вернуться к автоматическому расчёту:
-        - Установите manual_price = null или 0
-
-        ✅ НОВОЕ v2.1
-        """
-        from decimal import Decimal
-        from rest_framework import status
-
-        product = self.get_object()
-
-        # Валидация входных данных
-        serializer = ProductSetManualPriceSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        manual_price = serializer.validated_data.get('manual_price')
-
-        # Обновляем товар
-        old_price = product.final_price
-        old_manual = product.manual_price
-
-        if manual_price is None or manual_price == 0:
-            # Сброс ручной цены - возврат к автоматическому расчёту
-            product.manual_price = None
-            product.save()
-
-            return Response({
-                'success': True,
-                'message': 'Ручная цена сброшена. Цена рассчитывается автоматически.',
-                'product_id': product.id,
-                'old_manual_price': float(old_manual) if old_manual else None,
-                'new_manual_price': None,
-                'old_final_price': float(old_price),
-                'new_final_price': float(product.final_price),
-                'calculation_mode': 'automatic',
-                'average_cost_price': float(product.average_cost_price),
-                'markup_percentage': float(product.markup_percentage),
-            })
-        else:
-            # Установка ручной цены
-            product.manual_price = manual_price
-            product.save()
-
-            return Response({
-                'success': True,
-                'message': f'Ручная цена установлена: {product.final_price} сом',
-                'product_id': product.id,
-                'old_manual_price': float(old_manual) if old_manual else None,
-                'new_manual_price': float(product.manual_price),
-                'old_final_price': float(old_price),
-                'new_final_price': float(product.final_price),
-                'calculation_mode': 'manual',
-            })
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def clear_manual_price(self, request, pk=None):
-        """
-        Сбросить ручную цену и вернуться к автоматическому расчёту.
-
-        POST /api/products/products/{id}/clear-manual-price/
-
-        Эквивалентно: set_manual_price с manual_price = null
-
-        ✅ НОВОЕ v2.1
-        """
-        product = self.get_object()
-
-        old_price = product.final_price
-        old_manual = product.manual_price
-
-        if product.manual_price is None:
-            return Response({
-                'success': True,
-                'message': 'Ручная цена уже не установлена',
-                'product_id': product.id,
-                'final_price': float(product.final_price),
-                'calculation_mode': 'automatic',
-            })
-
-        product.manual_price = None
-        product.save()
-
-        return Response({
-            'success': True,
-            'message': 'Ручная цена сброшена. Цена рассчитывается автоматически.',
-            'product_id': product.id,
-            'old_manual_price': float(old_manual) if old_manual else None,
-            'old_final_price': float(old_price),
-            'new_final_price': float(product.final_price),
-            'calculation_mode': 'automatic',
-            'average_cost_price': float(product.average_cost_price),
-            'markup_percentage': float(product.markup_percentage),
-        })
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def add_expenses(self, request, pk=None):
-        """
-        Добавить расходы к товару.
-
-        POST /api/products/products/{id}/add-expenses/
-        Body: {
-            "expense_ids": [1, 2, 3],
-            "proportions": {"1": 0.5, "2": 0.3}  // опционально
-        }
-
-        ✅ НОВОЕ v2.1
-        """
-        from .models import ProductExpenseRelation, Expense
-        from decimal import Decimal
-
-        product = self.get_object()
-
-        expense_ids = request.data.get('expense_ids', [])
-        proportions = request.data.get('proportions', {})
-
-        if not expense_ids:
-            return Response(
-                {'error': 'Укажите expense_ids'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Валидация расходов
-        existing_expenses = Expense.objects.filter(
-            id__in=expense_ids,
-            is_active=True
-        )
-        existing_ids = set(existing_expenses.values_list('id', flat=True))
-
-        invalid_ids = set(expense_ids) - existing_ids
-        if invalid_ids:
-            return Response(
-                {'error': f'Расходы не найдены: {list(invalid_ids)}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Добавляем связи
-        created_relations = []
-        skipped_relations = []
-
-        for expense_id in expense_ids:
-            proportion = proportions.get(str(expense_id))
-            if proportion:
-                try:
-                    proportion = Decimal(str(proportion))
-                except (ValueError, TypeError):
-                    proportion = None
-
-            relation, created = ProductExpenseRelation.objects.get_or_create(
-                product=product,
-                expense_id=expense_id,
-                defaults={'proportion': proportion}
-            )
-
-            if created:
-                created_relations.append({
-                    'expense_id': expense_id,
-                    'expense_name': relation.expense.name,
-                    'proportion': float(proportion) if proportion else None
-                })
-            else:
-                skipped_relations.append({
-                    'expense_id': expense_id,
-                    'expense_name': relation.expense.name,
-                    'reason': 'already_exists'
-                })
-
-        return Response({
-            'success': True,
-            'product_id': product.id,
-            'created': created_relations,
-            'skipped': skipped_relations,
-            'total_expenses': product.expense_relations.count()
-        })
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
-    def remove_expenses(self, request, pk=None):
-        """
-        Удалить расходы из товара.
-
-        POST /api/products/products/{id}/remove-expenses/
-        Body: {"expense_ids": [1, 2, 3]}
-
-        ✅ НОВОЕ v2.1
-        """
-        from .models import ProductExpenseRelation
-
-        product = self.get_object()
-
-        expense_ids = request.data.get('expense_ids', [])
-
-        if not expense_ids:
-            return Response(
-                {'error': 'Укажите expense_ids'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        deleted_count, _ = ProductExpenseRelation.objects.filter(
-            product=product,
-            expense_id__in=expense_ids
-        ).delete()
-
-        return Response({
-            'success': True,
-            'product_id': product.id,
-            'deleted_count': deleted_count,
-            'remaining_expenses': product.expense_relations.count()
-        })
-
 
 # =============================================================================
-# PRODUCTION VIEWSET
+# PRODUCTION BATCH VIEWSET
 # =============================================================================
 
 class ProductionBatchViewSet(viewsets.ModelViewSet):
     """
     Производственные партии.
 
-    - Только админ
+    API:
+    - POST /api/products/production-batches/ - создать партию
+    - GET /api/products/production-batches/ - список партий
+    - GET /api/products/production-batches/{id}/ - детали
+
+    ФИЛЬТРЫ:
+    - ?product_id=1
+    - ?date_from=2026-01-01
+    - ?date_to=2026-01-31
     """
 
     permission_classes = [IsAuthenticated, IsAdmin]
-    queryset = ProductionBatch.objects.all().select_related('product').order_by('-date')
+    queryset = ProductionBatch.objects.all().select_related('product').order_by('-date', '-created_at')
+    serializer_class = ProductionBatchSerializer
     pagination_class = StandardPagination
 
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return ProductionBatchCreateSerializer
-        return ProductionBatchSerializer
+    def get_queryset(self):
+        """Фильтрация."""
+        queryset = super().get_queryset()
 
+        # Фильтр по товару
+        product_id = self.request.query_params.get('product_id')
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+
+        # Фильтр по дате (от)
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(date__gte=date_from)
+
+        # Фильтр по дате (до)
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(date__lte=date_to)
+
+        return queryset
+
+    @transaction.atomic
     def create(self, request):
-        """Создать производственную запись."""
-        serializer = self.get_serializer(data=request.data)
+        """
+        Создать производственную партию.
+
+        POST /api/products/production-batches/
+        Body: {
+            "product_id": 1,
+            "input_type": "quantity",  // или "suzerain"
+            "quantity": 200,           // если input_type=quantity
+            "suzerain_quantity": 2.0,  // если input_type=suzerain
+            "date": "2026-01-02",
+            "notes": "Производство"
+        }
+        """
+        # Извлекаем product_id
+        product_id = request.data.get('product_id')
+        if not product_id:
+            return Response(
+                {'error': 'Укажите product_id'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ProductionBatchCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        input_type = serializer.validated_data['input_type']
+        date_val = serializer.validated_data['date']
+        notes = serializer.validated_data.get('notes', '')
+
         try:
-            batch = ProductionService.record_production(
-                product_id=serializer.validated_data['product_id'],
-                date=serializer.validated_data['date'],
-                quantity=serializer.validated_data['quantity_produced'],
-                notes=serializer.validated_data.get('notes', '')
-            )
+            if input_type == 'quantity':
+                quantity = serializer.validated_data['quantity']
+                batch = ProductionService.create_batch_from_quantity(
+                    product_id=product_id,
+                    quantity=quantity,
+                    date=date_val,
+                    notes=notes
+                )
+            else:
+                suzerain_quantity = serializer.validated_data['suzerain_quantity']
+                batch = ProductionService.create_batch_from_suzerain(
+                    product_id=product_id,
+                    suzerain_quantity=suzerain_quantity,
+                    date=date_val,
+                    notes=notes
+                )
 
             output = ProductionBatchSerializer(batch)
             return Response(output.data, status=status.HTTP_201_CREATED)
@@ -760,88 +453,77 @@ class ProductImageViewSet(viewsets.ModelViewSet):
 
 
 # =============================================================================
-# PRODUCT EXPENSE RELATION VIEWSET (НОВОЕ v2.0)
+# PARTNER EXPENSE VIEWSET
 # =============================================================================
 
-class ProductExpenseRelationViewSet(viewsets.ModelViewSet):
+class PartnerExpenseViewSet(viewsets.ModelViewSet):
     """
-    Связь товар-расход (ТЗ v2.0, требование #12).
-    
-    POST /api/products/product-expense-relations/
-    Body: {"product": 1, "expense": 2, "proportion": 0.5}
-    
-    - Только админ
+    Расходы партнёров.
+
+    - Только партнёр может создавать свои расходы
+    - Админ может видеть все расходы партнёров
     """
 
-    permission_classes = [IsAuthenticated, IsAdmin]
-    queryset = ProductExpenseRelation.objects.all().select_related('product', 'expense')
+    permission_classes = [IsAuthenticated, IsAdminOrPartner]
     pagination_class = StandardPagination
 
     def get_serializer_class(self):
         if self.action == 'create':
-            return ProductExpenseRelationCreateSerializer
-        return ProductExpenseRelationSerializer
+            return PartnerExpenseCreateSerializer
+        return PartnerExpenseListSerializer
 
-    def list(self, request):
-        """Список связей."""
-        product_id = request.query_params.get('product_id')
-        expense_id = request.query_params.get('expense_id')
+    def get_queryset(self):
+        """Фильтрация."""
+        if self.request.user.role == 'admin':
+            # Админ видит все расходы
+            queryset = PartnerExpense.objects.all().select_related('partner')
+        else:
+            # Партнёр видит только свои
+            queryset = PartnerExpense.objects.filter(partner=self.request.user)
 
-        queryset = self.get_queryset()
+        # Фильтр по дате
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(date__gte=date_from)
 
-        if product_id:
-            queryset = queryset.filter(product_id=product_id)
-        if expense_id:
-            queryset = queryset.filter(expense_id=expense_id)
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(date__lte=date_to)
 
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = ProductExpenseRelationSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+        return queryset.order_by('-date')
 
-        serializer = ProductExpenseRelationSerializer(queryset, many=True)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['get'])
-    def by_product(self, request):
-        """
-        Получить все расходы для товара.
-        
-        GET /api/products/product-expense-relations/by-product/?product_id=1
-        """
-        product_id = request.query_params.get('product_id')
-        
-        if not product_id:
+    def create(self, request):
+        """Создать расход партнёра."""
+        # Только партнёр может создавать свои расходы
+        if request.user.role != 'partner':
             return Response(
-                {'error': 'product_id обязателен'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'Только партнёры могут создавать расходы'},
+                status=status.HTTP_403_FORBIDDEN
             )
 
-        relations = ProductExpenseRelation.objects.filter(
-            product_id=product_id
-        ).select_related('expense')
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-        serializer = ProductExpenseRelationSerializer(relations, many=True)
-        return Response(serializer.data)
+        expense = PartnerExpense.objects.create(
+            partner=request.user,
+            **serializer.validated_data
+        )
 
-    @action(detail=False, methods=['get'])
-    def by_expense(self, request):
-        """
-        Получить все товары для расхода.
-        
-        GET /api/products/product-expense-relations/by-expense/?expense_id=1
-        """
-        expense_id = request.query_params.get('expense_id')
-        
-        if not expense_id:
-            return Response(
-                {'error': 'expense_id обязателен'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        output = PartnerExpenseListSerializer(expense)
+        return Response(output.data, status=status.HTTP_201_CREATED)
 
-        relations = ProductExpenseRelation.objects.filter(
-            expense_id=expense_id
-        ).select_related('product')
 
-        serializer = ProductExpenseRelationSerializer(relations, many=True)
-        return Response(serializer.data)
+# =============================================================================
+# ОБРАТНАЯ СОВМЕСТИМОСТЬ
+# =============================================================================
+
+class ProductExpenseRelationViewSet(viewsets.ModelViewSet):
+    """
+    УСТАРЕЛО! Для обратной совместимости.
+    Используйте ProductRecipeViewSet вместо этого.
+    """
+
+    permission_classes = [IsAuthenticated, IsAdmin]
+    queryset = ProductExpenseRelation.objects.all().select_related('product', 'expense')
+    serializer_class = ProductExpenseRelationSerializer
+    pagination_class = StandardPagination

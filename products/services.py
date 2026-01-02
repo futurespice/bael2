@@ -1,586 +1,618 @@
-# apps/products/services.py
-"""Сервисы для products."""
+# apps/products/services.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v3.0
+"""
+Сервисы для расчёта производства и умной наценки.
+
+КРИТИЧЕСКИЕ КОМПОНЕНТЫ v3.0:
+1. ProductionCalculator - расчёт по двум сценариям (количество/Сюзерен)
+2. OverheadDistributor - умная наценка (перераспределение по объёму)
+3. ExpenseService - работа с иерархией расходов (Сюзерен/Вассал/Обыватель)
+"""
 
 from decimal import Decimal
 from datetime import date
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 from django.db import transaction
-from django.db.models import Sum, Avg, Q
+from django.db.models import Sum, Q
 
 from .models import (
     Expense,
     Product,
+    ProductRecipe,
     ProductionBatch,
-    ProductImage,
-    ProductExpenseRelation,
+    ExpenseType,
     ExpenseStatus,
-    ExpenseState
+    ExpenseState,
+    ApplyType,
 )
-from dataclasses import dataclass
+
+
+# =============================================================================
+# DATACLASSES ДЛЯ РЕЗУЛЬТАТОВ
+# =============================================================================
+
+@dataclass
+class ExpenseItem:
+    """Детализация одного расхода."""
+    expense_id: int
+    expense_name: str
+    expense_type: str  # physical/overhead
+    quantity: Decimal  # для физических
+    unit_price: Decimal  # для физических
+    total_cost: Decimal
 
 
 @dataclass
-class ExpenseCalculationResult:
-    """Результат расчёта расходов с иерархией."""
+class ProductionCalculationResult:
+    """
+    Результат расчёта производства.
 
-    # Расходы по категориям
-    suzerains_total: Decimal  # Все Сюзерены (с их Вассалами)
-    civilians_total: Decimal  # Все Обыватели
-    total_expenses: Decimal  # Общая сумма
-
-    # Детализация
-    daily_expenses: Decimal  # Дневные расходы
-    monthly_expenses: Decimal  # Месячные расходы
-    monthly_per_day: Decimal  # Месячные / 30
-
-    # Breakdown по группам
-    breakdown: Dict[str, List[Dict]]  # Детальная информация
-
-
-@dataclass
-class ProductCostData:
-    """Данные для расчёта себестоимости товара."""
-
+    ИСПОЛЬЗУЕТСЯ для ОБОИХ сценариев:
+    - calculate_from_quantity()
+    - calculate_from_suzerain()
+    """
     product: Product
-    quantity_produced: Decimal  # Количество произведённого товара
+    quantity_produced: Decimal
 
     # Расходы
-    total_expenses: Decimal
-    daily_expenses: Decimal
-    monthly_expenses_per_day: Decimal
+    physical_expenses: List[ExpenseItem]
+    overhead_expenses: List[ExpenseItem]
 
-    # Результаты
-    cost_per_unit: Decimal  # Себестоимость за единицу
-    markup_percentage: Decimal  # Наценка %
-    final_price: Decimal  # Цена продажи
+    # Суммы
+    total_physical_cost: Decimal
+    total_overhead_cost: Decimal
+    total_cost: Decimal
+    cost_per_unit: Decimal
+
+    # Прибыль
+    markup_percentage: Decimal
+    final_price: Decimal
     profit_per_unit: Decimal
 
 
-class ExpenseService:
+@dataclass
+class OverheadDistribution:
+    """Результат распределения накладных расходов."""
+    product_id: int
+    product_name: str
+    volume_produced: Decimal
+    volume_share: Decimal  # доля от общего объёма (0-1)
+    overhead_share: Decimal  # сумма накладных расходов
+
+
+# =============================================================================
+# PRODUCTION CALCULATOR (ТЗ 4.1.3)
+# =============================================================================
+
+class ProductionCalculator:
     """
-    Сервис для работы с расходами с учётом иерархии.
+    Калькулятор производства с двумя сценариями (ТЗ 4.1.3).
 
-    КРИТИЧЕСКИЕ МЕТОДЫ:
-    - calculate_total_expenses_with_hierarchy() - расчёт с Сюзеренами/Вассалами
-    - recalculate_vassals() - пересчёт всех Вассалов
-    - get_expense_breakdown() - детальная разбивка
+    СЦЕНАРИЙ 1: Ввод количества товара
+        calculate_from_quantity(product, 200) → расходы
+
+    СЦЕНАРИЙ 2: Ввод объёма Сюзерена
+        calculate_from_suzerain(product, Фарш, 2кг) → количество + расходы
     """
 
     @classmethod
-    def calculate_total_expenses_with_hierarchy(
-            cls,
-            date: Optional['date'] = None,
-            expense_type: Optional[str] = None,
-    ) -> ExpenseCalculationResult:
-        """
-        Рассчитать общие расходы с учётом иерархии Сюзерен → Вассал.
-
-        АЛГОРИТМ:
-        1. Собрать всех Сюзеренов
-        2. Для каждого Сюзерена рассчитать его расходы + расходы его Вассалов
-        3. Собрать всех Обывателей
-        4. Суммировать всё
-
-        Args:
-            date: Дата для фильтрации (опционально)
-            expense_type: Тип расхода (physical/overhead, опционально)
-
-        Returns:
-            ExpenseCalculationResult с детализацией
-        """
-        # Фильтр активных расходов
-        expenses_qs = Expense.objects.filter(is_active=True)
-
-        if expense_type:
-            expenses_qs = expenses_qs.filter(expense_type=expense_type)
-
-        # =====================================================================
-        # 1. СЮЗЕРЕНЫ (с их Вассалами)
-        # =====================================================================
-        suzerains = expenses_qs.filter(expense_status=ExpenseStatus.SUZERAIN)
-
-        suzerains_total = Decimal('0')
-        suzerains_breakdown = []
-
-        for suzerain in suzerains:
-            # Расходы самого Сюзерена
-            suzerain_amount = suzerain.calculate_amount()
-
-            # Расходы его Вассалов
-            vassals_total = Decimal('0')
-            vassals_list = []
-
-            for vassal in suzerain.vassals.filter(is_active=True):
-                vassal_amount = vassal.calculate_amount()
-                vassals_total += vassal_amount
-
-                vassals_list.append({
-                    'id': vassal.id,
-                    'name': vassal.name,
-                    'quantity': float(vassal.calculate_vassal_quantity()),
-                    'unit_cost': float(vassal.unit_cost),
-                    'amount': float(vassal_amount),
-                    'dependency_ratio': float(vassal.dependency_ratio or 0),
-                })
-
-            # Общая сумма группы
-            group_total = suzerain_amount + vassals_total
-            suzerains_total += group_total
-
-            suzerains_breakdown.append({
-                'id': suzerain.id,
-                'name': suzerain.name,
-                'quantity': float(suzerain.quantity),
-                'unit_cost': float(suzerain.unit_cost),
-                'suzerain_amount': float(suzerain_amount),
-                'vassals': vassals_list,
-                'vassals_total': float(vassals_total),
-                'group_total': float(group_total),
-            })
-
-        # =====================================================================
-        # 2. ОБЫВАТЕЛИ (независимые расходы)
-        # =====================================================================
-        civilians = expenses_qs.filter(expense_status=ExpenseStatus.CIVILIAN)
-
-        civilians_total = Decimal('0')
-        civilians_breakdown = []
-
-        for civilian in civilians:
-            amount = civilian.calculate_amount()
-            civilians_total += amount
-
-            civilians_breakdown.append({
-                'id': civilian.id,
-                'name': civilian.name,
-                'expense_type': civilian.get_expense_type_display(),
-                'daily_amount': float(civilian.daily_amount),
-                'monthly_amount': float(civilian.monthly_amount),
-                'amount': float(amount),
-            })
-
-        # =====================================================================
-        # 3. ОБЩИЕ СУММЫ
-        # =====================================================================
-        total_expenses = suzerains_total + civilians_total
-
-        # Разделение на дневные и месячные
-        daily_expenses = Decimal('0')
-        monthly_expenses = Decimal('0')
-
-        for expense in expenses_qs:
-            # Для Вассалов используем рассчитанную сумму
-            if expense.expense_status == ExpenseStatus.VASSAL:
-                # Вассалы уже учтены в Сюзеренах, пропускаем
-                continue
-
-            daily_expenses += expense.daily_amount
-            monthly_expenses += expense.monthly_amount
-
-        # Месячные расходы в пересчёте на день
-        monthly_per_day = (monthly_expenses / 30).quantize(Decimal('0.01'))
-
-        # Результат
-        return ExpenseCalculationResult(
-            suzerains_total=suzerains_total,
-            civilians_total=civilians_total,
-            total_expenses=total_expenses,
-            daily_expenses=daily_expenses,
-            monthly_expenses=monthly_expenses,
-            monthly_per_day=monthly_per_day,
-            breakdown={
-                'suzerains': suzerains_breakdown,
-                'civilians': civilians_breakdown,
-            }
-        )
-
-    @classmethod
-    @transaction.atomic
-    def recalculate_vassals(cls, suzerain: Expense) -> int:
-        """
-        Пересчитать всех Вассалов, зависящих от Сюзерена.
-
-        Используется когда:
-        - Изменилось количество у Сюзерена
-        - Нужно вручную обновить зависимости
-
-        Args:
-            suzerain: Расход со статусом SUZERAIN
-
-        Returns:
-            int: Количество пересчитанных Вассалов
-        """
-        if suzerain.expense_status != ExpenseStatus.SUZERAIN:
-            return 0
-
-        count = 0
-
-        for vassal in suzerain.vassals.filter(
-                is_active=True,
-                expense_state=ExpenseState.AUTOMATIC
-        ):
-            # Пересчитываем количество
-            vassal.quantity = vassal.calculate_vassal_quantity()
-            vassal.save(update_fields=['quantity'])
-            count += 1
-
-        return count
-
-    @classmethod
-    def get_expense_breakdown(
-            cls,
-            expense_type: Optional[str] = None
-    ) -> Dict[str, any]:
-        """
-        Получить детальную разбивку расходов.
-
-        Возвращает:
-        - Группировку по Сюзеренам
-        - Обывателей отдельно
-        - Общие суммы
-
-        Args:
-            expense_type: Тип расхода (опционально)
-
-        Returns:
-            Dict с детальной информацией
-        """
-        result = cls.calculate_total_expenses_with_hierarchy(
-            expense_type=expense_type
-        )
-
-        return {
-            'summary': {
-                'suzerains_total': float(result.suzerains_total),
-                'civilians_total': float(result.civilians_total),
-                'total_expenses': float(result.total_expenses),
-                'daily_expenses': float(result.daily_expenses),
-                'monthly_expenses': float(result.monthly_expenses),
-                'monthly_per_day': float(result.monthly_per_day),
-            },
-            'breakdown': result.breakdown,
-        }
-
-    @classmethod
-    def calculate_product_cost(
+    def calculate_from_quantity(
             cls,
             product: Product,
-            quantity_produced: Decimal,
-    ) -> ProductCostData:
+            quantity: Decimal
+    ) -> ProductionCalculationResult:
         """
-        Рассчитать себестоимость товара с учётом расходов.
+        Сценарий 1: Ввод количества товара (ТЗ 4.1.3).
 
-        ФОРМУЛА:
-        1. Собрать все расходы (с иерархией)
-        2. Поделить на количество произведённого товара
-        3. Применить наценку
+        ПРИМЕР: 200 пельменей
+        1. Находим Сюзерена (Фарш): 200 × 0.01 = 2 кг
+        2. Вычисляем пропорции: Лук (50%), Тесто (100%)
+        3. Рассчитываем стоимость каждого расхода
+        4. Распределяем накладные по объёму производства
 
         Args:
             product: Товар
-            quantity_produced: Количество произведённого товара
+            quantity: Количество товара
 
         Returns:
-            ProductCostData с детальным расчётом
+            ProductionCalculationResult
         """
-        # Получаем расходы с иерархией
-        expenses_result = cls.calculate_total_expenses_with_hierarchy()
+        # Получаем рецепт товара
+        recipe_items = ProductRecipe.objects.filter(
+            product=product
+        ).select_related('expense')
 
-        # Расчёт себестоимости за единицу
-        if quantity_produced > 0:
-            cost_per_unit = (
-                    expenses_result.total_expenses / quantity_produced
-            ).quantize(Decimal('0.01'))
-        else:
-            cost_per_unit = Decimal('0')
+        if not recipe_items.exists():
+            raise ValueError(f'У товара {product.name} нет рецепта')
 
-        # Применяем наценку
-        markup_percentage = product.markup_percentage or Decimal('0')
+        # Находим Сюзерена
+        suzerain_item = recipe_items.filter(
+            expense__expense_status=ExpenseStatus.SUZERAIN
+        ).first()
+
+        if not suzerain_item:
+            raise ValueError(f'У товара {product.name} нет Сюзерена')
+
+        # Рассчитываем объём Сюзерена
+        suzerain_quantity = quantity * suzerain_item.quantity_per_unit
+
+        # Теперь вызываем общий метод расчёта
+        return cls._calculate_expenses(
+            product=product,
+            quantity=quantity,
+            suzerain_item=suzerain_item,
+            suzerain_quantity=suzerain_quantity
+        )
+
+    @classmethod
+    def calculate_from_suzerain(
+            cls,
+            product: Product,
+            suzerain_quantity: Decimal
+    ) -> ProductionCalculationResult:
+        """
+        Сценарий 2: Ввод объёма Сюзерена (ТЗ 4.1.3).
+
+        ПРИМЕР: 2 кг фарша
+        1. Находим Сюзерена (Фарш)
+        2. Вычисляем количество: 2 / 0.01 = 200 пельменей
+        3. Далее аналогично сценарию 1
+
+        Args:
+            product: Товар
+            suzerain_quantity: Количество Сюзерена (кг/шт)
+
+        Returns:
+            ProductionCalculationResult
+        """
+        # Получаем рецепт
+        recipe_items = ProductRecipe.objects.filter(
+            product=product
+        ).select_related('expense')
+
+        # Находим Сюзерена
+        suzerain_item = recipe_items.filter(
+            expense__expense_status=ExpenseStatus.SUZERAIN
+        ).first()
+
+        if not suzerain_item:
+            raise ValueError(f'У товара {product.name} нет Сюзерена')
+
+        # Вычисляем количество товара
+        quantity = suzerain_quantity / suzerain_item.quantity_per_unit
+
+        # Вызываем общий метод
+        return cls._calculate_expenses(
+            product=product,
+            quantity=quantity,
+            suzerain_item=suzerain_item,
+            suzerain_quantity=suzerain_quantity
+        )
+
+    @classmethod
+    def _calculate_expenses(
+            cls,
+            product: Product,
+            quantity: Decimal,
+            suzerain_item: ProductRecipe,
+            suzerain_quantity: Decimal
+    ) -> ProductionCalculationResult:
+        """
+        Общий метод расчёта расходов.
+
+        1. Физические расходы (с пропорциями)
+        2. Накладные расходы (распределение по объёму)
+        3. Универсальные расходы
+        """
+        physical_expenses = []
+        overhead_expenses = []
+
+        # =====================================================================
+        # 1. ФИЗИЧЕСКИЕ РАСХОДЫ
+        # =====================================================================
+
+        # Сюзерен
+        suzerain_cost = (
+                suzerain_quantity * (suzerain_item.expense.price_per_unit or Decimal('0'))
+        ).quantize(Decimal('0.01'))
+
+        physical_expenses.append(ExpenseItem(
+            expense_id=suzerain_item.expense.id,
+            expense_name=suzerain_item.expense.name,
+            expense_type='physical',
+            quantity=suzerain_quantity,
+            unit_price=suzerain_item.expense.price_per_unit or Decimal('0'),
+            total_cost=suzerain_cost
+        ))
+
+        # Остальные физические (пропорции от Сюзерена)
+        recipe_items = ProductRecipe.objects.filter(
+            product=product,
+            expense__expense_type=ExpenseType.PHYSICAL
+        ).exclude(
+            expense__expense_status=ExpenseStatus.SUZERAIN
+        ).select_related('expense')
+
+        for item in recipe_items:
+            if item.proportion:
+                # Количество = Сюзерен × пропорция
+                item_quantity = suzerain_quantity * item.proportion
+                item_cost = (
+                        item_quantity * (item.expense.price_per_unit or Decimal('0'))
+                ).quantize(Decimal('0.01'))
+
+                physical_expenses.append(ExpenseItem(
+                    expense_id=item.expense.id,
+                    expense_name=item.expense.name,
+                    expense_type='physical',
+                    quantity=item_quantity,
+                    unit_price=item.expense.price_per_unit or Decimal('0'),
+                    total_cost=item_cost
+                ))
+
+        total_physical = sum(item.total_cost for item in physical_expenses)
+
+        # =====================================================================
+        # 2. НАКЛАДНЫЕ РАСХОДЫ (умная наценка)
+        # =====================================================================
+
+        # Получаем долю накладных для этого товара
+        overhead_share = OverheadDistributor.get_overhead_for_product(
+            product=product,
+            quantity_produced=quantity
+        )
+
+        # Добавляем в список (без детализации по каждому расходу)
+        overhead_expenses.append(ExpenseItem(
+            expense_id=0,
+            expense_name='Накладные расходы (общие)',
+            expense_type='overhead',
+            quantity=Decimal('0'),
+            unit_price=Decimal('0'),
+            total_cost=overhead_share
+        ))
+
+        total_overhead = overhead_share
+
+        # =====================================================================
+        # 3. ИТОГО
+        # =====================================================================
+
+        total_cost = total_physical + total_overhead
+        cost_per_unit = (total_cost / quantity).quantize(Decimal('0.01')) if quantity > 0 else Decimal('0')
+
+        # Прибыль
+        markup_percentage = product.markup_percentage
         markup_multiplier = Decimal('1') + (markup_percentage / 100)
         final_price = (cost_per_unit * markup_multiplier).quantize(Decimal('0.01'))
-
-        # Прибыль с единицы
         profit_per_unit = final_price - cost_per_unit
 
-        return ProductCostData(
+        return ProductionCalculationResult(
             product=product,
-            quantity_produced=quantity_produced,
-            total_expenses=expenses_result.total_expenses,
-            daily_expenses=expenses_result.daily_expenses,
-            monthly_expenses_per_day=expenses_result.monthly_per_day,
+            quantity_produced=quantity,
+            physical_expenses=physical_expenses,
+            overhead_expenses=overhead_expenses,
+            total_physical_cost=total_physical,
+            total_overhead_cost=total_overhead,
+            total_cost=total_cost,
             cost_per_unit=cost_per_unit,
             markup_percentage=markup_percentage,
             final_price=final_price,
-            profit_per_unit=profit_per_unit,
+            profit_per_unit=profit_per_unit
         )
 
 
+# =============================================================================
+# OVERHEAD DISTRIBUTOR (ТЗ 4.1.4 - Умная наценка)
+# =============================================================================
+
+class OverheadDistributor:
+    """
+    Распределитель накладных расходов по объёму производства (ТЗ 4.1.4).
+
+    ПРИМЕР:
+    Пельмени зелёные: 1000 шт/день (популярные)
+    Пельмени красные: 100 шт/день (непопулярные)
+    Аренда: 10,000 сом/день
+
+    Распределение НЕ ПОРОВНУ (5000/5000), а по объёму:
+    - Зелёные: 90.9% = 9,090 сом
+    - Красные: 9.1% = 910 сом
+    """
+
+    @classmethod
+    def get_overhead_for_product(
+            cls,
+            product: Product,
+            quantity_produced: Decimal,
+            date_filter: Optional[date] = None
+    ) -> Decimal:
+        """
+        Получить долю накладных расходов для товара.
+
+        Args:
+            product: Товар
+            quantity_produced: Количество производства
+            date_filter: Дата (опционально)
+
+        Returns:
+            Сумма накладных расходов
+        """
+        # Получаем все накладные расходы
+        overhead_expenses = Expense.objects.filter(
+            expense_type=ExpenseType.OVERHEAD,
+            is_active=True
+        )
+
+        if not overhead_expenses.exists():
+            return Decimal('0')
+
+        # Считаем общую сумму накладных
+        total_overhead = Decimal('0')
+        for expense in overhead_expenses:
+            total_overhead += expense.calculate_amount()
+
+        # Получаем объёмы производства всех товаров
+        all_products_volumes = cls._get_all_products_volumes(date_filter)
+
+        # Вычисляем долю текущего товара
+        total_volume = sum(v['volume'] for v in all_products_volumes)
+
+        if total_volume == 0:
+            # Если нет данных о производстве, делим поровну
+            active_products_count = Product.objects.filter(is_active=True).count()
+            if active_products_count > 0:
+                return (total_overhead / active_products_count).quantize(Decimal('0.01'))
+            else:
+                return Decimal('0')
+
+        # Находим текущий товар в списке
+        current_product_volume = next(
+            (v for v in all_products_volumes if v['product_id'] == product.id),
+            None
+        )
+
+        if current_product_volume:
+            volume = current_product_volume['volume']
+        else:
+            # Если товар ещё не производился, используем текущее количество
+            volume = quantity_produced
+            total_volume += volume
+
+        # Вычисляем долю
+        share = volume / total_volume if total_volume > 0 else Decimal('0')
+        overhead_share = (total_overhead * share).quantize(Decimal('0.01'))
+
+        return overhead_share
+
+    @classmethod
+    def _get_all_products_volumes(
+            cls,
+            date_filter: Optional[date] = None
+    ) -> List[Dict]:
+        """
+        Получить объёмы производства всех товаров.
+
+        Args:
+            date_filter: Дата (если None, берём последний месяц)
+
+        Returns:
+            [{'product_id': 1, 'product_name': 'Пельмени', 'volume': 1000}, ...]
+        """
+        from datetime import timedelta
+
+        # Если дата не указана, берём последний месяц
+        if not date_filter:
+            date_filter = date.today()
+
+        start_date = date_filter - timedelta(days=30)
+
+        # Получаем производство за период
+        batches = ProductionBatch.objects.filter(
+            date__gte=start_date,
+            date__lte=date_filter
+        ).values('product__id', 'product__name').annotate(
+            total_volume=Sum('quantity_produced')
+        )
+
+        return [
+            {
+                'product_id': batch['product__id'],
+                'product_name': batch['product__name'],
+                'volume': batch['total_volume']
+            }
+            for batch in batches
+        ]
+
+    @classmethod
+    def distribute_overhead_for_all(
+            cls,
+            products_with_volumes: List[Tuple[Product, Decimal]]
+    ) -> List[OverheadDistribution]:
+        """
+        Распределить накладные расходы для всех товаров.
+
+        Args:
+            products_with_volumes: [(product, volume), ...]
+
+        Returns:
+            [OverheadDistribution, ...]
+        """
+        # Получаем общую сумму накладных
+        total_overhead = Decimal('0')
+        overhead_expenses = Expense.objects.filter(
+            expense_type=ExpenseType.OVERHEAD,
+            is_active=True
+        )
+
+        for expense in overhead_expenses:
+            total_overhead += expense.calculate_amount()
+
+        # Вычисляем общий объём
+        total_volume = sum(volume for _, volume in products_with_volumes)
+
+        if total_volume == 0:
+            return []
+
+        # Распределяем
+        results = []
+        for product, volume in products_with_volumes:
+            share = volume / total_volume
+            overhead_share = (total_overhead * share).quantize(Decimal('0.01'))
+
+            results.append(OverheadDistribution(
+                product_id=product.id,
+                product_name=product.name,
+                volume_produced=volume,
+                volume_share=share,
+                overhead_share=overhead_share
+            ))
+
+        return results
+
+
+# =============================================================================
+# EXPENSE SERVICE (иерархия Сюзерен/Вассал/Обыватель)
+# =============================================================================
+
+class ExpenseService:
+    """Сервис для работы с расходами."""
+
+    @classmethod
+    def calculate_total_expenses_with_hierarchy(cls) -> Decimal:
+        """
+        Рассчитать общие расходы с учётом иерархии.
+
+        Returns:
+            Общая сумма расходов
+        """
+        total = Decimal('0')
+
+        expenses = Expense.objects.filter(is_active=True)
+
+        for expense in expenses:
+            total += expense.calculate_amount()
+
+        return total
+
+    @classmethod
+    def get_expense_breakdown(cls) -> Dict[str, List[Dict]]:
+        """
+        Получить детализацию расходов.
+
+        Returns:
+            {
+                'physical': [...],
+                'overhead': [...]
+            }
+        """
+        expenses = Expense.objects.filter(is_active=True)
+
+        physical = []
+        overhead = []
+
+        for expense in expenses:
+            item = {
+                'id': expense.id,
+                'name': expense.name,
+                'status': expense.expense_status,
+                'amount': float(expense.calculate_amount())
+            }
+
+            if expense.expense_type == ExpenseType.PHYSICAL:
+                physical.append(item)
+            else:
+                overhead.append(item)
+
+        return {
+            'physical': physical,
+            'overhead': overhead
+        }
+
+
+# =============================================================================
+# PRODUCTION SERVICE (создание партий)
+# =============================================================================
+
 class ProductionService:
-    """Сервис производства."""
+    """Сервис для создания производственных партий."""
 
     @classmethod
     @transaction.atomic
-    def create_production_batch(
+    def create_batch_from_quantity(
             cls,
             product_id: int,
-            date_obj: date,
-            quantity_produced: Decimal,
+            quantity: Decimal,
+            date: date,
             notes: str = ''
     ) -> ProductionBatch:
         """
-        Создать производственную запись.
+        Создать партию от количества товара (сценарий 1).
 
         Args:
             product_id: ID товара
-            date_obj: Дата производства
-            quantity_produced: Произведено единиц
+            quantity: Количество товара
+            date: Дата производства
             notes: Заметки
+
+        Returns:
+            ProductionBatch
         """
         product = Product.objects.get(pk=product_id)
 
-        # Получаем расходы
-        expenses = ExpenseService.get_total_expenses_for_date(date_obj)
+        # Рассчитываем
+        result = ProductionCalculator.calculate_from_quantity(product, quantity)
 
-        # Создаём запись
+        # Создаём партию
         batch = ProductionBatch.objects.create(
             product=product,
-            date=date_obj,
-            quantity_produced=quantity_produced,
-            total_daily_expenses=expenses['daily'],
-            total_monthly_expenses_per_day=expenses['monthly_per_day'],
+            date=date,
+            quantity_produced=result.quantity_produced,
+            total_physical_cost=result.total_physical_cost,
+            total_overhead_cost=result.total_overhead_cost,
+            cost_per_unit=result.cost_per_unit,
+            input_type='quantity',
             notes=notes
         )
 
         return batch
 
     @classmethod
-    def get_production_history(
+    @transaction.atomic
+    def create_batch_from_suzerain(
             cls,
-            product_id: int = None,
-            limit: int = 30
-    ) -> List[ProductionBatch]:
-        """Получить историю производства."""
-        queryset = ProductionBatch.objects.all()
-
-        if product_id:
-            queryset = queryset.filter(product_id=product_id)
-
-        return queryset.order_by('-date')[:limit]
-
-    @classmethod
-    def get_production_stats(cls, product_id: int) -> Dict[str, Any]:
-        """Статистика производства товара."""
-        from django.db.models import Min, Max, Count
-
-        stats = ProductionBatch.objects.filter(
-            product_id=product_id
-        ).aggregate(
-            avg_cost=Avg('cost_price_calculated'),
-            min_cost=Min('cost_price_calculated'),
-            max_cost=Max('cost_price_calculated'),
-            total_qty=Sum('quantity_produced'),
-            count=Count('id')
-        )
-
-        return {
-            'avg_cost_price': stats['avg_cost'] or Decimal('0'),
-            'min_cost_price': stats['min_cost'] or Decimal('0'),
-            'max_cost_price': stats['max_cost'] or Decimal('0'),
-            'total_produced': stats['total_qty'] or Decimal('0'),
-            'batches_count': stats['count'] or 0
-        }
-
-
-class ProductService:
-    """Сервис товаров."""
-
-    @classmethod
-    def get_catalog_for_stores(cls) -> List[Dict[str, Any]]:
+            product_id: int,
+            suzerain_quantity: Decimal,
+            date: date,
+            notes: str = ''
+    ) -> ProductionBatch:
         """
-        Каталог для магазинов.
-
-        Магазины видят только final_price!
-        """
-        products = Product.objects.filter(
-            is_active=True,
-            is_available=True
-        ).prefetch_related('images')
-
-        catalog = []
-        for product in products:
-            main_image = product.images.filter(order=0).first()
-
-            catalog.append({
-                'id': product.id,
-                'name': product.name,
-                'description': product.description,
-                'unit': product.unit,
-                'is_weight_based': product.is_weight_based,
-                'is_bonus': product.is_bonus,
-                'final_price': float(product.final_price),
-                'price_per_100g': float(product.price_per_100g) if product.is_weight_based else None,
-                'stock_quantity': float(product.stock_quantity),
-                'main_image': main_image.image.url if main_image else None,
-                'images_count': product.images.count()
-            })
-
-        return catalog
-
-    @classmethod
-    def get_product_details(cls, product_id: int, for_admin: bool = False) -> Dict[str, Any]:
-        """
-        Детали товара.
+        Создать партию от объёма Сюзерена (сценарий 2).
 
         Args:
             product_id: ID товара
-            for_admin: True - показать все данные, False - только для просмотра
+            suzerain_quantity: Количество Сюзерена (кг/шт)
+            date: Дата производства
+            notes: Заметки
+
+        Returns:
+            ProductionBatch
         """
         product = Product.objects.get(pk=product_id)
 
-        data = {
-            'id': product.id,
-            'name': product.name,
-            'description': product.description,
-            'unit': product.unit,
-            'is_weight_based': product.is_weight_based,
-            'is_bonus': product.is_bonus,
-            'final_price': float(product.final_price),
-            'stock_quantity': float(product.stock_quantity),
-            'is_active': product.is_active,
-            'is_available': product.is_available,
-        }
+        # Рассчитываем
+        result = ProductionCalculator.calculate_from_suzerain(product, suzerain_quantity)
 
-        if for_admin:
-            # Для админа - полная информация
-            prod_stats = ProductionService.get_production_stats(product_id)
-
-            data.update({
-                'average_cost_price': float(product.average_cost_price),
-                'markup_percentage': float(product.markup_percentage),
-                'profit_per_unit': float(product.profit_per_unit),
-                'popularity_weight': float(product.popularity_weight),
-                'production_stats': prod_stats,
-            })
-
-        # Изображения
-        data['images'] = [
-            {
-                'id': img.id,
-                'url': img.image.url,
-                'order': img.order
-            }
-            for img in product.images.all()
-        ]
-
-        return data
-
-    @classmethod
-    @transaction.atomic
-    def update_markup(
-            cls,
-            product_id: int,
-            markup_percentage: Decimal
-    ) -> Product:
-        """Обновить наценку товара."""
-        product = Product.objects.get(pk=product_id)
-        product.markup_percentage = markup_percentage
-        product.save()  # Автоматически пересчитает final_price
-        return product
-
-
-    @classmethod
-    def calculate_cost_and_price(
-            cls,
-            product_id: int,
-            quantity_produced: Decimal,
-    ) -> Dict[str, Any]:
-        # ✅ ИСПОЛЬЗУЕМ ExpenseService вместо простого Sum
-
-        product = Product.objects.get(pk=product_id)
-
-        # Рассчитываем с учётом иерархии
-        cost_data = ExpenseService.calculate_product_cost(
+        # Создаём партию
+        batch = ProductionBatch.objects.create(
             product=product,
-            quantity_produced=quantity_produced
+            date=date,
+            quantity_produced=result.quantity_produced,
+            total_physical_cost=result.total_physical_cost,
+            total_overhead_cost=result.total_overhead_cost,
+            cost_per_unit=result.cost_per_unit,
+            input_type='suzerain',
+            notes=notes
         )
 
-        # Обновляем товар
-        product.average_cost_price = cost_data.cost_per_unit
-        product.final_price = cost_data.final_price
-        product.save(update_fields=['average_cost_price', 'final_price'])
-
-        return {
-            'product_id': product.id,
-            'quantity_produced': float(quantity_produced),
-            'expenses': {
-                'total': float(cost_data.total_expenses),
-                'daily': float(cost_data.daily_expenses),
-                'monthly_per_day': float(cost_data.monthly_expenses_per_day),
-            },
-            'cost_per_unit': float(cost_data.cost_per_unit),
-            'markup_percentage': float(cost_data.markup_percentage),
-            'final_price': float(cost_data.final_price),
-            'profit_per_unit': float(cost_data.profit_per_unit),
-        }
-
-
-class ProductImageService:
-    """Сервис изображений."""
-
-    @classmethod
-    @transaction.atomic
-    def add_images(
-            cls,
-            product_id: int,
-            images: List[Any]
-    ) -> List[ProductImage]:
-        """Добавить изображения (до 3 штук)."""
-        product = Product.objects.get(pk=product_id)
-        existing = product.images.count()
-
-        if existing + len(images) > 3:
-            raise ValueError(
-                f'Максимум 3 изображения. Сейчас: {existing}'
-            )
-
-        created = []
-        for i, image_file in enumerate(images):
-            img = ProductImage.objects.create(
-                product=product,
-                image=image_file,
-                order=existing + i
-            )
-            created.append(img)
-
-        return created
-
-    @classmethod
-    @transaction.atomic
-    def delete_image(cls, image_id: int) -> None:
-        """Удалить изображение и переупорядочить."""
-        from django.db.models import F
-
-        image = ProductImage.objects.get(pk=image_id)
-        deleted_order = image.order
-        product_id = image.product_id
-
-        image.delete()
-
-        # Переупорядочить
-        ProductImage.objects.filter(
-            product_id=product_id,
-            order__gt=deleted_order
-        ).update(order=F('order') - 1)
-
-    @classmethod
-    @transaction.atomic
-    def reorder_images(
-            cls,
-            product_id: int,
-            new_order: List[int]
-    ) -> None:
-        """Изменить порядок изображений."""
-        for i, image_id in enumerate(new_order):
-            ProductImage.objects.filter(
-                id=image_id,
-                product_id=product_id
-            ).update(order=i)
+        return batch

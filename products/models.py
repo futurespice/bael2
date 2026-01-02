@@ -1,11 +1,22 @@
-# apps/products/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.1
+# apps/products/models.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v3.0
 """
-Модели для управления товарами, расходами и расходами партнёров.
+Модели для управления товарами и расходами.
 
-КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v2.1:
-1. Добавлен ExpenseUnitType - тип учёта расхода (По шт / По весу)
-2. Добавлен Product.manual_price - ручная цена от админа
-3. Обновлена логика save() - приоритет ручной цены
+КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ v3.0 (на основе правильного понимания ТЗ):
+1. Убрана модель Ingredient (была ошибкой!)
+2. Все расходы (физические и накладные) - это Expense
+3. Добавлена модель ProductRecipe для связи товаров с расходами через пропорции
+4. ProductionBatch поддерживает ДВА сценария расчёта:
+   - От количества товара
+   - От объёма Сюзерена
+5. Умная наценка (перераспределение накладных по объёму производства)
+
+ТЗ 4.1:
+- Физические расходы: лук, мука, фарш, тесто, упаковка
+- Накладные расходы: аренда, налоги, зарплата, топливо, вода
+- Статусы: Сюзерен, Вассал, Обыватель
+- Состояния: Механическое, Автоматическое
+- Типы: Обычный, Универсальный
 """
 
 from decimal import Decimal
@@ -17,77 +28,125 @@ from django.utils import timezone
 
 
 # =============================================================================
-# РАСХОДЫ АДМИНА (ПРОИЗВОДСТВЕННЫЕ)
+# ТИПЫ И СТАТУСЫ РАСХОДОВ
 # =============================================================================
 
 class ExpenseType(models.TextChoices):
-    """Тип расхода."""
+    """
+    Тип расхода (ТЗ 4.1.1).
+
+    - PHYSICAL: Физические (лук, мука, фарш, тесто, упаковка)
+    - OVERHEAD: Накладные (аренда, налоги, зарплата, топливо, вода)
+    """
     PHYSICAL = 'physical', 'Физические'
     OVERHEAD = 'overhead', 'Накладные'
 
 
 class ExpenseStatus(models.TextChoices):
-    """Статус расхода в иерархии."""
+    """
+    Статус расхода в иерархии (ТЗ 4.1.2.1).
+
+    - SUZERAIN: Сюзерен (главный, от него зависят все остальные)
+    - VASSAL: Вассал (зависит от Сюзерена, устанавливается автоматически)
+    - CIVILIAN: Обыватель (базовый, зависит от всех)
+    """
     SUZERAIN = 'suzerain', 'Сюзерен'
     VASSAL = 'vassal', 'Вассал'
     CIVILIAN = 'civilian', 'Обыватель'
 
 
 class ExpenseState(models.TextChoices):
-    """Состояние учёта."""
+    """
+    Состояние учёта (ТЗ 4.1.2.1).
+
+    - MECHANICAL: Механическое (ручной ввод, статус → Вассал)
+    - AUTOMATIC: Автоматическое (зависит от механического)
+    """
     MECHANICAL = 'mechanical', 'Механическое'
     AUTOMATIC = 'automatic', 'Автоматическое'
 
 
 class ApplyType(models.TextChoices):
-    """Тип применения."""
+    """
+    Тип применения (ТЗ 4.1.2.1).
+
+    - REGULAR: Обычный (применяется к отдельным товарам вручную)
+    - UNIVERSAL: Универсальный (применяется ко всем товарам сразу)
+    """
     REGULAR = 'regular', 'Обычный'
     UNIVERSAL = 'universal', 'Универсальный'
 
 
-# ✅ НОВОЕ v2.1: Тип учёта расхода
 class ExpenseUnitType(models.TextChoices):
-    """Тип учёта расхода (По шт / По весу)."""
+    """
+    Тип учёта расхода (только для физических).
+
+    - PER_PIECE: По штукам
+    - PER_WEIGHT: По весу (кг)
+    """
     PER_PIECE = 'per_piece', 'По штукам'
     PER_WEIGHT = 'per_weight', 'По весу (кг)'
 
 
+# =============================================================================
+# РАСХОДЫ (ЕДИНАЯ МОДЕЛЬ ДЛЯ ФИЗИЧЕСКИХ И НАКЛАДНЫХ)
+# =============================================================================
+
 class Expense(models.Model):
     """
-    Расход на производство (управляется админом).
+    Расход на производство (ТЗ 4.1).
 
-    Это расходы на производство: ингредиенты, аренда, зарплата и т.д.
-    НЕ путать с PartnerExpense (расходы партнёра).
+    ЕДИНАЯ модель для ВСЕХ расходов:
+    - Физические (type=physical): Лук, Мука, Фарш, Тесто, Упаковка
+    - Накладные (type=overhead): Аренда, Зарплата, Электричество, Вода
 
-    ИЕРАРХИЯ:
-    - Сюзерен: главный ингредиент, от его количества зависят Вассалы
-    - Вассал: автоматически зависит от Сюзерена
-    - Обыватель: независимый расход
+    ПРИМЕРЫ:
+
+    Физический расход (Мука):
+        name = "Мука"
+        expense_type = PHYSICAL
+        expense_status = SUZERAIN  # главный ингредиент для теста
+        expense_state = MECHANICAL  # ручной ввод количества
+        unit_type = PER_WEIGHT
+        price_per_unit = 50.00  # 50 сом/кг
+
+    Накладной расход (Аренда):
+        name = "Аренда"
+        expense_type = OVERHEAD
+        expense_status = CIVILIAN
+        expense_state = AUTOMATIC
+        monthly_amount = 30000.00
+        daily_amount = 1000.00  # автоматически 30000/30
     """
 
     name = models.CharField(
         max_length=200,
-        verbose_name='Название'
+        verbose_name='Название',
+        help_text='Например: Мука, Фарш, Аренда, Зарплата'
     )
 
+    # Классификация
     expense_type = models.CharField(
         max_length=10,
         choices=ExpenseType.choices,
-        verbose_name='Тип'
+        verbose_name='Тип',
+        help_text='Физические (ингредиенты) или Накладные (операционные)'
     )
 
     expense_status = models.CharField(
         max_length=10,
         choices=ExpenseStatus.choices,
         default=ExpenseStatus.CIVILIAN,
-        verbose_name='Статус в иерархии'
+        verbose_name='Статус в иерархии',
+        help_text='Сюзерен (главный), Вассал (зависимый), Обыватель (базовый)'
     )
 
     expense_state = models.CharField(
         max_length=15,
         choices=ExpenseState.choices,
         default=ExpenseState.AUTOMATIC,
-        verbose_name='Состояние учёта'
+        verbose_name='Состояние учёта',
+        help_text='Механическое (ручной ввод) или Автоматическое (расчётное)'
     )
 
     apply_type = models.CharField(
@@ -95,253 +154,176 @@ class Expense(models.Model):
         choices=ApplyType.choices,
         default=ApplyType.REGULAR,
         verbose_name='Тип применения',
-        help_text='Универсальный = применяется ко всем товарам (свет, аренда)'
+        help_text='Обычный (к отдельным товарам) или Универсальный (ко всем)'
     )
 
-    # ✅ НОВОЕ v2.1: Тип учёта (По шт / По весу)
+    # Для физических расходов
     unit_type = models.CharField(
         max_length=15,
         choices=ExpenseUnitType.choices,
-        default=ExpenseUnitType.PER_PIECE,
+        null=True,
+        blank=True,
         verbose_name='Тип учёта',
-        help_text='По штукам или по весу (кг)'
+        help_text='По штукам или По весу (только для физических)'
     )
 
-    # Зависимость Вассала от Сюзерена
+    price_per_unit = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name='Цена за единицу',
+        help_text='Для физических: цена за 1 кг/шт'
+    )
+
+    # Зависимости (для Вассалов)
     depends_on_suzerain = models.ForeignKey(
         'self',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='vassals',
-        limit_choices_to={'expense_status': 'suzerain'},
-        verbose_name='Зависит от Сюзерена',
-        help_text='Только для Вассалов: от какого Сюзерена зависит количество'
+        limit_choices_to={'expense_status': ExpenseStatus.SUZERAIN},
+        verbose_name='Зависит от Сюзерена'
     )
 
     dependency_ratio = models.DecimalField(
         max_digits=5,
-        decimal_places=3,
+        decimal_places=2,
         null=True,
         blank=True,
-        validators=[MinValueValidator(Decimal('0.001'))],
+        validators=[MinValueValidator(Decimal('0.01'))],
         verbose_name='Коэффициент зависимости',
-        help_text='Только для Вассалов: какая пропорция от Сюзерена (например: 0.095)'
+        help_text='Пропорция от Сюзерена (например, 0.5 = 50%)'
     )
 
-    quantity = models.DecimalField(
-        max_digits=12,
-        decimal_places=3,
-        default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Количество',
-        help_text='Для Сюзеренов - вводится вручную, для Вассалов - рассчитывается'
-    )
-
-    unit_cost = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Цена за единицу',
-        help_text='Цена за штуку или за кг (в зависимости от unit_type)'
-    )
-
+    # Суммы (для накладных расходов)
     monthly_amount = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Месячная сумма',
-        help_text='Например: Аренда 35,000 сом/месяц'
+        verbose_name='Месячная сумма'
     )
 
     daily_amount = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Дневная сумма',
-        help_text='Например: Фарш 28,350 сом/день'
+        verbose_name='Дневная сумма'
     )
 
-    description = models.TextField(blank=True, verbose_name='Описание')
-    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    description = models.TextField(
+        blank=True,
+        verbose_name='Описание'
+    )
+
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name='Активен'
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = 'expenses'
-        verbose_name = 'Расход (производство)'
-        verbose_name_plural = 'Расходы (производство)'
+        verbose_name = 'Расход'
+        verbose_name_plural = 'Расходы'
         ordering = ['name']
         indexes = [
-            models.Index(fields=['is_active']),
-            models.Index(fields=['expense_type']),
+            models.Index(fields=['expense_type', 'is_active']),
             models.Index(fields=['expense_status']),
         ]
 
     def __str__(self):
-        return f"{self.name} ({self.get_expense_type_display()})"
+        type_str = 'Физ' if self.expense_type == ExpenseType.PHYSICAL else 'Накл'
+        status_str = self.get_expense_status_display()[0]  # С/В/О
+        return f"[{type_str}][{status_str}] {self.name}"
 
     def clean(self):
-        """Валидация расхода с учётом иерархии."""
-        super().clean()
+        """Валидация полей."""
+        # Физические должны иметь unit_type и price_per_unit
+        if self.expense_type == ExpenseType.PHYSICAL:
+            if not self.unit_type:
+                raise ValidationError('Физический расход должен иметь тип учёта')
+            if not self.price_per_unit or self.price_per_unit <= 0:
+                raise ValidationError('Физический расход должен иметь цену за единицу')
 
-        # Правило 1: Только Вассалы могут зависеть от Сюзеренов
-        if self.depends_on_suzerain and self.expense_status != ExpenseStatus.VASSAL:
-            raise ValidationError({
-                'depends_on_suzerain':
-                    'Только расходы со статусом "Вассал" могут зависеть от Сюзерена'
-            })
-
-        # Правило 2: Вассал ДОЛЖЕН иметь Сюзерена
-        if self.expense_status == ExpenseStatus.VASSAL and not self.depends_on_suzerain:
-            raise ValidationError({
-                'depends_on_suzerain':
-                    'Вассал должен зависеть от Сюзерена. Выберите Сюзерена или измените статус.'
-            })
-
-        # Правило 3: Вассал ДОЛЖЕН иметь коэффициент
-        if self.expense_status == ExpenseStatus.VASSAL and not self.dependency_ratio:
-            raise ValidationError({
-                'dependency_ratio':
-                    'Укажите коэффициент зависимости (например: 0.095 для 9.5%)'
-            })
-
-    def calculate_vassal_quantity(self) -> Decimal:
-        """Рассчитать количество для Вассала."""
-        if self.expense_status != ExpenseStatus.VASSAL:
-            return self.quantity
-
-        if not self.depends_on_suzerain or not self.dependency_ratio:
-            return Decimal('0')
-
-        suzerain_quantity = self.depends_on_suzerain.quantity
-        calculated = suzerain_quantity * self.dependency_ratio
-
-        return calculated.quantize(Decimal('0.001'))
-
-    def calculate_amount(self) -> Decimal:
-        """Рассчитать сумму расхода."""
+        # Вассал должен зависеть от Сюзерена
         if self.expense_status == ExpenseStatus.VASSAL:
-            vassal_quantity = self.calculate_vassal_quantity()
-            amount = vassal_quantity * self.unit_cost
-            return amount.quantize(Decimal('0.01'))
+            if not self.depends_on_suzerain:
+                raise ValidationError('Вассал должен зависеть от Сюзерена')
+            if not self.dependency_ratio:
+                raise ValidationError('Вассал должен иметь коэффициент зависимости')
 
-        return self.daily_amount or self.monthly_amount or Decimal('0')
+    def calculate_amount(self, quantity: Decimal = None) -> Decimal:
+        """
+        Рассчитать сумму расхода.
 
-    def save(self, *args, **kwargs):
-        """Автоматический расчёт при сохранении."""
-        if (self.expense_status == ExpenseStatus.VASSAL and
-                self.expense_state == ExpenseState.AUTOMATIC):
-            self.quantity = self.calculate_vassal_quantity()
+        Args:
+            quantity: Количество (для физических расходов)
 
-        super().save(*args, **kwargs)
+        Returns:
+            Сумма расхода
+        """
+        if self.expense_type == ExpenseType.PHYSICAL and quantity:
+            # Физический: quantity × price_per_unit
+            return (quantity * (self.price_per_unit or Decimal('0'))).quantize(Decimal('0.01'))
+        else:
+            # Накладной: daily + monthly/30
+            return self.daily_amount + (self.monthly_amount / 30).quantize(Decimal('0.01'))
 
 
 # =============================================================================
-# РАСХОДЫ ПАРТНЁРА (v2.0)
+# РАСХОДЫ ПАРТНЁРОВ (для отчётности админа)
 # =============================================================================
 
 class PartnerExpense(models.Model):
-    """
-    Расход партнёра (ТЗ v2.0).
-
-    ТЗ: "Партнер будет добавлять расходы. Для этого нужны поля:
-    1. Amount - сумма расхода
-    2. Description - описание расхода"
-
-    Расходы партнёра влияют на статистику админа.
-    """
+    """Расходы партнёра (ручной ввод)."""
 
     partner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        limit_choices_to={'role': 'partner'},
         related_name='partner_expenses',
-        verbose_name='Партнёр'
+        limit_choices_to={'role': 'partner'}
     )
 
     amount = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.01'))],
-        verbose_name='Сумма расхода',
-        help_text='Сумма расхода в сомах'
+        validators=[MinValueValidator(Decimal('0.01'))]
     )
 
-    description = models.TextField(
-        verbose_name='Описание расхода',
-        help_text='Причина/описание расхода'
-    )
-
-    date = models.DateField(
-        default=timezone.now,
-        verbose_name='Дата расхода',
-        db_index=True
-    )
-
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        verbose_name='Дата создания'
-    )
-
-    updated_at = models.DateTimeField(
-        auto_now=True,
-        verbose_name='Дата обновления'
-    )
+    description = models.CharField(max_length=500)
+    date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'partner_expenses'
         verbose_name = 'Расход партнёра'
         verbose_name_plural = 'Расходы партнёров'
-        ordering = ['-date', '-created_at']
+        ordering = ['-date']
         indexes = [
             models.Index(fields=['partner', '-date']),
-            models.Index(fields=['date']),
-            models.Index(fields=['-created_at']),
         ]
 
     def __str__(self):
-        return f"{self.partner.get_full_name()}: {self.amount} сом - {self.description[:50]}"
-
-    def clean(self):
-        """Валидация расхода."""
-        super().clean()
-
-        if self.amount <= Decimal('0'):
-            raise ValidationError({
-                'amount': 'Сумма расхода должна быть больше 0'
-            })
-
-        if not self.description or not self.description.strip():
-            raise ValidationError({
-                'description': 'Описание расхода обязательно'
-            })
+        return f"{self.partner.email} - {self.amount} сом ({self.date})"
 
 
 # =============================================================================
-# ТОВАР
+# ТОВАРЫ
 # =============================================================================
 
 class ProductUnit(models.TextChoices):
-    PIECE = 'piece', 'Штука'
+    """Единицы измерения товаров."""
     KG = 'kg', 'Килограмм'
+    PIECE = 'piece', 'Штука'
     LITER = 'liter', 'Литр'
-    PACK = 'pack', 'Упаковка'
 
 
 class Product(models.Model):
-    """
-    Товар в каталоге.
-
-    ВАЖНО (ТЗ v2.1):
-    - Создаётся админом
-    - Цена: manual_price (ручная) ИЛИ авторасчёт (себестоимость + наценка)
-    - Запрещена смена категории "Весовой" → "Штучный"
-    - Бонусные товары: только штучные, каждый 21-й бесплатно
-    """
+    """Товар в каталоге."""
 
     name = models.CharField(
         max_length=200,
@@ -350,14 +332,9 @@ class Product(models.Model):
     )
 
     description = models.TextField(
+        max_length=250,
         blank=True,
-        verbose_name='Описание',
-        help_text='Максимум 250 символов'
-    )
-
-    is_weight_based = models.BooleanField(
-        default=False,
-        verbose_name='Весовой товар'
+        verbose_name='Описание'
     )
 
     unit = models.CharField(
@@ -367,74 +344,62 @@ class Product(models.Model):
         verbose_name='Единица измерения'
     )
 
-    # =====================================================================
-    # ЦЕНООБРАЗОВАНИЕ
-    # =====================================================================
+    is_weight_based = models.BooleanField(
+        default=False,
+        verbose_name='Весовой товар'
+    )
 
+    is_bonus = models.BooleanField(
+        default=False,
+        verbose_name='Бонусный'
+    )
+
+    # Ценообразование
     average_cost_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Себестоимость',
-        help_text='Обновляется из производства'
+        verbose_name='Средняя себестоимость'
     )
 
     markup_percentage = models.DecimalField(
         max_digits=5,
         decimal_places=2,
-        default=Decimal('10'),
-        validators=[MinValueValidator(Decimal('0')), MaxValueValidator(Decimal('1000'))],
-        verbose_name='Наценка (%)',
-        help_text='Устанавливается админом'
+        default=Decimal('20'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Наценка (%)'
     )
 
-    # ✅ НОВОЕ v2.1: Ручная цена от админа
     manual_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         null=True,
         blank=True,
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Ручная цена',
-        help_text='Если установлена, используется вместо автоматического расчёта'
+        verbose_name='Ручная цена'
     )
 
     final_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Цена продажи',
-        help_text='Авторасчёт или manual_price'
+        verbose_name='Цена продажи'
     )
-
-    price_per_100g = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal('0'),
-        verbose_name='Цена за 100г'
-    )
-
-    # =====================================================================
-    # СКЛАД И СТАТУСЫ
-    # =====================================================================
 
     stock_quantity = models.DecimalField(
         max_digits=12,
-        decimal_places=3,
+        decimal_places=2,
         default=Decimal('0'),
-        validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='На складе'
+        verbose_name='Количество на складе'
     )
 
-    is_active = models.BooleanField(default=True, verbose_name='Активен')
-    is_available = models.BooleanField(default=True, verbose_name='Доступен')
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name='Активен'
+    )
 
-    is_bonus = models.BooleanField(
-        default=False,
-        verbose_name='Бонусный',
-        help_text='Каждый 21-й товар бесплатно (только для штучных)'
+    is_available = models.BooleanField(
+        default=True,
+        verbose_name='Доступен'
     )
 
     popularity_weight = models.DecimalField(
@@ -442,7 +407,8 @@ class Product(models.Model):
         decimal_places=6,
         default=Decimal('1.000000'),
         validators=[MinValueValidator(Decimal('0.0001'))],
-        verbose_name='Коэффициент популярности'
+        verbose_name='Коэффициент популярности',
+        help_text='Для умной наценки (перераспределение накладных)'
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -455,76 +421,17 @@ class Product(models.Model):
         ordering = ['name']
         indexes = [
             models.Index(fields=['is_active', 'is_available']),
-            models.Index(fields=['name']),
-            models.Index(fields=['is_bonus']),  # ✅ НОВОЕ v2.1
         ]
 
     def __str__(self):
         return self.name
 
-    def clean(self):
-        super().clean()
-
-        # Валидация описания (250 символов)
-        if self.description and len(self.description) > 250:
-            raise ValidationError({
-                'description': 'Описание не может превышать 250 символов'
-            })
-
-        if self.is_weight_based and self.unit != ProductUnit.KG:
-            raise ValidationError({
-                'unit': 'Весовые товары должны быть в кг'
-            })
-
-        # ТЗ: Весовые товары НЕ могут быть бонусными
-        if self.is_weight_based and self.is_bonus:
-            raise ValidationError({
-                'is_bonus': 'Весовые товары не могут быть бонусными'
-            })
-
-        # Проверка на смену категории "Весовой" → "Штучный"
-        if self.pk:
-            old_product = Product.objects.filter(pk=self.pk).first()
-            if old_product and old_product.is_weight_based and not self.is_weight_based:
-                raise ValidationError({
-                    'is_weight_based': 'Запрещена смена категории "Весовой" → "Штучный"'
-                })
-
-    def save(self, *args, **kwargs):
-        """
-        Автоматический расчёт цены.
-
-        ЛОГИКА (v2.1):
-        1. Если manual_price установлена → использовать её
-        2. Иначе → рассчитать: себестоимость × (1 + наценка%)
-        """
-        # ✅ НОВОЕ v2.1: Приоритет ручной цены
-        if self.manual_price is not None and self.manual_price > 0:
-            # Используем ручную цену
-            self.final_price = self.manual_price
-        elif self.average_cost_price > 0:
-            # Автоматический расчёт: себестоимость + наценка
-            self.final_price = self.average_cost_price * (
-                    Decimal('1') + self.markup_percentage / Decimal('100')
-            )
-
-        # Цена за 100г для весовых товаров
-        if self.is_weight_based and self.final_price > 0:
-            self.price_per_100g = self.final_price / Decimal('10')
-
-        super().save(*args, **kwargs)
-
-    def update_average_cost_price(self):
-        """Обновить себестоимость из производства."""
-        from django.db.models import Avg
-
-        avg = self.production_batches.aggregate(
-            avg_cost=Avg('cost_price_calculated')
-        )['avg_cost']
-
-        if avg:
-            self.average_cost_price = avg
-            self.save()
+    @property
+    def price_per_100g(self) -> Decimal:
+        """Цена за 100 грамм (для весовых)."""
+        if self.is_weight_based:
+            return (self.final_price / 10).quantize(Decimal('0.01'))
+        return Decimal('0')
 
     @property
     def profit_per_unit(self) -> Decimal:
@@ -533,53 +440,158 @@ class Product(models.Model):
 
     @property
     def effective_price(self) -> Decimal:
-        """
-        Эффективная цена (для использования в расчётах).
-
-        Приоритет:
-        1. manual_price (если установлена)
-        2. final_price (авторасчёт)
-        """
+        """Эффективная цена (с учётом manual_price)."""
         if self.manual_price is not None and self.manual_price > 0:
             return self.manual_price
         return self.final_price
 
-    def validate_order_quantity(self, quantity: Decimal):
-        """
-        Валидация количества для заказа.
-
-        ТЗ v2.0:
-        - Весовые: минимум 1 кг (или 0.1 кг если остаток < 1 кг), шаг 0.1 кг
-        - Штучные: минимум 1 шт, только целые числа
-        """
-        if self.is_weight_based:
-            min_qty = Decimal('1.0') if self.stock_quantity >= Decimal('1.0') else Decimal('0.1')
-            if quantity < min_qty:
-                raise ValidationError(f'Минимум: {min_qty} кг')
-            if (quantity * Decimal('10')) % Decimal('1') != Decimal('0'):
-                raise ValidationError('Шаг: 0.1 кг')
+    def save(self, *args, **kwargs):
+        """Автоматический расчёт цены."""
+        # Если есть manual_price, используем его
+        if self.manual_price and self.manual_price > 0:
+            self.final_price = self.manual_price
         else:
-            if quantity < Decimal('1'):
-                raise ValidationError('Минимум: 1 шт')
-            if quantity != int(quantity):
-                raise ValidationError('Только целые числа')
+            # Автоматический расчёт: себестоимость + наценка
+            markup_multiplier = Decimal('1') + (self.markup_percentage / 100)
+            self.final_price = (self.average_cost_price * markup_multiplier).quantize(Decimal('0.01'))
+
+        super().save(*args, **kwargs)
+
+    def update_average_cost_price(self):
+        """Обновить среднюю себестоимость из ProductionBatch."""
+        from django.db.models import Avg
+
+        avg = self.production_batches.aggregate(
+            avg_cost=Avg('cost_per_unit')
+        )['avg_cost']
+
+        if avg:
+            self.average_cost_price = avg
+            self.save()
 
 
 # =============================================================================
-# ПРОИЗВОДСТВО
+# РЕЦЕПТЫ ТОВАРОВ (СВЯЗЬ С РАСХОДАМИ)
 # =============================================================================
 
-class ProductionBatch(models.Model):
-    """Производственная партия (записывает админ)."""
+class ProductRecipe(models.Model):
+    """
+    Рецепт товара - связь с расходами через пропорции (ТЗ 4.1.3).
+
+    ПРИМЕРЫ:
+
+    Пельмени:
+        - Фарш (Сюзерен): quantity_per_unit = 0.01 (10г на 1 пельмень)
+        - Лук: proportion = 0.5 (50% от фарша)
+        - Тесто: proportion = 1.0 (100% от фарша)
+        - Фаршировщик (накладной): proportion = None (распределяется автоматически)
+
+    Тесто:
+        - Мука (Сюзерен): quantity_per_unit = 0.5 (500г на 1 кг теста)
+        - Вода: proportion = 0.3 (30% от муки)
+    """
 
     product = models.ForeignKey(
         Product,
         on_delete=models.CASCADE,
-        related_name='production_batches'
+        related_name='recipe_items',
+        verbose_name='Товар'
+    )
+
+    expense = models.ForeignKey(
+        Expense,
+        on_delete=models.CASCADE,
+        related_name='recipe_usages',
+        verbose_name='Расход'
+    )
+
+    # Для Сюзерена: количество на 1 единицу товара
+    quantity_per_unit = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name='Количество на единицу',
+        help_text='Для Сюзерена: кг/шт на 1 единицу товара'
+    )
+
+    # Для остальных: пропорция от Сюзерена
+    proportion = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Пропорция',
+        help_text='Пропорция от Сюзерена (например, 0.5 = 50%)'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'product_recipes'
+        verbose_name = 'Рецепт товара'
+        verbose_name_plural = 'Рецепты товаров'
+        unique_together = [['product', 'expense']]
+        indexes = [
+            models.Index(fields=['product', 'expense']),
+        ]
+
+    def __str__(self):
+        if self.quantity_per_unit:
+            return f"{self.product.name}: {self.expense.name} (Сюзерен, {self.quantity_per_unit}/шт)"
+        elif self.proportion:
+            return f"{self.product.name}: {self.expense.name} (пропорция {self.proportion})"
+        else:
+            return f"{self.product.name}: {self.expense.name}"
+
+    def clean(self):
+        """Валидация."""
+        # Сюзерен должен иметь quantity_per_unit
+        if self.expense.expense_status == ExpenseStatus.SUZERAIN:
+            if not self.quantity_per_unit:
+                raise ValidationError('Сюзерен должен иметь quantity_per_unit')
+        else:
+            # Остальные должны иметь proportion (кроме универсальных)
+            if self.expense.apply_type != ApplyType.UNIVERSAL and not self.proportion:
+                raise ValidationError('Расход должен иметь пропорцию')
+
+
+# =============================================================================
+# ПРОИЗВОДСТВЕННЫЕ ПАРТИИ
+# =============================================================================
+
+class ProductionBatch(models.Model):
+    """
+    Производственная партия (ТЗ 4.1.3).
+
+    ДВА СЦЕНАРИЯ РАСЧЁТА:
+    1. Ввод количества товара → расчёт расходов
+    2. Ввод объёма Сюзерена → расчёт количества товара
+
+    ПРИМЕР (Пельмени, 200 шт):
+
+    Сценарий 1: Ввели 200 пельменей
+        - Фарш (Сюзерен): 200 × 0.01 = 2 кг
+        - Лук (50%): 2 × 0.5 = 1 кг
+        - Тесто (100%): 2 × 1.0 = 2 кг
+        - Фаршировщик: распределяется пропорционально
+
+    Сценарий 2: Ввели 2 кг фарша
+        - Количество: 2 / 0.01 = 200 пельменей
+        - Остальное аналогично
+    """
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name='production_batches',
+        verbose_name='Товар'
     )
 
     date = models.DateField(verbose_name='Дата производства')
 
+    # Результат расчёта
     quantity_produced = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -587,60 +599,72 @@ class ProductionBatch(models.Model):
         verbose_name='Произведено'
     )
 
-    total_daily_expenses = models.DecimalField(
+    # Расходы (детализация)
+    total_physical_cost = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         default=Decimal('0'),
-        verbose_name='Дневные расходы'
+        verbose_name='Физические расходы'
     )
 
-    total_monthly_expenses_per_day = models.DecimalField(
+    total_overhead_cost = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         default=Decimal('0'),
-        verbose_name='Месячные (на день)'
+        verbose_name='Накладные расходы'
     )
 
-    cost_price_calculated = models.DecimalField(
+    cost_per_unit = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=Decimal('0'),
-        verbose_name='Себестоимость'
+        verbose_name='Себестоимость за единицу'
+    )
+
+    # Метаданные
+    input_type = models.CharField(
+        max_length=20,
+        choices=[
+            ('quantity', 'От количества товара'),
+            ('suzerain', 'От объёма Сюзерена')
+        ],
+        default='quantity',
+        verbose_name='Тип ввода'
     )
 
     notes = models.TextField(blank=True, verbose_name='Заметки')
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = 'production_batches'
         verbose_name = 'Производственная партия'
         verbose_name_plural = 'Производственные партии'
-        ordering = ['-date']
+        ordering = ['-date', '-created_at']
         indexes = [
             models.Index(fields=['product', '-date']),
+            models.Index(fields=['-date']),
         ]
-        unique_together = ['product', 'date']
 
     def __str__(self):
-        return f"{self.product.name} - {self.date}"
+        return f"{self.product.name} - {self.date} ({self.quantity_produced} шт)"
 
-    def calculate_cost_price(self) -> Decimal:
-        """
-        Рассчитать себестоимость.
-
-        Формула: (дневные + месячные/30) / количество
-        """
+    def calculate_cost_per_unit(self) -> Decimal:
+        """Рассчитать себестоимость за единицу."""
         if self.quantity_produced <= 0:
             return Decimal('0')
 
-        total = self.total_daily_expenses + self.total_monthly_expenses_per_day
+        total = self.total_physical_cost + self.total_overhead_cost
         return (total / self.quantity_produced).quantize(Decimal('0.01'))
 
     def save(self, *args, **kwargs):
-        """Автоматический расчёт."""
-        self.cost_price_calculated = self.calculate_cost_price()
+        """Автоматический расчёт себестоимости."""
+        self.cost_per_unit = self.calculate_cost_per_unit()
         super().save(*args, **kwargs)
-        self.product.update_average_cost_price()
+
+        # Обновляем среднюю себестоимость товара
+        if hasattr(self.product, 'update_average_cost_price'):
+            self.product.update_average_cost_price()
 
 
 # =============================================================================
@@ -665,7 +689,7 @@ class ProductImage(models.Model):
         verbose_name = 'Изображение'
         verbose_name_plural = 'Изображения'
         ordering = ['product', 'order']
-        unique_together = ['product', 'order']
+        unique_together = [['product', 'order']]
 
     def clean(self):
         if not self.pk:
@@ -675,15 +699,14 @@ class ProductImage(models.Model):
 
 
 # =============================================================================
-# СВЯЗЬ ТОВАР-РАСХОД
+# ОБРАТНАЯ СОВМЕСТИМОСТЬ (для существующих эндпоинтов)
 # =============================================================================
 
 class ProductExpenseRelation(models.Model):
     """
-    Связь товара с расходом.
+    УСТАРЕЛО! Используйте ProductRecipe вместо этой модели.
 
-    ТЗ v2.0: Товар выбирает расходы которые к нему применяются.
-    Универсальные расходы (свет, аренда) применяются ко всем автоматически.
+    Оставлено для обратной совместимости с существующими эндпоинтами.
     """
 
     product = models.ForeignKey(
@@ -703,17 +726,16 @@ class ProductExpenseRelation(models.Model):
         decimal_places=3,
         null=True,
         blank=True,
-        validators=[MinValueValidator(Decimal('0'))],
-        help_text='Пропорция расхода для товара (опционально)'
+        validators=[MinValueValidator(Decimal('0'))]
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'product_expense_relations'
-        verbose_name = 'Связь товар-расход'
-        verbose_name_plural = 'Связи товар-расход'
-        unique_together = ['product', 'expense']
+        verbose_name = 'Связь товар-расход (устарело)'
+        verbose_name_plural = 'Связи товар-расход (устарело)'
+        unique_together = [['product', 'expense']]
 
     def __str__(self):
         return f"{self.product.name} ← {self.expense.name}"
