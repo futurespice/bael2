@@ -793,9 +793,157 @@ class ModifiedItemSerializer(serializers.Serializer):
     order_id = serializers.IntegerField()
 
 
-class BasketConfirmResponseSerializer(serializers.Serializer):
+# ============================================================================
+# ПАТЧ ДЛЯ apps/stores/serializers.py - ДОБАВИТЬ НОВЫЕ СЕРИАЛИЗАТОРЫ
+# ============================================================================
+#
+# ДОБАВИТЬ В КОНЕЦ ФАЙЛА (после строки 859)
+# Эти сериализаторы для нового метода remove_from_basket
+# ============================================================================
+
+# =============================================================================
+# УДАЛЕНИЕ/ИЗМЕНЕНИЕ ТОВАРОВ ИЗ КОРЗИНЫ (НОВОЕ v2.4)
+# =============================================================================
+
+class BasketRemoveRequestSerializer(serializers.Serializer):
     """
-    Сериализатор ответа на подтверждение корзины.
+    Сериализатор запроса на удаление/изменение товаров из корзины.
+
+    POST /api/stores/stores/{id}/basket/remove/
+
+    ЛОГИКА:
+    - items_to_remove: полностью удаляет товары по ID
+    - items_to_modify: удаляет УКАЗАННОЕ количество (не уменьшает ДО)
+    """
+
+    items_to_remove = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=list,
+        help_text='ID товаров для полного удаления из корзины'
+    )
+    items_to_modify = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list,
+        help_text='Товары с количеством ДЛЯ УДАЛЕНИЯ (не финальное количество!)'
+    )
+
+    def validate(self, data):
+        """Валидация: должно быть указано хотя бы что-то."""
+        if not data.get('items_to_remove') and not data.get('items_to_modify'):
+            raise serializers.ValidationError(
+                'Укажите items_to_remove или items_to_modify'
+            )
+        return data
+
+    def validate_items_to_modify(self, value):
+        """
+        Валидация items_to_modify.
+
+        ВАЖНО: quantity_to_remove - это сколько УДАЛИТЬ, не финальное количество!
+        """
+        validated = []
+
+        for i, item in enumerate(value):
+            product_id = item.get('product_id')
+            quantity_to_remove = item.get('quantity_to_remove')
+
+            if not product_id:
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: не указан product_id'
+                )
+
+            if quantity_to_remove is None:
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: не указан quantity_to_remove'
+                )
+
+            try:
+                quantity_to_remove = Decimal(str(quantity_to_remove))
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: некорректное значение quantity_to_remove'
+                )
+
+            if quantity_to_remove <= 0:
+                raise serializers.ValidationError(
+                    f'Позиция {i + 1}: quantity_to_remove должно быть больше 0'
+                )
+
+            validated.append({
+                'product_id': int(product_id),
+                'quantity_to_remove': quantity_to_remove,
+            })
+
+        return validated
+
+
+class ModifiedItemInfoSerializer(serializers.Serializer):
+    """Информация об изменённом товаре (частичное удаление)."""
+
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    quantity_before = serializers.FloatField(help_text='Количество до удаления')
+    quantity_removed = serializers.FloatField(help_text='Сколько удалили')
+    quantity_after = serializers.FloatField(help_text='Количество после удаления')
+    order_id = serializers.IntegerField()
+
+
+class RemovedItemInfoSerializer(serializers.Serializer):
+    """Информация об удалённом товаре (полное удаление)."""
+
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    quantity_removed = serializers.FloatField(help_text='Сколько удалили')
+    order_id = serializers.IntegerField()
+
+
+class BasketRemoveResponseSerializer(serializers.Serializer):
+    """
+    Сериализатор ответа на удаление/изменение товаров из корзины.
+
+    Возвращает обновлённую корзину + информацию об изменениях.
+    """
+
+    success = serializers.BooleanField()
+    message = serializers.CharField()
+    removed_items = RemovedItemInfoSerializer(many=True, help_text='Полностью удалённые товары')
+    modified_items = ModifiedItemInfoSerializer(many=True, help_text='Частично удалённые товары')
+    basket = BasketSerializer()
+
+
+# =============================================================================
+# ОБНОВЛЕННЫЙ СЕРИАЛИЗАТОР ДЛЯ CONFIRM (УПРОЩЕННЫЙ)
+# =============================================================================
+
+class BasketConfirmRequestUpdatedSerializer(serializers.Serializer):
+    """
+    Упрощенный сериализатор запроса на подтверждение корзины.
+
+    POST /api/stores/stores/{id}/basket/confirm/
+
+    ИЗМЕНЕНИЯ v2.4:
+    - Удалены items_to_remove и items_to_modify
+    - Остался только prepayment_amount
+    """
+
+    prepayment_amount = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0'),
+        min_value=Decimal('0'),
+        help_text='Сумма предоплаты'
+    )
+
+
+class BasketConfirmResponseUpdatedSerializer(serializers.Serializer):
+    """
+    Упрощенный сериализатор ответа на подтверждение корзины.
+
+    ИЗМЕНЕНИЯ v2.4:
+    - Удалены removed_items и modified_items
+    - Остались только подтвержденные заказы и итоги
     """
 
     success = serializers.BooleanField()
@@ -803,8 +951,20 @@ class BasketConfirmResponseSerializer(serializers.Serializer):
     confirmed_orders = ConfirmedOrderSerializer(many=True)
     totals = BasketConfirmTotalsSerializer()
     store_debt = serializers.FloatField()
-    removed_items = RemovedItemSerializer(many=True)
-    modified_items = ModifiedItemSerializer(many=True)
+
+
+# ============================================================================
+# ИНСТРУКЦИИ ПО ОБНОВЛЕНИЮ
+# ============================================================================
+#
+# ОПЦИОНАЛЬНО: Если хотите использовать обновленные сериализаторы
+# (без items_to_remove/items_to_modify), замените старые:
+#
+# BasketConfirmRequestSerializer → BasketConfirmRequestUpdatedSerializer
+# BasketConfirmResponseSerializer → BasketConfirmResponseUpdatedSerializer
+#
+# Или оставьте старые сериализаторы для обратной совместимости.
+# ============================================================================
 
 
 # =============================================================================

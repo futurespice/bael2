@@ -163,7 +163,7 @@ class OrderWorkflowService:
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
-            old_status=None,
+            old_status='',
             new_status=StoreOrderStatus.PENDING,
             changed_by=created_by,
             comment=f'Заказ создан магазином "{store.name}"'

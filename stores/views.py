@@ -685,6 +685,419 @@ class StoreViewSet(viewsets.ModelViewSet):
             403: OpenApiResponse(description="Только партнёры"),
         },
     )
+    # ============================================================================
+    # ПАТЧ ДЛЯ apps/stores/views.py - ЗАМЕНА МЕТОДА confirm_basket
+    # ============================================================================
+    #
+    # ЗАМЕНИТЬ метод confirm_basket на ДВА МЕТОДА:
+    # 1. remove_from_basket - удаление/изменение товаров
+    # 2. confirm_basket - подтверждение с предоплатой
+    #
+    # НАЙТИ И УДАЛИТЬ: строки 649-924 (весь метод confirm_basket)
+    # ВСТАВИТЬ: код ниже
+    # ============================================================================
+
+    @extend_schema(
+        summary="Удалить/изменить товары в корзине",
+        description="""
+                Партнёр удаляет или изменяет количество товаров в корзине магазина.
+
+                Работает с заказами в статусе IN_TRANSIT.
+                НЕ меняет статус заказов, НЕ переносит в инвентарь, НЕ создает долг.
+
+                WORKFLOW:
+                1. Партнёр просматривает корзину (GET /basket/)
+                2. Партнёр видит товары, которые ему не нужны
+                3. Партнёр удаляет ненужные товары или уменьшает количество
+                4. Товары возвращаются на склад
+                5. Суммы заказов пересчитываются
+                6. Возвращается обновлённая корзина
+
+                После этого партнёр вызывает confirm (подтверждение с предоплатой).
+                """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'items_to_remove': {
+                        'type': 'array',
+                        'items': {'type': 'integer'},
+                        'description': 'ID товаров для полного удаления из корзины',
+                        'example': [1, 2, 3]
+                    },
+                    'items_to_modify': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'product_id': {'type': 'integer'},
+                                'new_quantity': {'type': 'number'}
+                            }
+                        },
+                        'description': 'Товары с новым количеством (только уменьшение)',
+                        'example': [
+                            {'product_id': 4, 'new_quantity': 50},
+                            {'product_id': 5, 'new_quantity': 2.5}
+                        ]
+                    }
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Корзина обновлена"),
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Только партнёры"),
+        },
+    )
+    @extend_schema(
+        summary="Удалить/изменить товары в корзине",
+        description="""
+                Партнёр удаляет товары или уменьшает их количество в корзине магазина.
+
+                ЛОГИКА:
+                - items_to_remove: полностью удаляет товары по ID
+                - items_to_modify: удаляет УКАЗАННОЕ количество из корзины
+
+                ПРИМЕРЫ:
+                1. Полное удаление:
+                   {"items_to_remove": [1, 2, 3]} - удалит товары 1, 2, 3 полностью
+
+                2. Частичное удаление:
+                   Было: Курица 5 кг
+                   Запрос: {"items_to_modify": [{"product_id": 10, "quantity_to_remove": 2}]}
+                   Стало: Курица 3 кг
+
+                WORKFLOW:
+                1. Партнёр просматривает корзину (GET /basket/)
+                2. Партнёр видит ненужные товары
+                3. Партнёр удаляет товары или уменьшает количество
+                4. Товары возвращаются на склад
+                5. Возвращается обновлённая корзина
+                """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'items_to_remove': {
+                        'type': 'array',
+                        'items': {'type': 'integer'},
+                        'description': 'ID товаров для полного удаления из корзины',
+                        'example': [1, 2, 3]
+                    },
+                    'items_to_modify': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'product_id': {
+                                    'type': 'integer',
+                                    'description': 'ID товара'
+                                },
+                                'quantity_to_remove': {
+                                    'type': 'number',
+                                    'description': 'Сколько штук/кг удалить (НЕ финальное количество!)'
+                                }
+                            }
+                        },
+                        'description': 'Товары с количеством для удаления',
+                        'example': [
+                            {'product_id': 4, 'quantity_to_remove': 50},
+                            {'product_id': 5, 'quantity_to_remove': 2.5}
+                        ]
+                    }
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Корзина обновлена"),
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Только партнёры"),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='basket/remove')
+    @transaction.atomic
+    def remove_from_basket(self, request: Request, pk=None) -> Response:
+        """
+        Партнёр удаляет/изменяет товары из корзины магазина.
+
+        POST /api/stores/stores/{id}/basket/remove/
+        """
+        store = self.get_object()
+        user = request.user
+
+        if user.role != 'partner':
+            return Response(
+                {'error': 'Только партнёры могут редактировать корзину'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Параметры
+        items_to_remove = request.data.get('items_to_remove', [])
+        items_to_modify = request.data.get('items_to_modify', [])
+
+        if not items_to_remove and not items_to_modify:
+            return Response(
+                {'error': 'Не указаны товары для удаления или изменения'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Получаем IN_TRANSIT заказы
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.IN_TRANSIT
+        ).select_for_update().prefetch_related('items__product')
+
+        if not orders.exists():
+            return Response(
+                {'error': 'Нет заказов в корзине'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        removed_info = []
+        modified_info = []
+
+        # =====================================================================
+        # 1. ПОЛНОЕ УДАЛЕНИЕ ТОВАРОВ (items_to_remove)
+        # =====================================================================
+        for product_id in items_to_remove:
+            deleted_items = StoreOrderItem.objects.filter(
+                order__in=orders,
+                product_id=product_id
+            ).select_related('product')
+
+            for item in deleted_items:
+                removed_info.append({
+                    'product_id': product_id,
+                    'product_name': item.product.name,
+                    'quantity_removed': float(item.quantity),
+                    'order_id': item.order_id,
+                })
+                # Возвращаем товар на склад
+                item.product.stock_quantity += item.quantity
+                item.product.save(update_fields=['stock_quantity'])
+
+            deleted_items.delete()
+
+        # =====================================================================
+        # 2. ЧАСТИЧНОЕ УДАЛЕНИЕ (items_to_modify)
+        # ЛОГИКА: Удаляем УКАЗАННОЕ количество, не уменьшаем ДО
+        # =====================================================================
+        for mod in items_to_modify:
+            product_id = mod.get('product_id')
+            quantity_to_remove = mod.get('quantity_to_remove')
+
+            if not product_id or quantity_to_remove is None:
+                continue
+
+            try:
+                quantity_to_remove = Decimal(str(quantity_to_remove))
+            except (ValueError, TypeError):
+                continue
+
+            if quantity_to_remove <= 0:
+                continue  # Нельзя удалить 0 или отрицательное количество
+
+            # Находим все позиции с этим товаром
+            items = StoreOrderItem.objects.filter(
+                order__in=orders,
+                product_id=product_id
+            ).select_related('product').order_by('id')
+
+            if not items.exists():
+                continue
+
+            # Считаем текущее общее количество
+            current_total = sum(item.quantity for item in items)
+
+            # ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверяем, что удаляем не больше чем есть
+            if quantity_to_remove > current_total:
+                # Нельзя удалить больше чем есть - удаляем всё
+                quantity_to_remove = current_total
+
+            # Удаляем указанное количество
+            remaining_to_remove = quantity_to_remove
+
+            for item in items:
+                if remaining_to_remove <= 0:
+                    break
+
+                product = item.product
+
+                if item.quantity <= remaining_to_remove:
+                    # Удаляем позицию полностью
+                    removed_qty = item.quantity
+                    remaining_to_remove -= removed_qty
+
+                    # Возвращаем на склад
+                    product.stock_quantity += removed_qty
+                    product.save(update_fields=['stock_quantity'])
+
+                    removed_info.append({
+                        'product_id': product_id,
+                        'product_name': product.name,
+                        'quantity_removed': float(removed_qty),
+                        'order_id': item.order_id,
+                    })
+
+                    item.delete()
+                else:
+                    # Уменьшаем позицию частично
+                    old_qty = item.quantity
+                    item.quantity -= remaining_to_remove
+                    item.total = item.quantity * item.price
+                    item.save(update_fields=['quantity', 'total'])
+
+                    # Возвращаем на склад
+                    product.stock_quantity += remaining_to_remove
+                    product.save(update_fields=['stock_quantity'])
+
+                    modified_info.append({
+                        'product_id': product_id,
+                        'product_name': product.name,
+                        'quantity_before': float(old_qty),
+                        'quantity_removed': float(remaining_to_remove),
+                        'quantity_after': float(item.quantity),
+                        'order_id': item.order_id,
+                    })
+
+                    remaining_to_remove = Decimal('0')
+
+        # =====================================================================
+        # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ
+        # =====================================================================
+        for order in orders:
+            order.refresh_from_db()
+            new_total = sum(item.total for item in order.items.all())
+            order.total_amount = new_total
+            order.save(update_fields=['total_amount'])
+
+        # =====================================================================
+        # 4. ВОЗВРАЩАЕМ ОБНОВЛЁННУЮ КОРЗИНУ
+        # =====================================================================
+        # Перезагружаем заказы после всех изменений
+        orders = orders.prefetch_related('items__product__images')
+
+        # Агрегируем товары
+        items_map = {}
+
+        for order in orders:
+            for item in order.items.all():
+                product = item.product
+                product_id = product.id
+
+                if product_id not in items_map:
+                    main_image = None
+                    if hasattr(product, 'images') and product.images.exists():
+                        first_image = product.images.first()
+                        if first_image and first_image.image:
+                            main_image = first_image.image.url
+
+                    items_map[product_id] = {
+                        'product_id': product_id,
+                        'product_name': product.name,
+                        'product_image': main_image,
+                        'is_weight_based': product.is_weight_based,
+                        'is_bonus_product': product.is_bonus,
+                        'unit': product.unit,
+                        'price': item.price,
+                        'quantity': Decimal('0'),
+                        'total': Decimal('0'),
+                        'order_ids': [],
+                    }
+
+                items_map[product_id]['quantity'] += item.quantity
+                items_map[product_id]['total'] += item.total
+                if order.id not in items_map[product_id]['order_ids']:
+                    items_map[product_id]['order_ids'].append(order.id)
+
+        # Форматируем результат
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
+
+        for product_id, data in items_map.items():
+            if data['is_weight_based']:
+                qty = data['quantity']
+                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+                weight_total += data['quantity']
+            else:
+                quantity_display = f"{int(data['quantity'])} шт"
+                piece_count += int(data['quantity'])
+
+            total_amount += data['total']
+
+            items.append({
+                'product_id': data['product_id'],
+                'product_name': data['product_name'],
+                'product_image': data['product_image'],
+                'is_weight_based': data['is_weight_based'],
+                'is_bonus_product': data['is_bonus_product'],
+                'unit': data['unit'],
+                'quantity': str(data['quantity']),
+                'quantity_display': quantity_display,
+                'price': str(data['price']),
+                'total': str(data['total']),
+                'order_ids': data['order_ids'],
+            })
+
+        return Response({
+            'success': True,
+            'message': f'Корзина обновлена. Полностью удалено позиций: {len(removed_info)}, частично изменено: {len(modified_info)}',
+            'removed_items': removed_info,
+            'modified_items': modified_info,
+            'basket': {
+                'store_id': store.id,
+                'store_name': store.name,
+                'owner_name': store.owner_name,
+                'store_phone': store.phone,
+                'is_empty': len(items) == 0,
+                'orders_count': orders.count(),
+                'order_ids': list(orders.values_list('id', flat=True)),
+                'items': items,
+                'totals': {
+                    'piece_count': piece_count,
+                    'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+                    'total_amount': str(total_amount),
+                }
+            }
+        })
+
+    @extend_schema(
+        summary="Подтвердить корзину",
+        description="""
+                Партнёр подтверждает корзину магазина с указанием предоплаты.
+
+                ВАЖНО: Перед подтверждением партнёр должен отредактировать корзину
+                через /basket/remove/ (удалить ненужные товары).
+
+                WORKFLOW:
+                1. Партнёр уже отредактировал корзину (remove_from_basket)
+                2. Партнёр вводит сумму предоплаты (если магазин заплатил заранее)
+                3. Все IN_TRANSIT заказы → ACCEPTED
+                4. Товары переносятся в инвентарь магазина
+                5. Создаётся долг = сумма_заказов - предоплата
+                6. Корзина очищается (заказы переходят в статус ACCEPTED)
+                """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'prepayment_amount': {
+                        'type': 'number',
+                        'default': 0,
+                        'description': 'Сумма предоплаты (если магазин заплатил заранее)',
+                        'example': 5000
+                    }
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Корзина подтверждена, создан долг"),
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Только партнёры"),
+        },
+    )
     @action(detail=True, methods=['post'], url_path='basket/confirm')
     @transaction.atomic
     def confirm_basket(self, request: Request, pk=None) -> Response:
@@ -702,10 +1115,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Параметры
+        # Параметр предоплаты
         prepayment_amount = request.data.get('prepayment_amount', 0)
-        items_to_remove = request.data.get('items_to_remove', [])
-        items_to_modify = request.data.get('items_to_modify', [])
 
         try:
             prepayment_amount = Decimal(str(prepayment_amount))
@@ -733,106 +1144,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        removed_info = []
-        modified_info = []
-
         # =====================================================================
-        # 1. УДАЛЕНИЕ ТОВАРОВ
-        # =====================================================================
-        for product_id in items_to_remove:
-            deleted_items = StoreOrderItem.objects.filter(
-                order__in=orders,
-                product_id=product_id
-            ).select_related('product')
-
-            for item in deleted_items:
-                removed_info.append({
-                    'product_id': product_id,
-                    'product_name': item.product.name,
-                    'quantity': float(item.quantity),
-                    'order_id': item.order_id,
-                })
-                # Возвращаем товар на склад
-                item.product.stock_quantity += item.quantity
-                item.product.save(update_fields=['stock_quantity'])
-
-            deleted_items.delete()
-
-        # =====================================================================
-        # 2. ИЗМЕНЕНИЕ КОЛИЧЕСТВА
-        # =====================================================================
-        for mod in items_to_modify:
-            product_id = mod.get('product_id')
-            new_quantity = mod.get('new_quantity')
-
-            if not product_id or new_quantity is None:
-                continue
-
-            try:
-                new_quantity = Decimal(str(new_quantity))
-            except (ValueError, TypeError):
-                continue
-
-            items = StoreOrderItem.objects.filter(
-                order__in=orders,
-                product_id=product_id
-            ).select_related('product')
-
-            if not items.exists():
-                continue
-
-            current_total = sum(item.quantity for item in items)
-
-            if new_quantity >= current_total:
-                continue  # Нельзя увеличивать
-
-            if new_quantity <= 0:
-                # Удаляем все позиции
-                for item in items:
-                    item.product.stock_quantity += item.quantity
-                    item.product.save(update_fields=['stock_quantity'])
-                    removed_info.append({
-                        'product_id': product_id,
-                        'product_name': item.product.name,
-                        'quantity': float(item.quantity),
-                        'order_id': item.order_id,
-                    })
-                items.delete()
-                continue
-
-            # Уменьшаем количество
-            difference = current_total - new_quantity
-            first_item = items.first()
-            product = first_item.product
-
-            if first_item.quantity >= difference:
-                old_qty = first_item.quantity
-                first_item.quantity -= difference
-                first_item.total = first_item.quantity * first_item.price
-                first_item.save(update_fields=['quantity', 'total'])
-
-                product.stock_quantity += difference
-                product.save(update_fields=['stock_quantity'])
-
-                modified_info.append({
-                    'product_id': product_id,
-                    'product_name': product.name,
-                    'old_quantity': float(old_qty),
-                    'new_quantity': float(first_item.quantity),
-                    'order_id': first_item.order_id,
-                })
-
-        # =====================================================================
-        # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ
-        # =====================================================================
-        for order in orders:
-            order.refresh_from_db()
-            new_total = sum(item.total for item in order.items.all())
-            order.total_amount = new_total
-            order.save(update_fields=['total_amount'])
-
-        # =====================================================================
-        # 4. РАСЧЁТ ОБЩЕЙ СУММЫ И ДОЛГА
+        # 1. РАСЧЁТ ОБЩЕЙ СУММЫ И ДОЛГА
         # =====================================================================
         total_amount = sum(order.total_amount for order in orders)
 
@@ -848,11 +1161,12 @@ class StoreViewSet(viewsets.ModelViewSet):
         total_debt = total_amount - prepayment_amount
 
         # =====================================================================
-        # 5. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
+        # 2. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
         # =====================================================================
         confirmed_orders = []
 
         for order in orders:
+            # Пропорциональное распределение предоплаты
             if total_amount > 0:
                 order_prepayment = (order.total_amount / total_amount) * prepayment_amount
             else:
@@ -904,7 +1218,7 @@ class StoreViewSet(viewsets.ModelViewSet):
             })
 
         # =====================================================================
-        # 6. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
+        # 3. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
         # =====================================================================
         Store.objects.filter(pk=store.pk).update(debt=F('debt') + total_debt)
         store.refresh_from_db()
@@ -919,26 +1233,9 @@ class StoreViewSet(viewsets.ModelViewSet):
                 'debt_created': float(total_debt),
             },
             'store_debt': float(store.debt),
-            'removed_items': removed_info,
-            'modified_items': modified_info,
         })
 
-    @extend_schema(
-        summary="Инвентарь магазина",
-        description="""
-            Получить инвентарь магазина (товары из ACCEPTED заказов).
 
-            Инвентарь = история всех доставленных товаров.
-            Используется для выбора бракованных товаров.
-
-            ВАЖНО: Магазин не видит инвентарь, пока есть заказы в статусе IN_TRANSIT.
-            """,
-        responses={
-            200: StoreInventoryListSerializer(many=True),
-            403: OpenApiResponse(description="Инвентарь недоступен"),
-        },
-
-    )
     @action(detail=True, methods=['get'], url_path='inventory')
     def inventory(self, request: Request, pk=None) -> Response:
         """
