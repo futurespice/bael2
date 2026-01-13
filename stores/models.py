@@ -163,6 +163,16 @@ class Store(models.Model):
         help_text='Используется для поиска'
     )
 
+    # Owner-based доступ (v3.0)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'store'},
+        related_name='owned_stores',
+        verbose_name='Владелец магазина',
+        help_text='v3.0: Пользователь, создавший магазин'
+    )
+
     inn = models.CharField(
         max_length=14,
         validators=[inn_validator],
@@ -291,6 +301,7 @@ class Store(models.Model):
             models.Index(fields=['debt']),
             models.Index(fields=['is_active', 'approval_status']),
             models.Index(fields=['created_at']),
+            models.Index(fields=['owner']),  # v3.0
         ]
 
     def __str__(self) -> str:
@@ -694,3 +705,55 @@ class StoreInventory(models.Model):
 
         if self.quantity == Decimal('0'):
             self.delete()
+
+
+# =============================================================================
+# PARTNER INVENTORY (v3.0)
+# =============================================================================
+
+class PartnerInventory(models.Model):
+    """Склад партнера."""
+    
+    partner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'partner'},
+        related_name='partner_inventory'
+    )
+    
+    product = models.ForeignKey(
+        'products.Product',
+        on_delete=models.PROTECT,
+        related_name='partner_inventory'
+    )
+    
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))]
+    )
+    
+    reserved_quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))]
+    )
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'partner_inventory'
+        unique_together = [['partner', 'product']]
+        indexes = [
+            models.Index(fields=['partner', 'product']),
+        ]
+    
+    def __str__(self):
+        return f"{self.partner.get_full_name()} - {self.product.name}: {self.quantity}"
+    
+    @property
+    def available_quantity(self):
+        return self.quantity - self.reserved_quantity

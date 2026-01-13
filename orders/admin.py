@@ -13,6 +13,8 @@ from .models import (
     DebtPayment,
     DefectiveProduct,
     OrderHistory,
+    PartnerRequest,
+    ReturnedItem,
 )
 
 
@@ -226,3 +228,17 @@ class OrderHistoryAdmin(admin.ModelAdmin):
 # PartnerOrderAdmin - УДАЛЁН (модель PartnerOrder удалена)
 #
 # =============================================================================
+
+
+@admin.register(PartnerRequest)
+class PartnerRequestAdmin(admin.ModelAdmin):
+    list_display = ['id', 'partner', 'product', 'request_type', 'status', 'quantity', 'created_at']
+    list_filter = ['request_type', 'status', 'created_at']
+    search_fields = ['partner__name', 'product__name']
+
+
+@admin.register(ReturnedItem)
+class ReturnedItemAdmin(admin.ModelAdmin):
+    list_display = ['id', 'order', 'product', 'quantity', 'total_amount', 'returned_at']
+    list_filter = ['returned_at']
+    search_fields = ['order__id', 'product__name']

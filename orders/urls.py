@@ -23,6 +23,8 @@ router = DefaultRouter()
 
 # Заказы магазинов (основной workflow)
 router.register(r'store-orders', views.StoreOrderViewSet, basename='store-order')
+router.register(r'partner-requests', views.PartnerRequestViewSet, basename='partner-request')
+router.register(r'returned-items', views.ReturnedItemViewSet, basename='returned-item')
 
 
 urlpatterns = [

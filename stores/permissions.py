@@ -78,3 +78,54 @@ class IsStoreOwnerOrAdmin(permissions.BasePermission):
             return current_store and current_store.id == obj.id
 
         return False
+
+
+class IsStoreOwner(permissions.BasePermission):
+    """
+    Проверка: пользователь является владельцем магазина.
+    
+    v3.0: Используется для update/delete операций.
+    """
+    
+    def has_object_permission(self, request, view, obj):
+        # Админ может всё
+        if request.user.role == 'admin':
+            return True
+        
+        # Владелец магазина может редактировать свой магазин
+        if request.user.role == 'store':
+            return obj.owner == request.user
+        
+        return False
+
+
+class CanAccessStore(permissions.BasePermission):
+    """
+    Проверка: пользователь может видеть магазин.
+    
+    v3.0:
+    - Админ: все магазины
+    - Store: только свои магазины
+    - Partner: магазины, с которыми работает
+    """
+    
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        
+        # Админ видит всё
+        if user.role == 'admin':
+            return True
+        
+        # Владелец видит свой магазин
+        if user.role == 'store' and obj.owner == user:
+            return True
+        
+        # Партнер видит магазины, с которыми работает
+        if user.role == 'partner':
+            from orders.models import StoreOrder
+            return StoreOrder.objects.filter(
+                partner=user,
+                store=obj
+            ).exists()
+        
+        return False

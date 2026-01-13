@@ -597,3 +597,147 @@ class ReportService:
             day_data['status_history'] = status_history_list
 
         return history
+
+
+# =============================================================================
+# PARTNER STATISTICS SERVICE (v3.0)
+# =============================================================================
+
+class PartnerStatisticsService:
+    """Сервис для расчета статистики партнера."""
+    
+    @staticmethod
+    def calculate_statistics(
+        partner_id: int,
+        period: str = 'month',
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """
+        Рассчитать статистику партнера.
+        
+        Args:
+            partner_id: ID партнера
+            period: Период (day/week/month/half_year/year/all_time)
+            date_from: Начальная дата (опционально)
+            date_to: Конечная дата (опционально)
+        """
+        from orders.models import PartnerRequest, PartnerRequestStatus
+        from stores.models import PartnerInventory
+        
+        # Определить диапазон дат
+        if not date_from or not date_to:
+            date_from, date_to = PartnerStatisticsService._get_date_range(period)
+        
+        # 1. Запрошено у админа
+        requested_from_admin = PartnerRequest.objects.filter(
+            partner_id=partner_id,
+            request_type='request',
+            status=PartnerRequestStatus.APPROVED,
+            created_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum(F('quantity') * F('product__price'))
+        )['total'] or Decimal('0')
+        
+        # 2. Продано магазинам
+        sold_to_stores = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            status=StoreOrderStatus.ACCEPTED,
+            confirmed_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum('total_amount')
+        )['total'] or Decimal('0')
+        
+        # 3. Остаток товара в инвентаре
+        inventory = PartnerInventory.objects.filter(
+            partner_id=partner_id
+        ).select_related('product')
+        
+        inventory_balance = sum(
+            (item.quantity * item.product.price) for item in inventory
+        )
+        
+        # 4. Расходы партнера
+        expenses = PartnerExpense.objects.filter(
+            partner_id=partner_id,
+            created_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum('amount')
+        )['total'] or Decimal('0')
+        
+        # 5. Брак
+        defective = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            status=StoreOrderStatus.ACCEPTED,
+            confirmed_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum('defective_items__total_amount')
+        )['total'] or Decimal('0')
+        
+        # 6. Бонус (количество)
+        bonus = 0  # TODO: Уточнить логику подсчета бонусов партнера
+        
+        # 7. Долг (непогашенный)
+        unpaid_debt = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            status=StoreOrderStatus.ACCEPTED
+        ).aggregate(
+            total=Sum(F('debt_amount') - F('paid_amount'))
+        )['total'] or Decimal('0')
+        
+        # 8. Погашенный долг
+        paid_debt = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            confirmed_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum('paid_amount')
+        )['total'] or Decimal('0')
+        
+        # 9. Общая сумма (прибыль)
+        total_profit = sold_to_stores - expenses - defective
+        
+        # 10. Итого
+        grand_total = total_profit + paid_debt - unpaid_debt
+        
+        return {
+            'requested_from_admin': requested_from_admin,
+            'sold_to_stores': sold_to_stores,
+            'inventory_balance': inventory_balance,
+            'expenses': expenses,
+            'defective': defective,
+            'bonus': bonus,
+            'unpaid_debt': unpaid_debt,
+            'paid_debt': paid_debt,
+            'total_profit': total_profit,
+            'grand_total': grand_total,
+            'period': period,
+            'date_from': date_from.date() if date_from else None,
+            'date_to': date_to.date() if date_to else None,
+        }
+    
+    @staticmethod
+    def _get_date_range(period: str) -> tuple:
+        """Получить диапазон дат для периода."""
+        now = timezone.now()
+        
+        if period == 'day':
+            date_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            date_to = now
+        elif period == 'week':
+            date_from = now - timedelta(days=7)
+            date_to = now
+        elif period == 'month':
+            date_from = now - timedelta(days=30)
+            date_to = now
+        elif period == 'half_year':
+            date_from = now - timedelta(days=180)
+            date_to = now
+        elif period == 'year':
+            date_from = now - timedelta(days=365)
+            date_to = now
+        else:  # all_time
+            # Фиксированная дата начала для "все время"
+            date_from = timezone.datetime(2020, 1, 1, tzinfo=timezone.get_current_timezone())
+            date_to = now
+        
+        return date_from, date_to

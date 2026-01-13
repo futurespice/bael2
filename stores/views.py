@@ -51,7 +51,7 @@ from django.utils import timezone
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
 from drf_spectacular.types import OpenApiTypes
 
-from .permissions import IsPartner
+from .permissions import IsPartner, IsStoreOwner, CanAccessStore
 
 from .models import (
     Region,
@@ -248,6 +248,23 @@ class StoreViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     pagination_class = StandardPagination
 
+    def get_permissions(self):
+        """
+        Определить permissions в зависимости от действия.
+        
+        v3.0:
+        - create: IsAuthenticated
+        - update/destroy: IsStoreOwner
+        - retrieve/list: CanAccessStore
+        """
+        if self.action == 'create':
+            return [IsAuthenticated()]
+        elif self.action in ['update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsStoreOwner()]
+        elif self.action in ['retrieve', 'list']:
+            return [IsAuthenticated(), CanAccessStore()]
+        return [IsAuthenticated()]
+
     def get_queryset(self) -> QuerySet[Store]:
         """
         Получение списка магазинов в зависимости от роли.
@@ -267,17 +284,17 @@ class StoreViewSet(viewsets.ModelViewSet):
         if user.role == 'admin':
             queryset = Store.objects.all()
 
-        elif user.role == 'partner':
-            queryset = Store.objects.filter(
-                approval_status=Store.ApprovalStatus.APPROVED,
-                is_active=True
-            )
-
         elif user.role == 'store':
-            queryset = Store.objects.filter(
-                approval_status=Store.ApprovalStatus.APPROVED,
-                is_active=True
-            )
+            # 🔴 v3.0: Пользователь видит только СВОИ магазины
+            queryset = Store.objects.filter(owner=user)
+
+        elif user.role == 'partner':
+            # Партнер видит магазины, с которыми работает (через заказы)
+            from orders.models import StoreOrder
+            store_ids = StoreOrder.objects.filter(
+                partner=user
+            ).values_list('store_id', flat=True).distinct()
+            queryset = Store.objects.filter(id__in=store_ids)
 
         else:
             queryset = Store.objects.none()
@@ -1755,3 +1772,26 @@ def get_users_in_store(request: Request, pk: int) -> Response:
         'users_count': len(users_data),
         'users': users_data
     })
+
+
+# =============================================================================
+# PARTNER INVENTORY (v3.0)
+# =============================================================================
+
+class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
+    
+    def get_serializer_class(self):
+        from .serializers import PartnerInventorySerializer
+        return PartnerInventorySerializer
+    
+    def get_queryset(self):
+        from .models import PartnerInventory
+        queryset = PartnerInventory.objects.select_related('partner', 'product')
+        
+        if self.request.user.role == 'admin':
+            return queryset
+        elif self.request.user.role == 'partner':
+            return queryset.filter(partner=self.request.user)
+        return queryset.none()

@@ -106,3 +106,69 @@ class StatisticsSerializer(serializers.Serializer):
     # Вычисляемые
     total_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
     profit = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+# =============================================================================
+# PARTNER STATISTICS (v3.0)
+# =============================================================================
+
+class PartnerStatisticsSerializer(serializers.Serializer):
+    """Статистика партнера (10 показателей)."""
+    
+    requested_from_admin = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Сумма запрошенных товаров'
+    )
+    sold_to_stores = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Сумма проданных товаров'
+    )
+    inventory_balance = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Стоимость товаров в инвентаре'
+    )
+    expenses = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Сумма расходов партнера'
+    )
+    defective = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Сумма бракованных товаров'
+    )
+    bonus = serializers.IntegerField(help_text='Количество бонусных товаров')
+    unpaid_debt = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Непогашенный долг магазинов'
+    )
+    paid_debt = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Погашенный долг'
+    )
+    total_profit = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Прибыль: продано - расходы - брак'
+    )
+    grand_total = serializers.DecimalField(
+        max_digits=14, decimal_places=2, help_text='Итоговый баланс'
+    )
+    period = serializers.CharField(help_text='Период статистики')
+    date_from = serializers.DateField(allow_null=True)
+    date_to = serializers.DateField(allow_null=True)
+
+
+class PartnerProfileSerializer(serializers.Serializer):
+    """Профиль партнера."""
+    
+    date = serializers.DateField()
+    store_name = serializers.CharField()
+    store_inn = serializers.CharField()
+    product = serializers.CharField()
+    price = serializers.DecimalField(max_digits=12, decimal_places=2)
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3)
+    total_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class PartnerTrackerSerializer(serializers.Serializer):
+    """Трекер заказов партнера."""
+    
+    order_id = serializers.IntegerField()
+    store_name = serializers.CharField()
+    status = serializers.CharField()
+    status_display = serializers.CharField()
+    total_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    debt_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    paid_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    created_at = serializers.DateTimeField()
+    confirmed_at = serializers.DateTimeField(allow_null=True)

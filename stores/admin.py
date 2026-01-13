@@ -5,7 +5,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 from django.db.models import Sum
 
-from .models import Region, City, Store, StoreSelection, StoreInventory
+from .models import Region, City, Store, StoreSelection, StoreInventory, PartnerInventory
 
 
 @admin.register(Region)
@@ -359,3 +359,10 @@ class StoreInventoryAdmin(admin.ModelAdmin):
         # ИСПРАВЛЕНО
         price_formatted = f'{obj.total_price:.2f}'
         return format_html('{} сом', price_formatted)
+
+
+@admin.register(PartnerInventory)
+class PartnerInventoryAdmin(admin.ModelAdmin):
+    list_display = ['id', 'partner', 'product', 'quantity', 'reserved_quantity']
+    list_filter = ['partner', 'created_at']
+    search_fields = ['partner__name', 'product__name']

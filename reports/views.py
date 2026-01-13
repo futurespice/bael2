@@ -132,3 +132,129 @@ def get_store_history(request: Request, store_id: int) -> Response:
     )
 
     return Response(history)
+
+
+# =============================================================================
+# PARTNER STATISTICS (v3.0)
+# =============================================================================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def partner_statistics(request: Request) -> Response:
+    """
+    Статистика партнера (10 показателей).
+    
+    GET /api/reports/partner-statistics/
+    
+    Query params:
+    - period: day/week/month/half_year/year/all_time (default: month)
+    - partner_id: ID партнера (только для админа)
+    - date_from: YYYY-MM-DD (опционально)
+    - date_to: YYYY-MM-DD (опционально)
+    """
+    from .services import PartnerStatisticsService
+    from .serializers import PartnerStatisticsSerializer
+    from datetime import datetime
+    
+    user = request.user
+    
+    # Определить партнера
+    if user.role == 'admin':
+        partner_id = request.query_params.get('partner_id')
+        if not partner_id:
+            return Response({'detail': 'Для админа требуется параметр partner_id'}, status=400)
+    elif user.role == 'partner':
+        partner_id = user.id
+    else:
+        return Response({'detail': 'Доступ запрещен'}, status=403)
+    
+    # Получить параметры
+    period = request.query_params.get('period', 'month')
+    date_from_str = request.query_params.get('date_from')
+    date_to_str = request.query_params.get('date_to')
+    
+    date_from = None
+    date_to = None
+    
+    try:
+        if date_from_str:
+            date_from = datetime.strptime(date_from_str, '%Y-%m-%d')
+        if date_to_str:
+            date_to = datetime.strptime(date_to_str, '%Y-%m-%d')
+    except ValueError:
+        return Response({'detail': 'Некорректный формат даты (YYYY-MM-DD)'}, status=400)
+    
+    # Расчет статистики
+    stats = PartnerStatisticsService.calculate_statistics(
+        partner_id=partner_id,
+        period=period,
+        date_from=date_from,
+        date_to=date_to
+    )
+    
+    serializer = PartnerStatisticsSerializer(stats)
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def partner_profile(request: Request) -> Response:
+    """
+    Профиль партнера (детали продаж).
+    
+    GET /api/reports/partner-profile/
+    """
+    from .serializers import PartnerProfileSerializer
+    
+    if request.user.role != 'partner':
+        return Response({'detail': 'Только для партнеров'}, status=403)
+    
+    # TODO: Реализовать логику
+    data = []
+    
+    serializer = PartnerProfileSerializer(data, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def partner_tracker(request: Request) -> Response:
+    """
+    Трекер заказов партнера.
+    
+    GET /api/reports/partner-tracker/
+    """
+    from orders.models import StoreOrder
+    from .serializers import PartnerTrackerSerializer
+    
+    if request.user.role != 'partner':
+        return Response({'detail': 'Только для партнеров'}, status=403)
+    
+    queryset = StoreOrder.objects.filter(partner=request.user).select_related('store')
+    
+    # Фильтры
+    status_filter = request.query_params.get('status')
+    if status_filter:
+        queryset = queryset.filter(status=status_filter)
+    
+    store_id = request.query_params.get('store_id')
+    if store_id:
+        queryset = queryset.filter(store_id=store_id)
+    
+    data = [
+        {
+            'order_id': order.id,
+            'store_name': order.store.name,
+            'status': order.status,
+            'status_display': order.get_status_display(),
+            'total_amount': order.total_amount,
+            'debt_amount': order.debt_amount,
+            'paid_amount': order.paid_amount,
+            'created_at': order.created_at,
+            'confirmed_at': order.confirmed_at,
+        }
+        for order in queryset
+    ]
+    
+    serializer = PartnerTrackerSerializer(data, many=True)
+    return Response(serializer.data)

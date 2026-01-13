@@ -163,6 +163,7 @@ class StoreSerializer(serializers.ModelSerializer):
             'id',
             'name',
             'inn',
+            'owner',  # v3.0
             'owner_name',
             'phone',
             'region',
@@ -278,6 +279,17 @@ class StoreCreateSerializer(serializers.ModelSerializer):
             })
 
         return attrs
+
+    def create(self, validated_data):
+        """
+        Создание магазина с автоматической установкой owner (v3.0).
+        """
+        # 🔴 v3.0: Автоматически устанавливаем owner = текущий пользователь
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            validated_data['owner'] = request.user
+            
+        return super().create(validated_data)
 
 
 class StoreUpdateSerializer(serializers.ModelSerializer):
@@ -1017,3 +1029,23 @@ class ReportDefectResponseSerializer(serializers.Serializer):
     message = serializers.CharField()
     defect = DefectInfoSerializer()
     store_debt = serializers.FloatField()
+
+
+# =============================================================================
+# PARTNER INVENTORY (v3.0)
+# =============================================================================
+
+class PartnerInventorySerializer(serializers.ModelSerializer):
+    partner_name = serializers.CharField(source='partner.get_full_name', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    available_quantity = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True)
+    
+    class Meta:
+        from stores.models import PartnerInventory
+        model = PartnerInventory
+        fields = [
+            'id', 'partner', 'partner_name', 'product', 'product_name',
+            'quantity', 'reserved_quantity', 'available_quantity',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']

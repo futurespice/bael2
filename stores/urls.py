@@ -19,6 +19,7 @@ router = DefaultRouter()
 router.register(r'regions', views.RegionViewSet, basename='region')
 router.register(r'cities', views.CityViewSet, basename='city')
 router.register(r'stores', views.StoreViewSet, basename='store')
+router.register(r'partner-inventory', views.PartnerInventoryViewSet, basename='partner-inventory')
 
 # URL patterns
 urlpatterns = [

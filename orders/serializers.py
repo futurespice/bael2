@@ -159,6 +159,7 @@ class StoreOrderListSerializer(serializers.ModelSerializer):
             'store_phone',
             'status',
             'status_display',
+            'order_type',  # v3.0
             'total_amount',
             'items_summary',
             'piece_count',
@@ -269,6 +270,12 @@ class StoreOrderDetailSerializer(serializers.ModelSerializer):
         source='get_status_display',
         read_only=True
     )
+    
+    # Тип заказа (v3.0)
+    order_type_display = serializers.CharField(
+        source='get_order_type_display',
+        read_only=True
+    )
 
     # Товары
     items = StoreOrderItemSerializer(many=True, read_only=True)
@@ -304,6 +311,9 @@ class StoreOrderDetailSerializer(serializers.ModelSerializer):
             # Статус
             'status',
             'status_display',
+            # Тип заказа (v3.0)
+            'order_type',
+            'order_type_display',
             # Товары
             'items',
             'items_summary',
@@ -876,3 +886,55 @@ class OrderHistorySerializer(serializers.ModelSerializer):
 
 # Оставляем старый StoreOrderForStoreSerializer как алиас
 StoreOrderForStoreSerializer = StoreOrderForStoreListSerializer
+
+
+# =============================================================================
+# PARTNER REQUEST (v3.0)
+# =============================================================================
+
+class PartnerRequestSerializer(serializers.ModelSerializer):
+    partner_name = serializers.CharField(source='partner.get_full_name', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    
+    class Meta:
+        from .models import PartnerRequest
+        model = PartnerRequest
+        fields = [
+            'id', 'partner', 'partner_name', 'product', 'product_name',
+            'request_type', 'status', 'status_display', 'quantity', 'reason',
+            'reviewed_by', 'reviewed_at', 'rejection_reason',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['partner', 'status', 'reviewed_by', 'reviewed_at', 'created_at', 'updated_at']
+    
+    def create(self, validated_data):
+        validated_data['partner'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class PartnerRequestApproveSerializer(serializers.Serializer):
+    pass
+
+
+class PartnerRequestRejectSerializer(serializers.Serializer):
+    rejection_reason = serializers.CharField(required=False, allow_blank=True)
+
+
+# =============================================================================
+# RETURNED ITEMS (v3.0)
+# =============================================================================
+
+class ReturnedItemSerializer(serializers.ModelSerializer):
+    order_number = serializers.CharField(source='order.id', read_only=True)
+    store_name = serializers.CharField(source='order.store.name', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    
+    class Meta:
+        from .models import ReturnedItem
+        model = ReturnedItem
+        fields = [
+            'id', 'order', 'order_number', 'store_name', 'product', 'product_name',
+            'quantity', 'price_at_return', 'total_amount', 'reason',
+            'returned_by', 'returned_at'
+        ]

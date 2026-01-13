@@ -150,6 +150,7 @@ class StoreService:
             latitude=data.latitude,
             longitude=data.longitude,
             created_by=created_by,
+            owner=created_by,  # v3.0: Owner обязателен
             approval_status=Store.ApprovalStatus.APPROVED  # ✅ Было PENDING
         )
 
@@ -430,7 +431,18 @@ class StoreSelectionService:
         Returns:
             Store или None
         """
-        return StoreSelection.get_current_store_for_user(user)
+        try:
+            selection = StoreSelection.objects.select_related('store').get(user=user)
+            
+            # 🔴 v3.0: Дополнительная проверка владельца
+            if selection.store.owner != user:
+                # Владелец изменился - сбросить выбор
+                selection.delete()
+                return None
+            
+            return selection.store
+        except StoreSelection.DoesNotExist:
+            return None
 
     @classmethod
     @transaction.atomic
@@ -462,6 +474,10 @@ class StoreSelectionService:
             store = Store.objects.get(pk=store_id)
         except Store.DoesNotExist:
             raise ValidationError(f'Магазин с ID {store_id} не найден')
+        
+        # 🔴 v3.0: Проверка владельца
+        if store.owner != user:
+            raise ValidationError("Вы не являетесь владельцем этого магазина")
 
         # Проверка доступности магазина
         store.check_can_interact()
@@ -498,9 +514,13 @@ class StoreSelectionService:
         Returns:
             QuerySet магазинов (одобренные и активные)
         """
+        if user.role != 'store':
+            return Store.objects.none()
+        
+        # 🔴 v3.0: Только магазины, где user является owner
         return Store.objects.filter(
-            approval_status=Store.ApprovalStatus.APPROVED,
-            is_active=True
+            owner=user,
+            approval_status=Store.ApprovalStatus.APPROVED
         ).select_related('region', 'city').order_by('name')
 
     @classmethod

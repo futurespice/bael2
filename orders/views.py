@@ -180,6 +180,11 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         if store_id and request.user.role == 'admin':
             queryset = queryset.filter(store_id=store_id)
 
+        # Фильтрация по типу заказа (v3.0)
+        order_type = request.query_params.get('order_type')
+        if order_type:
+            queryset = queryset.filter(order_type=order_type)
+
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
@@ -571,3 +576,95 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
             'success': True,
             'message': f'Заказ #{order_id} от магазина "{store_name}" удалён'
         })
+
+
+# =============================================================================
+# PARTNER REQUEST (v3.0)
+# =============================================================================
+
+class PartnerRequestViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
+    
+    def get_queryset(self):
+        from .models import PartnerRequest
+        queryset = PartnerRequest.objects.select_related('partner', 'product', 'reviewed_by')
+        
+        if self.request.user.role == 'admin':
+            return queryset
+        elif self.request.user.role == 'partner':
+            return queryset.filter(partner=self.request.user)
+        return queryset.none()
+    
+    def get_serializer_class(self):
+        from .serializers import (
+            PartnerRequestSerializer,
+            PartnerRequestApproveSerializer,
+            PartnerRequestRejectSerializer,
+        )
+        if self.action == 'approve':
+            return PartnerRequestApproveSerializer
+        elif self.action == 'reject':
+            return PartnerRequestRejectSerializer
+        return PartnerRequestSerializer
+    
+    def get_permissions(self):
+        if self.action in ['approve', 'reject']:
+            return [IsAuthenticated(), IsAdmin()]
+        elif self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsPartner()]
+        return [IsAuthenticated()]
+    
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        from django.utils import timezone
+        from .models import PartnerRequestStatus
+        from .serializers import PartnerRequestSerializer
+        
+        obj = self.get_object()
+        obj.status = PartnerRequestStatus.APPROVED
+        obj.reviewed_by = request.user
+        obj.reviewed_at = timezone.now()
+        obj.save()
+        return Response(PartnerRequestSerializer(obj).data)
+    
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        from django.utils import timezone
+        from .models import PartnerRequestStatus
+        from .serializers import PartnerRequestSerializer
+        
+        obj = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        obj.status = PartnerRequestStatus.REJECTED
+        obj.reviewed_by = request.user
+        obj.reviewed_at = timezone.now()
+        obj.rejection_reason = serializer.validated_data.get('rejection_reason', '')
+        obj.save()
+        
+        return Response(PartnerRequestSerializer(obj).data)
+
+
+# =============================================================================
+# RETURNED ITEMS (v3.0)
+# =============================================================================
+
+class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
+    
+    def get_serializer_class(self):
+        from .serializers import ReturnedItemSerializer
+        return ReturnedItemSerializer
+    
+    def get_queryset(self):
+        from .models import ReturnedItem
+        queryset = ReturnedItem.objects.select_related('order', 'order__store', 'product')
+        
+        if self.request.user.role == 'admin':
+            return queryset
+        elif self.request.user.role == 'partner':
+            return queryset.filter(order__partner=self.request.user)
+        return queryset.none()

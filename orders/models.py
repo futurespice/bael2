@@ -35,6 +35,97 @@ from stores.models import Store
 
 
 # =============================================================================
+# PARTNER REQUEST (v3.0)
+# =============================================================================
+
+class PartnerRequestType(models.TextChoices):
+    REQUEST = 'request', 'Запрос товара'
+    RETURN = 'return', 'Возврат товара'
+
+
+class PartnerRequestStatus(models.TextChoices):
+    PENDING = 'pending', 'Ожидает'
+    APPROVED = 'approved', 'Одобрено'
+    REJECTED = 'rejected', 'Отклонено'
+
+
+class PartnerRequest(models.Model):
+    """Запросы партнера на товары."""
+    
+    partner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role': 'partner'},
+        related_name='product_requests'
+    )
+    
+    product = models.ForeignKey(
+        'products.Product',
+        on_delete=models.PROTECT,
+        related_name='partner_requests'
+    )
+    
+    request_type = models.CharField(
+        max_length=10,
+        choices=PartnerRequestType.choices
+    )
+    
+    status = models.CharField(
+        max_length=10,
+        choices=PartnerRequestStatus.choices,
+        default=PartnerRequestStatus.PENDING,
+        db_index=True
+    )
+    
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal('0.001'))]
+    )
+    
+    reason = models.TextField(blank=True)
+    
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reviewed_partner_requests'
+    )
+    
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'partner_requests'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['partner', 'status']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+    
+    def __str__(self):
+        return f"{self.get_request_type_display()}: {self.product.name} - {self.get_status_display()}"
+    
+    @property
+    def is_pending(self):
+        return self.status == PartnerRequestStatus.PENDING
+
+
+# =============================================================================
+# ТИПЫ ЗАКАЗОВ (v3.0)
+# =============================================================================
+
+class StoreOrderType(models.TextChoices):
+    """Типы заказов v3.0."""
+    PREORDER = 'preorder', 'Предзаказ'
+    MANUAL = 'manual', 'Ручной сбор'
+
+
+# =============================================================================
 # СТАТУСЫ ЗАКАЗОВ
 # =============================================================================
 
@@ -176,6 +267,15 @@ class StoreOrder(models.Model):
         choices=StoreOrderStatus.choices,
         default=StoreOrderStatus.PENDING,
         verbose_name='Статус'
+    )
+
+    # Тип заказа (v3.0)
+    order_type = models.CharField(
+        max_length=10,
+        choices=StoreOrderType.choices,
+        default=StoreOrderType.PREORDER,
+        verbose_name='Тип заказа',
+        help_text='Предзаказ или ручной сбор партнёром'
     )
 
     # Суммы
@@ -413,6 +513,70 @@ class StoreOrderItem(models.Model):
         else:
             self.total = (self.price or Decimal('0')) * (self.quantity or Decimal('0'))
 
+        super().save(*args, **kwargs)
+
+
+# =============================================================================
+# RETURNED ITEMS (v3.0)
+# =============================================================================
+
+class ReturnedItem(models.Model):
+    """Возвращенные товары из заказов."""
+    
+    order = models.ForeignKey(
+        'StoreOrder',
+        on_delete=models.CASCADE,
+        related_name='returned_items'
+    )
+    
+    product = models.ForeignKey(
+        'products.Product',
+        on_delete=models.PROTECT,
+        related_name='returned_items'
+    )
+    
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal('0.001'))]
+    )
+    
+    price_at_return = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0'))]
+    )
+    
+    total_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0'))]
+    )
+    
+    reason = models.TextField(blank=True)
+    
+    returned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='returned_items'
+    )
+    
+    returned_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'returned_items'
+        ordering = ['-returned_at']
+        indexes = [
+            models.Index(fields=['order', 'product']),
+        ]
+    
+    def __str__(self):
+        return f"Возврат: {self.product.name} ({self.quantity}) из заказа #{self.order.id}"
+    
+    def save(self, *args, **kwargs):
+        self.total_amount = self.quantity * self.price_at_return
         super().save(*args, **kwargs)
 
 
