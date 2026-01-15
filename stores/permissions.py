@@ -1,6 +1,6 @@
 # apps/stores/permissions.py
 """
-Пермишены для stores согласно ТЗ v2.0.
+Пермишены для stores согласно ТЗ v2.0 + v3.0.
 """
 
 from rest_framework import permissions
@@ -127,5 +127,38 @@ class CanAccessStore(permissions.BasePermission):
                 partner=user,
                 store=obj
             ).exists()
+        
+        return False
+
+
+class CanAccessPartnerInventory(permissions.BasePermission):
+    """
+    Проверка: партнёр может видеть только свой инвентарь.
+    
+    v3.0: Защита от доступа к чужому инвентарю.
+    """
+    
+    def has_permission(self, request, view):
+        """Только партнёры имеют инвентарь."""
+        return (
+            request.user and
+            request.user.is_authenticated and
+            request.user.role == 'partner'
+        )
+    
+    def has_object_permission(self, request, view, obj):
+        """
+        Проверка владения инвентарём.
+        
+        Args:
+            obj: PartnerInventory instance
+        """
+        # Админ может видеть всё
+        if request.user.role == 'admin':
+            return True
+        
+        # Партнёр видит только свой инвентарь
+        if request.user.role == 'partner':
+            return obj.partner == request.user
         
         return False

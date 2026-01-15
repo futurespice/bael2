@@ -22,19 +22,20 @@ from decimal import Decimal
 from typing import Any
 
 from django.db.models import QuerySet
+from drf_spectacular.types import OpenApiTypes
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
-
+from drf_spectacular.utils import extend_schema_view, extend_schema, OpenApiParameter, OpenApiResponse
 from stores.models import Store
 from stores.services import StoreSelectionService
-
+from django.core.exceptions import ValidationError
 from .models import (
     StoreOrder,
-    StoreOrderStatus,
+    StoreOrderStatus, PartnerRequestStatus, PartnerRequest, ReturnedItem,
 )
 from .serializers import (
     # Админ
@@ -47,13 +48,16 @@ from .serializers import (
     StoreOrderCreateSerializer,
     # Actions
     OrderApproveSerializer,
-    OrderRejectSerializer,
+    OrderRejectSerializer, PartnerRequestSerializer, PartnerRequestListSerializer, PartnerRequestCreateSerializer,
+    RejectRequestSerializer, ApproveRequestSerializer, ManualOrderSerializer, ManualOrderCreateSerializer,
+    ManualOrderListSerializer,ReturnedItemListSerializer, ReturnedItemSerializer
 )
 from .services import (
     OrderWorkflowService,
-    OrderItemData,
+    OrderItemData, PartnerRequestService, ManualOrderService,
 )
 from .permissions import IsAdmin, IsPartner, IsStore
+from .filters import ReturnedItemFilter
 
 
 # =============================================================================
@@ -582,69 +586,156 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
 # PARTNER REQUEST (v3.0)
 # =============================================================================
 
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список запросов партнёра",
+        description="Получить все запросы текущего партнёра",
+        tags=['Partners v3.0'],
+        parameters=[
+            OpenApiParameter('request_type', str, description='Фильтр по типу: request/return'),
+            OpenApiParameter('status', str, description='Фильтр по статусу: pending/approved/rejected')
+        ]
+    ),
+    create=extend_schema(
+        summary="Создать запрос",
+        description="Создать новый запрос товаров или возврат",
+        tags=['Partners v3.0'],
+        request=PartnerRequestCreateSerializer
+    ),
+    retrieve=extend_schema(
+        summary="Детали запроса",
+        tags=['Partners v3.0']
+    ),
+    partial_update=extend_schema(
+        summary="Обновить запрос",
+        description="Обновить запрос (только pending)",
+        tags=['Partners v3.0']
+    ),
+    destroy=extend_schema(
+        summary="Отменить запрос",
+        description="Отменить запрос (только pending)",
+        tags=['Partners v3.0']
+    )
+)
 class PartnerRequestViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
-    pagination_class = StandardPagination
-    
+    """
+    ViewSet для управления запросами партнёра (v3.0).
+
+    Workflow REQUEST (запрос товаров):
+    1. Партнёр создаёт запрос → статус PENDING
+    2. Админ одобряет → товары добавляются в PartnerInventory
+    3. Статус → APPROVED
+
+    Workflow RETURN (возврат товаров):
+    1. Партнёр создаёт запрос → резервирование в PartnerInventory
+    2. Админ одобряет → товары возвращаются на склад админа
+    3. Статус → APPROVED
+
+    Permissions:
+    - Только партнёры (IsPartner)
+    - Каждый партнёр видит только свои запросы
+    """
+
+    permission_classes = [IsAuthenticated, IsPartner]
+
     def get_queryset(self):
-        from .models import PartnerRequest
-        queryset = PartnerRequest.objects.select_related('partner', 'product', 'reviewed_by')
-        
-        if self.request.user.role == 'admin':
-            return queryset
-        elif self.request.user.role == 'partner':
-            return queryset.filter(partner=self.request.user)
-        return queryset.none()
-    
+        """Получить запросы ТОЛЬКО текущего партнёра."""
+        queryset = PartnerRequest.objects.filter(
+            partner=self.request.user
+        ).prefetch_related('items__product').order_by('-created_at')
+
+        # Фильтр по типу
+        request_type = self.request.query_params.get('request_type')
+        if request_type in ['request', 'return']:
+            queryset = queryset.filter(request_type=request_type)
+
+        # Фильтр по статусу
+        status_param = self.request.query_params.get('status')
+        if status_param in ['pending', 'approved', 'rejected']:
+            queryset = queryset.filter(status=status_param)
+
+        return queryset
+
     def get_serializer_class(self):
-        from .serializers import (
-            PartnerRequestSerializer,
-            PartnerRequestApproveSerializer,
-            PartnerRequestRejectSerializer,
-        )
-        if self.action == 'approve':
-            return PartnerRequestApproveSerializer
-        elif self.action == 'reject':
-            return PartnerRequestRejectSerializer
+        """Выбрать сериализатор."""
+        if self.action == 'list':
+            return PartnerRequestListSerializer
+        elif self.action == 'create':
+            return PartnerRequestCreateSerializer
         return PartnerRequestSerializer
-    
-    def get_permissions(self):
-        if self.action in ['approve', 'reject']:
-            return [IsAuthenticated(), IsAdmin()]
-        elif self.action in ['create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsPartner()]
-        return [IsAuthenticated()]
-    
-    @action(detail=True, methods=['post'])
-    def approve(self, request, pk=None):
-        from django.utils import timezone
-        from .models import PartnerRequestStatus
-        from .serializers import PartnerRequestSerializer
-        
-        obj = self.get_object()
-        obj.status = PartnerRequestStatus.APPROVED
-        obj.reviewed_by = request.user
-        obj.reviewed_at = timezone.now()
-        obj.save()
-        return Response(PartnerRequestSerializer(obj).data)
-    
-    @action(detail=True, methods=['post'])
-    def reject(self, request, pk=None):
-        from django.utils import timezone
-        from .models import PartnerRequestStatus
-        from .serializers import PartnerRequestSerializer
-        
-        obj = self.get_object()
-        serializer = self.get_serializer(data=request.data)
+
+    def create(self, request: Request) -> Response:
+        """Создать новый запрос партнёра."""
+        serializer = PartnerRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
-        obj.status = PartnerRequestStatus.REJECTED
-        obj.reviewed_by = request.user
-        obj.reviewed_at = timezone.now()
-        obj.rejection_reason = serializer.validated_data.get('rejection_reason', '')
-        obj.save()
-        
-        return Response(PartnerRequestSerializer(obj).data)
+
+        try:
+            partner_request = PartnerRequestService.create_request(
+                partner=request.user,
+                request_type=serializer.validated_data['request_type'],
+                items=serializer.validated_data['items'],
+                notes=serializer.validated_data.get('notes', '')
+            )
+
+            return Response(
+                {
+                    'message': 'Запрос успешно создан',
+                    'request': PartnerRequestSerializer(partner_request).data
+                },
+                status=status.HTTP_201_CREATED
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    def update(self, request: Request, pk=None) -> Response:
+        """Обновление запроса запрещено (используйте partial_update)."""
+        return Response(
+            {'error': 'Используйте PATCH для обновления'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    def partial_update(self, request: Request, pk=None) -> Response:
+        """Обновить запрос (только pending)."""
+        partner_request = self.get_object()
+
+        if partner_request.status != PartnerRequestStatus.PENDING:
+            return Response(
+                {'error': 'Можно обновить только запросы со статусом PENDING'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Обновить notes
+        notes = request.data.get('notes')
+        if notes is not None:
+            partner_request.notes = notes
+            partner_request.save(update_fields=['notes', 'updated_at'])
+
+        return Response(
+            PartnerRequestSerializer(partner_request).data,
+            status=status.HTTP_200_OK
+        )
+
+    def destroy(self, request: Request, pk=None) -> Response:
+        """Отменить запрос (только pending)."""
+        partner_request = self.get_object()
+
+        try:
+            PartnerRequestService.cancel_request(partner_request)
+
+            return Response(
+                {'message': 'Запрос успешно отменён'},
+                status=status.HTTP_204_NO_CONTENT
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 
 # =============================================================================
@@ -668,3 +759,513 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
         elif self.request.user.role == 'partner':
             return queryset.filter(order__partner=self.request.user)
         return queryset.none()
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список всех запросов партнёров",
+        description="Админ видит все запросы от всех партнёров",
+        tags=['Admin v3.0'],
+        parameters=[
+            OpenApiParameter('partner', int, description='Фильтр по ID партнёра'),
+            OpenApiParameter('request_type', str, description='Фильтр по типу'),
+            OpenApiParameter('status', str, description='Фильтр по статусу')
+        ]
+    ),
+    retrieve=extend_schema(
+        summary="Детали запроса",
+        tags=['Admin v3.0']
+    ),
+    approve=extend_schema(
+        summary="Одобрить запрос",
+        description="Одобрить запрос партнёра (товары → PartnerInventory)",
+        tags=['Admin v3.0'],
+        request=ApproveRequestSerializer
+    ),
+    reject=extend_schema(
+        summary="Отклонить запрос",
+        tags=['Admin v3.0'],
+        request=RejectRequestSerializer
+    )
+)
+class PartnerRequestAdminViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для управления запросами партнёров (админ).
+
+    Админ может:
+    - Просматривать все запросы от всех партнёров
+    - Одобрять запросы (товары → PartnerInventory)
+    - Отклонять запросы с указанием причины
+
+    Permissions:
+    - Только админы (IsAdmin)
+    """
+
+    permission_classes = [IsAuthenticated, IsAdmin]
+    serializer_class = PartnerRequestSerializer
+
+    def get_queryset(self):
+        """Получить все запросы."""
+        queryset = PartnerRequest.objects.all().select_related(
+            'partner'
+        ).prefetch_related('items__product').order_by('-created_at')
+
+        # Фильтры
+        partner_id = self.request.query_params.get('partner')
+        if partner_id:
+            queryset = queryset.filter(partner_id=partner_id)
+
+        request_type = self.request.query_params.get('request_type')
+        if request_type:
+            queryset = queryset.filter(request_type=request_type)
+
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+
+        return queryset
+
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request: Request, pk=None) -> Response:
+        """
+        Одобрить запрос партнёра.
+
+        REQUEST: Товары добавляются в PartnerInventory
+        RETURN: Товары возвращаются на склад админа
+        """
+        partner_request = self.get_object()
+        serializer = ApproveRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            PartnerRequestService.approve_request(
+                request=partner_request,
+                approved_by=request.user
+            )
+
+            partner_request.refresh_from_db()
+
+            return Response(
+                {
+                    'message': 'Запрос успешно одобрен',
+                    'request': PartnerRequestSerializer(partner_request).data
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(detail=True, methods=['post'], url_path='reject')
+    def reject(self, request: Request, pk=None) -> Response:
+        """Отклонить запрос партнёра."""
+        partner_request = self.get_object()
+        serializer = RejectRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            PartnerRequestService.reject_request(
+                request=partner_request,
+                rejection_reason=serializer.validated_data['rejection_reason']
+            )
+
+            partner_request.refresh_from_db()
+
+            return Response(
+                {
+                    'message': 'Запрос отклонён',
+                    'request': PartnerRequestSerializer(partner_request).data
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список ручных заказов партнёра",
+        description="""
+        Возвращает список всех ручных заказов, созданных текущим партнёром.
+
+        **Фильтры:**
+        - `store` - ID магазина
+        - `status` - статус заказа (accepted по умолчанию)
+        - `date_from` - дата от (YYYY-MM-DD)
+        - `date_to` - дата до (YYYY-MM-DD)
+        """,
+        parameters=[
+            OpenApiParameter('store', OpenApiTypes.INT, description='ID магазина'),
+            OpenApiParameter('status', OpenApiTypes.STR, description='Статус заказа'),
+            OpenApiParameter('date_from', OpenApiTypes.DATE, description='Дата от'),
+            OpenApiParameter('date_to', OpenApiTypes.DATE, description='Дата до'),
+        ]
+    ),
+    create=extend_schema(
+        summary="Создать ручной заказ",
+        description="""
+        Партнёр создаёт заказ напрямую магазину из своего инвентаря.
+
+        **Workflow:**
+        1. Проверяется наличие товаров в PartnerInventory
+        2. Товары перемещаются: PartnerInventory → StoreInventory
+        3. Создаётся заказ со статусом ACCEPTED
+        4. order_type = 'manual'
+        5. Долг = total_amount - prepayment
+
+        **Требования:**
+        - Магазин должен быть активен
+        - Все товары должны быть в инвентаре партнёра
+        - Минимум 1 товар в заказе
+        """,
+        request=ManualOrderCreateSerializer,
+        responses={
+            201: ManualOrderSerializer,
+            400: OpenApiTypes.OBJECT,
+        }
+    ),
+    retrieve=extend_schema(
+        summary="Детали ручного заказа",
+        description="Возвращает детальную информацию о ручном заказе"
+    )
+)
+class ManualOrderViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для ручных заказов партнёра (v3.0).
+
+    **Permissions:** IsAuthenticated + IsPartner
+
+    **Endpoints:**
+    - GET /api/partners/manual-orders/ - список
+    - POST /api/partners/manual-orders/ - создать
+    - GET /api/partners/manual-orders/{id}/ - детали
+
+    **Особенности:**
+    - Только ручные заказы (order_type='manual')
+    - Только заказы текущего партнёра
+    - Статус всегда ACCEPTED при создании
+    - Товары берутся из PartnerInventory
+    """
+
+    permission_classes = [IsAuthenticated, IsPartner]
+    lookup_field = 'id'
+
+    def get_queryset(self):
+        """Только ручные заказы текущего партнёра."""
+        user = self.request.user
+
+        queryset = StoreOrder.objects.filter(
+            partner=user,
+            order_type='manual'
+        ).select_related(
+            'store',
+            'partner',
+            'confirmed_by'
+        ).prefetch_related(
+            'items__product'
+        ).order_by('-created_at')
+
+        # Фильтры
+        store_id = self.request.query_params.get('store')
+        if store_id:
+            queryset = queryset.filter(store_id=store_id)
+
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
+
+        return queryset
+
+    def get_serializer_class(self):
+        """Выбор сериализатора в зависимости от action."""
+        if self.action == 'create':
+            return ManualOrderCreateSerializer
+        elif self.action == 'list':
+            return ManualOrderListSerializer
+        return ManualOrderSerializer
+
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        """
+        Создание ручного заказа.
+
+        POST /api/partners/manual-orders/
+        {
+            "store": 1,
+            "items": [
+                {
+                    "product": 5,
+                    "quantity": 20,
+                    "price": 200.00
+                }
+            ],
+            "prepayment": 1000.00,
+            "notes": "Ручной сбор"
+        }
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            # Преобразуем данные товаров
+            items_data = [
+                OrderItemData(
+                    product_id=item['product'],
+                    quantity=Decimal(str(item['quantity'])),
+                    price=Decimal(str(item.get('price'))) if item.get('price') else None,
+                    is_bonus=item.get('is_bonus', False)
+                )
+                for item in serializer.validated_data['items']
+            ]
+
+            # Получаем магазин
+            from stores.models import Store
+            store = Store.objects.get(pk=serializer.validated_data['store'])
+
+            # Создаём заказ через сервис
+            order = ManualOrderService.create_manual_order(
+                partner=request.user,
+                store=store,
+                items=items_data,
+                prepayment_amount=serializer.validated_data.get('prepayment', Decimal('0')),
+                notes=serializer.validated_data.get('notes', '')
+            )
+
+            # Возвращаем созданный заказ
+            output_serializer = ManualOrderSerializer(order)
+
+            return Response(
+                output_serializer.data,
+                status=status.HTTP_201_CREATED
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Ошибка создания заказа: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+
+
+class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для просмотра возвращённых товаров.
+
+    Партнёр видит только возвращённые товары из своих заказов.
+    Админ видит все возвращённые товары.
+
+    **Endpoints:**
+    - GET /api/partners/returned-items/ - список возвращённых товаров
+    - GET /api/partners/returned-items/{id}/ - детали возвращённого товара
+
+    **Фильтры:**
+    - order: ID заказа
+    - store: ID магазина
+    - product: ID товара
+    - date_from: дата с (формат: YYYY-MM-DD)
+    - date_to: дата по (формат: YYYY-MM-DD)
+
+    **Примеры:**
+    ```
+    GET /api/partners/returned-items/?order=123
+    GET /api/partners/returned-items/?store=1&date_from=2026-01-01
+    GET /api/partners/returned-items/?product=5
+    ```
+    """
+
+    permission_classes = [IsAuthenticated, IsPartner | IsAdmin]
+    filterset_class = ReturnedItemFilter
+    ordering_fields = ['returned_at', 'price']
+    ordering = ['-returned_at']  # По умолчанию новые первые
+
+    def get_queryset(self):
+        """
+        Фильтрация по роли:
+        - Партнёр: только возвраты из своих заказов
+        - Админ: все возвраты
+        """
+        user = self.request.user
+
+        queryset = ReturnedItem.objects.select_related(
+            'order',
+            'order__store',
+            'product',
+            'returned_by',
+        )
+
+        # Партнёр видит только возвраты, которые он сделал
+        if user.role == 'partner':
+            queryset = queryset.filter(returned_by=user)
+
+        return queryset
+
+    def get_serializer_class(self):
+        """Выбор сериализатора в зависимости от действия."""
+        if self.action == 'list':
+            return ReturnedItemListSerializer
+        return ReturnedItemSerializer
+
+    @extend_schema(
+        summary="Список возвращённых товаров",
+        description="Получить список всех возвращённых товаров с фильтрацией",
+        parameters=[
+            OpenApiParameter(
+                name='order',
+                type=int,
+                description='Фильтр по ID заказа'
+            ),
+            OpenApiParameter(
+                name='store',
+                type=int,
+                description='Фильтр по ID магазина'
+            ),
+            OpenApiParameter(
+                name='product',
+                type=int,
+                description='Фильтр по ID товара'
+            ),
+            OpenApiParameter(
+                name='date_from',
+                type=str,
+                description='Дата с (формат: YYYY-MM-DD)'
+            ),
+            OpenApiParameter(
+                name='date_to',
+                type=str,
+                description='Дата по (формат: YYYY-MM-DD)'
+            ),
+        ],
+        responses={
+            200: ReturnedItemListSerializer(many=True),
+        }
+    )
+    def list(self, request, *args, **kwargs):
+        """Список возвращённых товаров."""
+        return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="Детали возвращённого товара",
+        description="Получить подробную информацию о возвращённом товаре",
+        responses={
+            200: ReturnedItemSerializer,
+            404: OpenApiResponse(description="Возвращённый товар не найден"),
+        }
+    )
+    def retrieve(self, request, *args, **kwargs):
+        """Детали возвращённого товара."""
+        return super().retrieve(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="Статистика возвратов",
+        description="Получить статистику по возвращённым товарам",
+        responses={
+            200: {
+                'type': 'object',
+                'properties': {
+                    'total_items': {'type': 'integer'},
+                    'total_amount': {'type': 'string'},
+                    'by_product': {'type': 'object'},
+                    'by_store': {'type': 'object'},
+                }
+            }
+        }
+    )
+    @action(detail=False, methods=['get'])
+    def statistics(self, request):
+        """
+        Статистика по возвратам.
+
+        **Ответ:**
+        ```json
+        {
+            "total_items": 45,
+            "total_amount": "12500.00",
+            "by_product": {
+                "Пельмени": {
+                    "count": 20,
+                    "amount": "5000.00"
+                }
+            },
+            "by_store": {
+                "Магазин №1": {
+                    "count": 10,
+                    "amount": "3000.00"
+                }
+            }
+        }
+        ```
+        """
+        queryset = self.get_queryset()
+
+        # Применяем фильтры
+        queryset = self.filter_queryset(queryset)
+
+        # Общая статистика
+        total_items = queryset.count()
+        total_amount = Decimal('0')
+
+        by_product = {}
+        by_store = {}
+
+        for item in queryset:
+            # Рассчитываем total
+            if item.product.is_weight_based and item.weight:
+                item_total = (item.price / 10) * (item.weight / Decimal('0.1'))
+            else:
+                item_total = item.price * item.quantity
+
+            total_amount += item_total
+
+            # По товарам
+            product_name = item.product.name
+            if product_name not in by_product:
+                by_product[product_name] = {
+                    'count': 0,
+                    'amount': Decimal('0')
+                }
+            by_product[product_name]['count'] += 1
+            by_product[product_name]['amount'] += item_total
+
+            # По магазинам
+            store_name = item.order.store.name
+            if store_name not in by_store:
+                by_store[store_name] = {
+                    'count': 0,
+                    'amount': Decimal('0')
+                }
+            by_store[store_name]['count'] += 1
+            by_store[store_name]['amount'] += item_total
+
+        # Конвертируем Decimal в строки
+        for product_data in by_product.values():
+            product_data['amount'] = str(product_data['amount'])
+
+        for store_data in by_store.values():
+            store_data['amount'] = str(store_data['amount'])
+
+        return Response({
+            'total_items': total_items,
+            'total_amount': str(total_amount),
+            'by_product': by_product,
+            'by_store': by_store,
+        })

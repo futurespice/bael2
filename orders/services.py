@@ -34,6 +34,10 @@ from .models import (
     StoreOrderStatus,
     OrderHistory,
     OrderType,
+    PartnerRequest,
+    PartnerRequestType,
+    PartnerRequestStatus,
+    ReturnedItem,
 )
 
 
@@ -758,3 +762,527 @@ class BasketService:
             'removed_items': removed_info,
             'modified_items': modified_info,
         }
+
+
+# =============================================================================
+# PARTNER REQUEST SERVICE (v3.0)
+# =============================================================================
+
+class PartnerRequestService:
+    """
+    Сервис для управления запросами партнёра (v3.0).
+    
+    ТИПЫ ЗАПРОСОВ:
+    - REQUEST: Партнёр запрашивает товары у админа
+    - RETURN: Партнёр возвращает товары админу
+    
+    WORKFLOW REQUEST:
+    1. Партнёр создаёт запрос (status=PENDING)
+    2. Админ одобряет (status=APPROVED)
+       - Товары добавляются в PartnerInventory
+       - Количество в каталоге админа уменьшается
+    3. Админ отклоняет (status=REJECTED)
+    
+    WORKFLOW RETURN:
+    1. Партнёр создаёт возврат (status=PENDING)
+       - Товары резервируются в PartnerInventory
+    2. Админ одобряет (status=APPROVED)
+       - Товары удаляются из PartnerInventory
+       - Количество в каталоге админа увеличивается
+    3. Админ отклоняет (status=REJECTED)
+       - Резервирование снимается
+    """
+    
+    @classmethod
+    @transaction.atomic
+    def create_request(
+        cls,
+        *,
+        partner: 'User',
+        product: Product,
+        quantity: Decimal,
+        request_type: str,
+        reason: str = ''
+    ) -> PartnerRequest:
+        """
+        Создать запрос партнёра.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Количество
+            request_type: Тип запроса (request/return)
+            reason: Причина запроса
+            
+        Returns:
+            PartnerRequest
+            
+        Raises:
+            ValidationError: При ошибках валидации
+        """
+        from stores.services import PartnerInventoryService
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Валидация
+        if partner.role != 'partner':
+            raise ValidationError('Только партнёры могут создавать запросы')
+            
+        if quantity <= Decimal('0'):
+            raise ValidationError('Количество должно быть больше 0')
+            
+        if request_type not in [PartnerRequestType.REQUEST, PartnerRequestType.RETURN]:
+            raise ValidationError(f'Неверный тип запроса: {request_type}')
+        
+        # Дополнительная валидация для возврата
+        if request_type == PartnerRequestType.RETURN:
+            # Проверяем наличие товара в инвентаре партнёра
+            has_inventory = PartnerInventoryService.check_availability(
+                partner=partner,
+                product=product,
+                quantity=quantity
+            )
+            if not has_inventory:
+                raise ValidationError(
+                    f'Недостаточно товара {product.name} в инвентаре для возврата'
+                )
+            
+            # Резервируем товары
+            PartnerInventoryService.reserve_quantity(
+                partner=partner,
+                product=product,
+                quantity=quantity
+            )
+        
+        # Создаём запрос
+        request = PartnerRequest.objects.create(
+            partner=partner,
+            product=product,
+            quantity=quantity,
+            request_type=request_type,
+            status=PartnerRequestStatus.PENDING,
+            reason=reason,
+            price_at_request=product.price
+        )
+        
+        logger.info(
+            f"Создан запрос партнёра #{request.id} | "
+            f"Partner: {partner.id} | Type: {request_type} | "
+            f"Product: {product.name} | Qty: {quantity}"
+        )
+        
+        return request
+    
+    @classmethod
+    @transaction.atomic
+    def approve_request(
+        cls,
+        *,
+        request: PartnerRequest,
+        approved_by: 'User'
+    ) -> PartnerRequest:
+        """
+        Одобрить запрос партнёра (только админ).
+        
+        Args:
+            request: Запрос
+            approved_by: Кто одобрил (админ)
+            
+        Returns:
+            PartnerRequest
+            
+        Raises:
+            ValidationError: При ошибках
+        """
+        from stores.services import PartnerInventoryService
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Валидация
+        if approved_by.role != 'admin':
+            raise ValidationError('Только админ может одобрять запросы')
+            
+        if request.status != PartnerRequestStatus.PENDING:
+            raise ValidationError(
+                f'Запрос уже обработан (статус: {request.get_status_display()})'
+            )
+        
+        product = request.product
+        quantity = request.quantity
+        partner = request.partner
+        
+        if request.request_type == PartnerRequestType.REQUEST:
+            # ЗАПРОС ТОВАРОВ: Админ → Партнёр
+            
+            # Проверяем наличие в каталоге админа
+            if product.quantity < quantity:
+                raise ValidationError(
+                    f'Недостаточно товара {product.name} на складе. '
+                    f'Доступно: {product.quantity}, запрошено: {quantity}'
+                )
+            
+            # Уменьшаем количество в каталоге
+            product.quantity -= quantity
+            product.save(update_fields=['quantity'])
+            
+            # Добавляем в инвентарь партнёра
+            PartnerInventoryService.add_to_inventory(
+                partner=partner,
+                product=product,
+                quantity=quantity,
+                source_request=request
+            )
+            
+            logger.info(
+                f"Запрос #{request.id} одобрен | "
+                f"Товар {product.name} x{quantity} добавлен в инвентарь партнёра {partner.id}"
+            )
+            
+        else:  # RETURN
+            # ВОЗВРАТ ТОВАРОВ: Партнёр → Админ
+            
+            # Удаляем из инвентаря партнёра (зарезервированные товары)
+            PartnerInventoryService.remove_from_inventory(
+                partner=partner,
+                product=product,
+                quantity=quantity
+            )
+            
+            # Увеличиваем количество в каталоге
+            product.quantity += quantity
+            product.save(update_fields=['quantity'])
+            
+            logger.info(
+                f"Возврат #{request.id} одобрен | "
+                f"Товар {product.name} x{quantity} возвращён на склад админа"
+            )
+        
+        # Обновляем статус запроса
+        request.status = PartnerRequestStatus.APPROVED
+        request.reviewed_by = approved_by
+        request.reviewed_at = timezone.now()
+        request.save(update_fields=['status', 'reviewed_by', 'reviewed_at'])
+        
+        return request
+    
+    @classmethod
+    @transaction.atomic
+    def reject_request(
+        cls,
+        *,
+        request: PartnerRequest,
+        rejected_by: 'User',
+        rejection_reason: str
+    ) -> PartnerRequest:
+        """
+        Отклонить запрос партнёра (только админ).
+        
+        Args:
+            request: Запрос
+            rejected_by: Кто отклонил (админ)
+            rejection_reason: Причина отклонения
+            
+        Returns:
+            PartnerRequest
+            
+        Raises:
+            ValidationError: При ошибках
+        """
+        from stores.services import PartnerInventoryService
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Валидация
+        if rejected_by.role != 'admin':
+            raise ValidationError('Только админ может отклонять запросы')
+            
+        if request.status != PartnerRequestStatus.PENDING:
+            raise ValidationError(
+                f'Запрос уже обработан (статус: {request.get_status_display()})'
+            )
+        
+        if not rejection_reason:
+            raise ValidationError('Необходимо указать причину отклонения')
+        
+        # Для возврата - освобождаем резервирование
+        if request.request_type == PartnerRequestType.RETURN:
+            PartnerInventoryService.release_reserved(
+                partner=request.partner,
+                product=request.product,
+                quantity=request.quantity
+            )
+        
+        # Обновляем статус
+        request.status = PartnerRequestStatus.REJECTED
+        request.reviewed_by = rejected_by
+        request.reviewed_at = timezone.now()
+        request.rejection_reason = rejection_reason
+        request.save(update_fields=[
+            'status', 'reviewed_by', 'reviewed_at', 'rejection_reason'
+        ])
+        
+        logger.info(
+            f"Запрос #{request.id} отклонён | "
+            f"Reason: {rejection_reason}"
+        )
+        
+        return request
+    
+    @classmethod
+    @transaction.atomic
+    def cancel_request(
+        cls,
+        *,
+        request: PartnerRequest,
+        cancelled_by: 'User'
+    ) -> PartnerRequest:
+        """
+        Отменить запрос партнёром (только если PENDING).
+        
+        Args:
+            request: Запрос
+            cancelled_by: Партнёр (владелец запроса)
+            
+        Returns:
+            PartnerRequest
+            
+        Raises:
+            ValidationError: При ошибках
+        """
+        from stores.services import PartnerInventoryService
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Валидация
+        if request.partner != cancelled_by:
+            raise ValidationError('Только владелец запроса может его отменить')
+            
+        if request.status != PartnerRequestStatus.PENDING:
+            raise ValidationError(
+                f'Нельзя отменить обработанный запрос (статус: {request.get_status_display()})'
+            )
+        
+        # Для возврата - освобождаем резервирование
+        if request.request_type == PartnerRequestType.RETURN:
+            PartnerInventoryService.release_reserved(
+                partner=request.partner,
+                product=request.product,
+                quantity=request.quantity
+            )
+        
+        # Удаляем запрос
+        request.delete()
+        
+        logger.info(
+            f"Запрос #{request.id} отменён партнёром {cancelled_by.id}"
+        )
+        
+        return request
+    
+    @classmethod
+    def get_partner_requests(
+        cls,
+        *,
+        partner: 'User',
+        request_type: Optional[str] = None,
+        status: Optional[str] = None
+    ):
+        """
+        Получить запросы партнёра с фильтрацией.
+        
+        Args:
+            partner: Партнёр
+            request_type: Тип запроса (опционально)
+            status: Статус (опционально)
+            
+        Returns:
+            QuerySet[PartnerRequest]
+        """
+        queryset = PartnerRequest.objects.filter(
+            partner=partner
+        ).select_related('product', 'reviewed_by').order_by('-created_at')
+        
+        if request_type:
+            queryset = queryset.filter(request_type=request_type)
+            
+        if status:
+            queryset = queryset.filter(status=status)
+        
+        return queryset
+    
+    @classmethod
+    def get_pending_requests_for_admin(cls):
+        """
+        Получить все запросы в ожидании (для админа).
+        
+        Returns:
+            QuerySet[PartnerRequest]
+        """
+        return PartnerRequest.objects.filter(
+            status=PartnerRequestStatus.PENDING
+        ).select_related('partner', 'product').order_by('created_at')
+
+
+# =============================================================================
+# MANUAL ORDER SERVICE (v3.0)
+# =============================================================================
+
+class ManualOrderService:
+    """
+    Сервис для создания ручных заказов партнёром (v3.0).
+    
+    ОТЛИЧИЯ ОТ ПРЕДЗАКАЗА:
+    - Партнёр сам создаёт заказ магазину
+    - Товары берутся из PartnerInventory (не из каталога админа)
+    - Заказ сразу в статусе ACCEPTED
+    - order_type = 'manual'
+    - Долг создаётся сразу
+    
+    WORKFLOW:
+    1. Партнёр выбирает магазин
+    2. Партнёр выбирает товары из своего инвентаря
+    3. Указывает предоплату (опционально)
+    4. Заказ создаётся с order_type='manual', status='accepted'
+    5. Товары: PartnerInventory → StoreInventory
+    6. Долг = total_amount - prepayment
+    """
+    
+    @classmethod
+    @transaction.atomic
+    def create_manual_order(
+        cls,
+        *,
+        partner: 'User',
+        store: Store,
+        items: List[OrderItemData],
+        prepayment_amount: Decimal = Decimal('0'),
+        notes: str = ''
+    ) -> StoreOrder:
+        """
+        Создать ручной заказ партнёром.
+        
+        Args:
+            partner: Партнёр
+            store: Магазин
+            items: Список товаров
+            prepayment_amount: Сумма предоплаты
+            notes: Примечания
+            
+        Returns:
+            StoreOrder
+            
+        Raises:
+            ValidationError: При ошибках
+        """
+        from stores.services import PartnerInventoryService
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Валидация
+        if partner.role != 'partner':
+            raise ValidationError('Только партнёры могут создавать ручные заказы')
+            
+        if not store.is_active:
+            raise ValidationError(f'Магазин {store.name} заблокирован')
+            
+        if not items:
+            raise ValidationError('Заказ должен содержать хотя бы один товар')
+            
+        if prepayment_amount < Decimal('0'):
+            raise ValidationError('Предоплата не может быть отрицательной')
+        
+        # Создаём заказ
+        order = StoreOrder.objects.create(
+            store=store,
+            partner=partner,
+            status=StoreOrderStatus.ACCEPTED,
+            order_type='manual',  # v3.0: manual order
+            confirmed_by=partner,
+            confirmed_at=timezone.now(),
+            prepayment_amount=prepayment_amount,
+            notes=notes
+        )
+        
+        total_amount = Decimal('0')
+        
+        # Обрабатываем товары
+        for item_data in items:
+            try:
+                product = Product.objects.get(pk=item_data.product_id)
+            except Product.DoesNotExist:
+                raise ValidationError(f'Товар с ID {item_data.product_id} не найден')
+            
+            # Проверяем наличие в инвентаре партнёра
+            has_inventory = PartnerInventoryService.check_availability(
+                partner=partner,
+                product=product,
+                quantity=item_data.quantity
+            )
+            
+            if not has_inventory:
+                raise ValidationError(
+                    f'Недостаточно товара {product.name} в инвентаре партнёра'
+                )
+            
+            # Убираем из инвентаря партнёра
+            PartnerInventoryService.remove_from_inventory(
+                partner=partner,
+                product=product,
+                quantity=item_data.quantity
+            )
+            
+            # Добавляем в инвентарь магазина
+            StoreInventoryService.add_to_inventory(
+                store=store,
+                product=product,
+                quantity=item_data.quantity
+            )
+            
+            # Создаём позицию заказа
+            price = item_data.price or product.price
+            item_total = price * item_data.quantity
+            
+            StoreOrderItem.objects.create(
+                order=order,
+                product=product,
+                quantity=item_data.quantity,
+                price=price,
+                total_amount=item_total,
+                is_bonus=item_data.is_bonus
+            )
+            
+            total_amount += item_total
+        
+        # Обновляем заказ
+        debt_amount = total_amount - prepayment_amount
+        order.total_amount = total_amount
+        order.debt_amount = debt_amount
+        order.save(update_fields=['total_amount', 'debt_amount'])
+        
+        # Обновляем долг магазина
+        store = Store.objects.select_for_update().get(pk=store.pk)
+        store.debt += debt_amount
+        store.save(update_fields=['debt'])
+        
+        # История
+        OrderHistory.objects.create(
+            order_type=OrderType.STORE,
+            order_id=order.id,
+            old_status=None,
+            new_status=StoreOrderStatus.ACCEPTED,
+            changed_by=partner,
+            comment=(
+                f'Ручной заказ создан партнёром. '
+                f'Сумма: {total_amount} сом. '
+                f'Предоплата: {prepayment_amount} сом. '
+                f'Долг: {debt_amount} сом.'
+            )
+        )
+        
+        logger.info(
+            f"Создан ручной заказ #{order.id} | "
+            f"Partner: {partner.id} | Store: {store.id} | "
+            f"Amount: {total_amount} | Debt: {debt_amount}"
+        )
+        
+        return order

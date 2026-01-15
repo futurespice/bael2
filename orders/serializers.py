@@ -12,17 +12,19 @@
 
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
-
+from stores.models import Store
 from rest_framework import serializers
 
 from products.models import Product
+from products.serializers import ProductListSerializer
+from stores.serializers import StoreListSerializer
 from .models import (
     StoreOrder,
     StoreOrderItem,
     StoreOrderStatus,
     DebtPayment,
     DefectiveProduct,
-    OrderHistory,
+    OrderHistory, ReturnedItem,
 )
 
 
@@ -892,49 +894,401 @@ StoreOrderForStoreSerializer = StoreOrderForStoreListSerializer
 # PARTNER REQUEST (v3.0)
 # =============================================================================
 
-class PartnerRequestSerializer(serializers.ModelSerializer):
-    partner_name = serializers.CharField(source='partner.get_full_name', read_only=True)
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+class PartnerRequestItemSerializer(serializers.Serializer):
+    """Сериализатор элемента запроса партнёра."""
+
+    product = serializers.IntegerField(
+        help_text="ID товара"
+    )
+    quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        min_value=Decimal('0.001'),
+        help_text="Количество товара"
+    )
+    weight = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        required=False,
+        allow_null=True,
+        help_text="Вес (только для весовых товаров)"
+    )
+
+
+class PartnerRequestItemReadSerializer(serializers.Serializer):
+    """Сериализатор элемента запроса (для чтения)."""
+
+    id = serializers.IntegerField(read_only=True)
+    product = ProductListSerializer(read_only=True)
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3)
+    weight = serializers.DecimalField(max_digits=12, decimal_places=3, allow_null=True)
+    price_at_request = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_price = serializers.SerializerMethodField()
+
+    def get_total_price(self, obj) -> str:
+        """Рассчитать общую стоимость."""
+        if hasattr(obj, 'quantity') and hasattr(obj, 'price_at_request'):
+            return str(obj.quantity * obj.price_at_request)
+        return "0.00"
+
+
+class PartnerRequestCreateSerializer(serializers.Serializer):
+    """Сериализатор для создания запроса партнёра."""
+
+    request_type = serializers.ChoiceField(
+        choices=['request', 'return'],
+        help_text="Тип запроса: request (запрос товаров) или return (возврат)"
+    )
+    items = PartnerRequestItemSerializer(
+        many=True,
+        help_text="Список товаров"
+    )
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=1000,
+        help_text="Примечания к запросу"
+    )
+
+    def validate_items(self, value):
+        """Проверить, что список товаров не пустой."""
+        if not value:
+            raise serializers.ValidationError("Список товаров не может быть пустым")
+        return value
+
+
+class PartnerRequestSerializer(serializers.Serializer):
+    """Сериализатор запроса партнёра (для чтения)."""
+
+    id = serializers.IntegerField(read_only=True)
+    partner = serializers.SerializerMethodField()
+    request_type = serializers.CharField()
+    status = serializers.CharField()
+    items = PartnerRequestItemReadSerializer(many=True, read_only=True)
+    notes = serializers.CharField()
+    rejection_reason = serializers.CharField(allow_null=True)
+    total_amount = serializers.SerializerMethodField()
+    created_at = serializers.DateTimeField(read_only=True)
+    updated_at = serializers.DateTimeField(read_only=True)
+    approved_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    rejected_at = serializers.DateTimeField(read_only=True, allow_null=True)
+
+    def get_partner(self, obj):
+        """Информация о партнёре."""
+        if hasattr(obj, 'partner'):
+            return {
+                'id': obj.partner.id,
+                'name': obj.partner.get_full_name(),
+                'phone': obj.partner.phone
+            }
+        return None
+
+    def get_total_amount(self, obj) -> str:
+        """Общая сумма запроса."""
+        if hasattr(obj, 'items'):
+            total = sum(
+                item.quantity * item.price_at_request
+                for item in obj.items.all()
+            )
+            return str(total)
+        return "0.00"
+
+
+class PartnerRequestListSerializer(serializers.Serializer):
+    """Упрощённый сериализатор для списка запросов."""
+
+    id = serializers.IntegerField()
+    request_type = serializers.CharField()
+    status = serializers.CharField()
+    total_amount = serializers.SerializerMethodField()
+    items_count = serializers.SerializerMethodField()
+    created_at = serializers.DateTimeField()
+
+    def get_total_amount(self, obj) -> str:
+        """Общая сумма."""
+        if hasattr(obj, 'items'):
+            total = sum(
+                item.quantity * item.price_at_request
+                for item in obj.items.all()
+            )
+            return str(total)
+        return "0.00"
+
+    def get_items_count(self, obj) -> int:
+        """Количество товаров."""
+        if hasattr(obj, 'items'):
+            return obj.items.count()
+        return 0
+
+
+class ApproveRequestSerializer(serializers.Serializer):
+    """Сериализатор для одобрения запроса."""
+
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        help_text="Примечания администратора"
+    )
+
+
+class RejectRequestSerializer(serializers.Serializer):
+    """Сериализатор для отклонения запроса."""
+
+    rejection_reason = serializers.CharField(
+        required=True,
+        max_length=500,
+        help_text="Причина отклонения"
+    )
+
+
+class ManualOrderItemSerializer(serializers.Serializer):
+    """
+    Сериализатор элемента ручного заказа.
+
+    Входные данные для создания заказа.
+    """
+
+    product = serializers.IntegerField(
+        min_value=1,
+        help_text="ID товара из инвентаря партнёра"
+    )
+
+    quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        min_value=Decimal('0.001'),
+        help_text="Количество товара"
+    )
+
+    price = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        help_text="Цена (опционально, по умолчанию текущая цена товара)"
+    )
+
+    is_bonus = serializers.BooleanField(
+        default=False,
+        help_text="Бонусный товар"
+    )
+
+
+class ManualOrderItemReadSerializer(serializers.ModelSerializer):
+    """Сериализатор для чтения элементов заказа."""
+
+    product = ProductListSerializer(read_only=True)
+
     class Meta:
-        from .models import PartnerRequest
-        model = PartnerRequest
+        model = StoreOrderItem
         fields = [
-            'id', 'partner', 'partner_name', 'product', 'product_name',
-            'request_type', 'status', 'status_display', 'quantity', 'reason',
-            'reviewed_by', 'reviewed_at', 'rejection_reason',
-            'created_at', 'updated_at'
+            'id',
+            'product',
+            'quantity',
+            'price',
+            'total_amount',
+            'is_bonus'
         ]
-        read_only_fields = ['partner', 'status', 'reviewed_by', 'reviewed_at', 'created_at', 'updated_at']
-    
-    def create(self, validated_data):
-        validated_data['partner'] = self.context['request'].user
-        return super().create(validated_data)
+        read_only_fields = fields
 
 
-class PartnerRequestApproveSerializer(serializers.Serializer):
-    pass
+class ManualOrderCreateSerializer(serializers.Serializer):
+    """
+    Сериализатор создания ручного заказа (v3.0).
+
+    Партнёр создаёт заказ напрямую магазину из своего инвентаря.
+    """
+
+    store = serializers.IntegerField(
+        min_value=1,
+        help_text="ID магазина"
+    )
+
+    items = ManualOrderItemSerializer(
+        many=True,
+        min_length=1,
+        help_text="Список товаров для заказа"
+    )
+
+    prepayment = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0'),
+        min_value=Decimal('0'),
+        help_text="Сумма предоплаты"
+    )
+
+    notes = serializers.CharField(
+        max_length=500,
+        required=False,
+        allow_blank=True,
+        help_text="Примечания к заказу"
+    )
+
+    def validate_store(self, value):
+        """Проверка существования магазина."""
+        try:
+            store = Store.objects.get(pk=value)
+        except Store.DoesNotExist:
+            raise serializers.ValidationError(
+                f"Магазин с ID {value} не найден"
+            )
+
+        if not store.is_active:
+            raise serializers.ValidationError(
+                f'Магазин "{store.name}" не активен'
+            )
+
+        return value
+
+    def validate_items(self, value):
+        """Проверка товаров."""
+        if not value:
+            raise serializers.ValidationError(
+                "Заказ должен содержать хотя бы один товар"
+            )
+
+        # Проверка на дубликаты
+        product_ids = [item['product'] for item in value]
+        if len(product_ids) != len(set(product_ids)):
+            raise serializers.ValidationError(
+                "В заказе не должно быть дублирующихся товаров"
+            )
+
+        return value
 
 
-class PartnerRequestRejectSerializer(serializers.Serializer):
-    rejection_reason = serializers.CharField(required=False, allow_blank=True)
+class ManualOrderSerializer(serializers.ModelSerializer):
+    """
+    Сериализатор ручного заказа (полная информация).
+
+    Для детального просмотра и списка.
+    """
+
+    store = StoreListSerializer(read_only=True)
+    partner = serializers.StringRelatedField(read_only=True)
+    confirmed_by = serializers.StringRelatedField(read_only=True)
+    items = ManualOrderItemReadSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = StoreOrder
+        fields = [
+            'id',
+            'store',
+            'partner',
+            'status',
+            'order_type',
+            'items',
+            'total_amount',
+            'prepayment_amount',
+            'debt_amount',
+            'confirmed_by',
+            'confirmed_at',
+            'notes',
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = fields
 
 
-# =============================================================================
-# RETURNED ITEMS (v3.0)
-# =============================================================================
+class ManualOrderListSerializer(serializers.ModelSerializer):
+    """Упрощённый сериализатор для списка ручных заказов."""
+
+    store_name = serializers.CharField(source='store.name', read_only=True)
+    items_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = StoreOrder
+        fields = [
+            'id',
+            'store_name',
+            'status',
+            'total_amount',
+            'debt_amount',
+            'items_count',
+            'created_at'
+        ]
+        read_only_fields = fields
+
 
 class ReturnedItemSerializer(serializers.ModelSerializer):
-    order_number = serializers.CharField(source='order.id', read_only=True)
-    store_name = serializers.CharField(source='order.store.name', read_only=True)
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    
+    """Полная информация о возвращённом товаре."""
+
+    order = serializers.SerializerMethodField()
+    product = ProductListSerializer(read_only=True)
+    returned_by = serializers.SerializerMethodField()
+    total = serializers.SerializerMethodField()
+
     class Meta:
-        from .models import ReturnedItem
         model = ReturnedItem
         fields = [
-            'id', 'order', 'order_number', 'store_name', 'product', 'product_name',
-            'quantity', 'price_at_return', 'total_amount', 'reason',
-            'returned_by', 'returned_at'
+            'id',
+            'order',
+            'product',
+            'quantity',
+            'weight',
+            'price',
+            'total',
+            'reason',
+            'returned_at',
+            'returned_by',
         ]
+
+    def get_order(self, obj) -> dict:
+        """Информация о заказе."""
+        return {
+            'id': obj.order.id,
+            'store': obj.order.store.name,
+            'status': obj.order.status,
+            'order_type': obj.order.order_type,
+        }
+
+    def get_returned_by(self, obj) -> dict:
+        """Кто вернул товар."""
+        if obj.returned_by:
+            return {
+                'id': obj.returned_by.id,
+                'name': f"{obj.returned_by.name} {obj.returned_by.second_name}",
+                'role': obj.returned_by.role,
+            }
+        return None
+
+    def get_total(self, obj) -> Decimal:
+        """Общая стоимость возвращённых товаров."""
+        if obj.product.is_weight_based and obj.weight:
+            # Весовой товар
+            return (obj.price / 10) * (obj.weight / Decimal('0.1'))
+        else:
+            # Штучный товар
+            return obj.price * obj.quantity
+
+
+class ReturnedItemListSerializer(serializers.ModelSerializer):
+    """Упрощённый сериализатор для списка возвращённых товаров."""
+
+    order_id = serializers.IntegerField(source='order.id', read_only=True)
+    store_name = serializers.CharField(source='order.store.name', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReturnedItem
+        fields = [
+            'id',
+            'order_id',
+            'store_name',
+            'product_name',
+            'quantity',
+            'weight',
+            'price',
+            'total',
+            'reason',
+            'returned_at',
+        ]
+
+    def get_total(self, obj) -> Decimal:
+        """Общая стоимость."""
+        if obj.product.is_weight_based and obj.weight:
+            return (obj.price / 10) * (obj.weight / Decimal('0.1'))
+        return obj.price * obj.quantity

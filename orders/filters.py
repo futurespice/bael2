@@ -8,8 +8,8 @@
 """
 
 import django_filters
-
-from .models import StoreOrder
+from django_filters import filters
+from .models import StoreOrder, ReturnedItem
 
 
 class StoreOrderFilter(django_filters.FilterSet):
@@ -51,3 +51,16 @@ class StoreOrderFilter(django_filters.FilterSet):
 # Причина: Модели OrderReturn не существует (мёртвый код)
 #
 # =============================================================================
+
+class ReturnedItemFilter(filters.Filter):
+    """Фильтры для возвращённых товаров."""
+
+    order = filters.NumberFilter(field_name='order__id')
+    store = filters.NumberFilter(field_name='order__store__id')
+    product = filters.NumberFilter(field_name='product__id')
+    date_from = filters.DateFilter(field_name='returned_at', lookup_expr='gte')
+    date_to = filters.DateFilter(field_name='returned_at', lookup_expr='lte')
+
+    class Meta:
+        model = ReturnedItem
+        fields = ['order', 'store', 'product', 'date_from', 'date_to']

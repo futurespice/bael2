@@ -7,16 +7,18 @@ API ENDPOINTS:
 - GET /api/reports/store-history/{store_id}/ - История магазина
 """
 
-from rest_framework import status
+from rest_framework import status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
 from stores.models import Store
-from .serializers import ReportFiltersSerializer, StoreHistoryFiltersSerializer
-from .services import ReportService, ReportFilters, TimePeriod
-
+from .serializers import ReportFiltersSerializer, StoreHistoryFiltersSerializer, PartnerStoreSerializer, PartnerTrackerOrderSerializer, PartnerStatisticsSerializer, PartnerProfileSerializer
+from .services import ReportService, ReportFilters, TimePeriod, PartnerProfileService, PartnerStatisticsService
+from users.permissions import IsPartnerUser
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
+from django.db.models import Q, Max, Count
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -138,123 +140,324 @@ def get_store_history(request: Request, store_id: int) -> Response:
 # PARTNER STATISTICS (v3.0)
 # =============================================================================
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def partner_statistics(request: Request) -> Response:
+class PartnerStatisticsViewSet(viewsets.ViewSet):
     """
-    Статистика партнера (10 показателей).
-    
-    GET /api/reports/partner-statistics/
-    
-    Query params:
-    - period: day/week/month/half_year/year/all_time (default: month)
-    - partner_id: ID партнера (только для админа)
-    - date_from: YYYY-MM-DD (опционально)
-    - date_to: YYYY-MM-DD (опционально)
-    """
-    from .services import PartnerStatisticsService
-    from .serializers import PartnerStatisticsSerializer
-    from datetime import datetime
-    
-    user = request.user
-    
-    # Определить партнера
-    if user.role == 'admin':
-        partner_id = request.query_params.get('partner_id')
-        if not partner_id:
-            return Response({'detail': 'Для админа требуется параметр partner_id'}, status=400)
-    elif user.role == 'partner':
-        partner_id = user.id
-    else:
-        return Response({'detail': 'Доступ запрещен'}, status=403)
-    
-    # Получить параметры
-    period = request.query_params.get('period', 'month')
-    date_from_str = request.query_params.get('date_from')
-    date_to_str = request.query_params.get('date_to')
-    
-    date_from = None
-    date_to = None
-    
-    try:
-        if date_from_str:
-            date_from = datetime.strptime(date_from_str, '%Y-%m-%d')
-        if date_to_str:
-            date_to = datetime.strptime(date_to_str, '%Y-%m-%d')
-    except ValueError:
-        return Response({'detail': 'Некорректный формат даты (YYYY-MM-DD)'}, status=400)
-    
-    # Расчет статистики
-    stats = PartnerStatisticsService.calculate_statistics(
-        partner_id=partner_id,
-        period=period,
-        date_from=date_from,
-        date_to=date_to
-    )
-    
-    serializer = PartnerStatisticsSerializer(stats)
-    return Response(serializer.data)
+    ViewSet для статистики партнёра (10 показателей).
 
+    **Endpoint:**
+    - GET /api/partners/statistics/?period=week
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def partner_profile(request: Request) -> Response:
-    """
-    Профиль партнера (детали продаж).
-    
-    GET /api/reports/partner-profile/
-    """
-    from .serializers import PartnerProfileSerializer
-    
-    if request.user.role != 'partner':
-        return Response({'detail': 'Только для партнеров'}, status=403)
-    
-    # TODO: Реализовать логику
-    data = []
-    
-    serializer = PartnerProfileSerializer(data, many=True)
-    return Response(serializer.data)
+    **Периоды:**
+    - day: день
+    - week: неделя
+    - month: месяц
+    - year: год
 
+    **Ответ:** 10 показателей статистики
+    """
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def partner_tracker(request: Request) -> Response:
-    """
-    Трекер заказов партнера.
-    
-    GET /api/reports/partner-tracker/
-    """
-    from orders.models import StoreOrder
-    from .serializers import PartnerTrackerSerializer
-    
-    if request.user.role != 'partner':
-        return Response({'detail': 'Только для партнеров'}, status=403)
-    
-    queryset = StoreOrder.objects.filter(partner=request.user).select_related('store')
-    
-    # Фильтры
-    status_filter = request.query_params.get('status')
-    if status_filter:
-        queryset = queryset.filter(status=status_filter)
-    
-    store_id = request.query_params.get('store_id')
-    if store_id:
-        queryset = queryset.filter(store_id=store_id)
-    
-    data = [
-        {
-            'order_id': order.id,
-            'store_name': order.store.name,
-            'status': order.status,
-            'status_display': order.get_status_display(),
-            'total_amount': order.total_amount,
-            'debt_amount': order.debt_amount,
-            'paid_amount': order.paid_amount,
-            'created_at': order.created_at,
-            'confirmed_at': order.confirmed_at,
+    permission_classes = [IsAuthenticated, IsPartnerUser]
+
+    @extend_schema(
+        summary="Статистика партнёра (10 показателей)",
+        description="Получить статистику партнёра за выбранный период",
+        parameters=[
+            OpenApiParameter(
+                name='period',
+                type=str,
+                enum=['day', 'week', 'month', 'year'],
+                description='Период статистики',
+                required=True
+            ),
+        ],
+        responses={
+            200: PartnerStatisticsSerializer,
         }
-        for order in queryset
-    ]
-    
-    serializer = PartnerTrackerSerializer(data, many=True)
-    return Response(serializer.data)
+    )
+    def list(self, request):
+        """Получить статистику партнёра."""
+        period = request.query_params.get('period', 'week')
+
+        if period not in ['day', 'week', 'month', 'year']:
+            return Response(
+                {'error': 'Неверный период. Используйте: day, week, month, year'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Получаем статистику через сервис
+        try:
+            stats = PartnerStatisticsService.get_partner_statistics(
+                partner=request.user,
+                period=period
+            )
+
+            serializer = PartnerStatisticsSerializer(stats)
+            return Response(serializer.data)
+
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class PartnerProfileViewSet(viewsets.ViewSet):
+    """
+    ViewSet для профиля партнёра с историей продаж.
+
+    **Endpoint:**
+    - GET /api/partners/profile/?period=month
+
+    **Ответ:**
+    ```json
+    {
+        "period": "month",
+        "stores": [
+            {
+                "store_name": "Магазин №1",
+                "store_inn": "01234567890123",
+                "orders": [
+                    {
+                        "date": "2026-01-09",
+                        "product_name": "Пельмени",
+                        "quantity": 20,
+                        "price_per_unit": "200.00",
+                        "total_amount": "4000.00"
+                    }
+                ],
+                "total_sold": "6250.00"
+            }
+        ],
+        "total_all_stores": "25000.00"
+    }
+    ```
+    """
+
+    permission_classes = [IsAuthenticated, IsPartnerUser]
+
+    @extend_schema(
+        summary="Профиль партнёра",
+        description="Получить профиль партнёра с историей продаж по магазинам",
+        parameters=[
+            OpenApiParameter(
+                name='period',
+                type=str,
+                enum=['day', 'week', 'month', 'year'],
+                description='Период профиля',
+                required=True
+            ),
+        ],
+        responses={
+            200: PartnerProfileSerializer,
+        }
+    )
+    def list(self, request):
+        """Получить профиль партнёра."""
+        period = request.query_params.get('period', 'month')
+
+        if period not in ['day', 'week', 'month', 'year']:
+            return Response(
+                {'error': 'Неверный период. Используйте: day, week, month, year'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            profile = PartnerProfileService.get_partner_profile(
+                partner=request.user,
+                period=period
+            )
+
+            serializer = PartnerProfileSerializer(profile)
+            return Response(serializer.data)
+
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class PartnerTrackerViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для трекера партнёра с фильтрацией.
+
+    **Endpoint:**
+    - GET /api/partners/tracker/?type=preorder
+
+    **Типы заказов:**
+    - preorder: предзаказы
+    - manual: ручные заказы
+    - all: все заказы
+    """
+
+    permission_classes = [IsAuthenticated, IsPartnerUser]
+    serializer_class = PartnerTrackerOrderSerializer
+
+    def get_queryset(self):
+        """Получить заказы партнёра."""
+        from orders.models import StoreOrder
+
+        order_type = self.request.query_params.get('type', 'all')
+
+        # Только заказы, подтверждённые текущим партнёром
+        queryset = StoreOrder.objects.filter(
+            confirmed_by=self.request.user,
+            status='accepted'
+        ).select_related(
+            'store',
+            'confirmed_by'
+        ).prefetch_related(
+            'items',
+            'returned_items'
+        ).order_by('-created_at')
+
+        # Фильтр по типу
+        if order_type == 'preorder':
+            queryset = queryset.filter(order_type='preorder')
+        elif order_type == 'manual':
+            queryset = queryset.filter(order_type='manual')
+        # 'all' - без фильтра
+
+        return queryset
+
+    @extend_schema(
+        summary="Трекер заказов партнёра",
+        description="Получить список заказов партнёра с фильтрацией",
+        parameters=[
+            OpenApiParameter(
+                name='type',
+                type=str,
+                enum=['preorder', 'manual', 'all'],
+                description='Тип заказа',
+            ),
+        ],
+        responses={
+            200: PartnerTrackerOrderSerializer(many=True),
+        }
+    )
+    def list(self, request, *args, **kwargs):
+        """Список заказов."""
+        queryset = self.get_queryset()
+
+        # Добавляем аннотации
+        queryset = queryset.annotate(
+            items_count=Count('items'),
+            returned_items_count=Count('returned_items')
+        )
+
+        # Формируем ответ вручную для полного контроля
+        data = []
+        for order in queryset:
+            data.append({
+                'id': order.id,
+                'store': {
+                    'id': order.store.id,
+                    'name': order.store.name,
+                },
+                'order_type': order.order_type,
+                'status': order.status,
+                'total_amount': str(order.total_amount),
+                'debt_amount': str(order.debt_amount),
+                'created_at': order.created_at,
+                'accepted_at': order.accepted_at,
+                'items_count': order.items_count,
+                'returned_items_count': order.returned_items_count,
+            })
+
+        return Response(data)
+
+
+class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для списка магазинов партнёра с сортировкой.
+
+    **Endpoint:**
+    - GET /api/partners/stores/?sort=debt_desc
+
+    **Сортировки:**
+    - debt_desc: по долгу (убывание)
+    - paid_date_desc: по дате погашения (новые первые)
+    """
+
+    permission_classes = [IsAuthenticated, IsPartnerUser]
+    serializer_class = PartnerStoreSerializer
+
+    def get_queryset(self):
+        """Получить магазины партнёра."""
+        from stores.models import Store
+        from orders.models import StoreOrder, DebtPayment
+
+        sort_by = self.request.query_params.get('sort', 'debt_desc')
+
+        # Магазины, с которыми работал партнёр
+        store_ids = StoreOrder.objects.filter(
+            confirmed_by=self.request.user
+        ).values_list('store_id', flat=True).distinct()
+
+        queryset = Store.objects.filter(
+            id__in=store_ids
+        ).select_related(
+            'region',
+            'city'
+        )
+
+        # Сортировка
+        if sort_by == 'debt_desc':
+            queryset = queryset.order_by('-total_debt')
+        elif sort_by == 'paid_date_desc':
+            # Сортировка по последней дате погашения
+            queryset = queryset.annotate(
+                last_payment=Max(
+                    'debt_payments__paid_at',
+                    filter=Q(debt_payments__isnull=False)
+                )
+            ).order_by('-last_payment')
+
+        return queryset
+
+    @extend_schema(
+        summary="Список магазинов партнёра",
+        description="Получить список магазинов с сортировкой",
+        parameters=[
+            OpenApiParameter(
+                name='sort',
+                type=str,
+                enum=['debt_desc', 'paid_date_desc'],
+                description='Сортировка',
+            ),
+        ],
+        responses={
+            200: PartnerStoreSerializer(many=True),
+        }
+    )
+    def list(self, request, *args, **kwargs):
+        """Список магазинов."""
+        from orders.models import StoreOrder, DebtPayment
+
+        queryset = self.get_queryset()
+
+        # Формируем ответ
+        data = []
+        for store in queryset:
+            # Получаем количество заказов
+            orders_count = StoreOrder.objects.filter(
+                store=store,
+                confirmed_by=request.user
+            ).count()
+
+            # Получаем последнюю дату погашения
+            last_payment = DebtPayment.objects.filter(
+                store=store
+            ).order_by('-paid_at').first()
+
+            data.append({
+                'id': store.id,
+                'name': store.name,
+                'inn': store.inn,
+                'total_debt': str(store.total_debt),
+                'paid_debt': str(store.paid_debt),
+                'last_payment_date': last_payment.paid_at if last_payment else None,
+                'orders_count': orders_count,
+            })
+
+        return Response(data)

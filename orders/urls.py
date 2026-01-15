@@ -25,7 +25,8 @@ router = DefaultRouter()
 router.register(r'store-orders', views.StoreOrderViewSet, basename='store-order')
 router.register(r'partner-requests', views.PartnerRequestViewSet, basename='partner-request')
 router.register(r'returned-items', views.ReturnedItemViewSet, basename='returned-item')
-
+router.register(r'partners/manual-orders',views.ManualOrderViewSet,basename='partner-manual-order')
+router.register(r'admin/partner-requests',views.PartnerRequestAdminViewSet,basename='admin-partner-request')
 
 urlpatterns = [
     path('', include(router.urls)),

@@ -18,12 +18,13 @@ from typing import Dict, Any
 
 from rest_framework import serializers
 
+from products.serializers import ProductListSerializer
 from .models import (
     Region,
     City,
     Store,
     StoreSelection,
-    StoreInventory,
+    StoreInventory, PartnerInventory,
 )
 
 
@@ -1036,16 +1037,104 @@ class ReportDefectResponseSerializer(serializers.Serializer):
 # =============================================================================
 
 class PartnerInventorySerializer(serializers.ModelSerializer):
-    partner_name = serializers.CharField(source='partner.get_full_name', read_only=True)
-    product_name = serializers.CharField(source='product.name', read_only=True)
-    available_quantity = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True)
-    
+    """
+    Сериализатор инвентаря партнёра (v3.0).
+
+    Показывает:
+    - Товар с полной информацией
+    - Общее количество
+    - Зарезервированное количество
+    - Доступное количество
+    """
+
+    product = ProductListSerializer(read_only=True)
+    available_quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        read_only=True,
+        help_text="Доступное количество (quantity - reserved_quantity)"
+    )
+
     class Meta:
-        from stores.models import PartnerInventory
         model = PartnerInventory
         fields = [
-            'id', 'partner', 'partner_name', 'product', 'product_name',
-            'quantity', 'reserved_quantity', 'available_quantity',
-            'created_at', 'updated_at'
+            'id',
+            'product',
+            'quantity',
+            'reserved_quantity',
+            'available_quantity',
+            'created_at',
+            'updated_at'
         ]
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class PartnerInventoryListSerializer(serializers.ModelSerializer):
+    """Сериализатор для списка инвентаря (упрощённый)."""
+
+    product_id = serializers.IntegerField(source='product.id', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_price = serializers.DecimalField(
+        source='product.price',
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+    is_weight_based = serializers.BooleanField(
+        source='product.is_weight_based',
+        read_only=True
+    )
+    available_quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        read_only=True
+    )
+    total_value = serializers.SerializerMethodField(
+        help_text="Общая стоимость (available_quantity * price)"
+    )
+
+    class Meta:
+        model = PartnerInventory
+        fields = [
+            'id',
+            'product_id',
+            'product_name',
+            'product_price',
+            'is_weight_based',
+            'quantity',
+            'reserved_quantity',
+            'available_quantity',
+            'total_value',
+            'updated_at'
+        ]
+
+    def get_total_value(self, obj: PartnerInventory) -> str:
+        """Рассчитать общую стоимость товара в инвентаре."""
+        if obj.product and obj.product.price:
+            total = obj.available_quantity * obj.product.price
+            return str(total)
+        return "0.00"
+
+
+class ReserveQuantitySerializer(serializers.Serializer):
+    """Сериализатор для резервирования товара."""
+
+    quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        min_value=Decimal('0.001'),
+        help_text="Количество для резервирования"
+    )
+
+
+class ReleaseQuantitySerializer(serializers.Serializer):
+    """Сериализатор для освобождения резерва."""
+
+    quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        min_value=Decimal('0.001'),
+        help_text="Количество для освобождения"
+    )
+
+

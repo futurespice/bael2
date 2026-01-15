@@ -58,7 +58,7 @@ from .models import (
     City,
     Store,
     StoreSelection,
-    StoreInventory,
+    StoreInventory, PartnerInventory,
 )
 from .serializers import (
     RegionSerializer,
@@ -75,7 +75,8 @@ from .serializers import (
     StoreApproveSerializer,
     StoreRejectSerializer,
     StoreFreezeSerializer,
-    StoreUnfreezeSerializer,
+    StoreUnfreezeSerializer, ReserveQuantitySerializer, PartnerInventorySerializer, ReleaseQuantitySerializer,
+    PartnerInventoryListSerializer,
 )
 from .services import (
     StoreService,
@@ -85,7 +86,7 @@ from .services import (
     BonusCalculationService,  # ✅ НОВОЕ v2.0
     StoreCreateData,
     StoreUpdateData,
-    StoreSearchFilters,
+    StoreSearchFilters, PartnerInventoryService,
 )
 from .permissions import IsAdmin, IsStore, IsAdminOrReadOnly
 from orders.models import (
@@ -1599,6 +1600,8 @@ class StoreViewSet(viewsets.ModelViewSet):
             'store_total_paid': float(store.total_paid)
         }, status=status.HTTP_201_CREATED)
 
+
+
     # ============================================================================
     # ИМПОРТЫ КОТОРЫЕ НУЖНО ДОБАВИТЬ В НАЧАЛО ФАЙЛА stores/views.py
     # ============================================================================
@@ -1777,21 +1780,171 @@ def get_users_in_store(request: Request, pk: int) -> Response:
 # =============================================================================
 # PARTNER INVENTORY (v3.0)
 # =============================================================================
-
+@extend_schema_view(
+    list=extend_schema(
+        summary="Список инвентаря партнёра",
+        description="Получить весь инвентарь партнёра с информацией о товарах",
+        tags=['Partners v3.0']
+    ),
+    retrieve=extend_schema(
+        summary="Детали позиции инвентаря",
+        description="Получить подробную информацию о позиции в инвентаре",
+        tags=['Partners v3.0']
+    ),
+    reserve=extend_schema(
+        summary="Зарезервировать товар",
+        description="Зарезервировать указанное количество товара для заказа",
+        tags=['Partners v3.0'],
+        request=ReserveQuantitySerializer,
+        responses={
+            200: PartnerInventorySerializer,
+            400: OpenApiTypes.OBJECT
+        }
+    ),
+    release=extend_schema(
+        summary="Освободить резерв",
+        description="Освободить зарезервированное количество товара",
+        tags=['Partners v3.0'],
+        request=ReleaseQuantitySerializer,
+        responses={
+            200: PartnerInventorySerializer,
+            400: OpenApiTypes.OBJECT
+        }
+    )
+)
 class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated]
-    pagination_class = StandardPagination
-    
-    def get_serializer_class(self):
-        from .serializers import PartnerInventorySerializer
-        return PartnerInventorySerializer
-    
+    """
+    ViewSet для управления инвентарём партнёра (v3.0).
+
+    Функциональность:
+    - Просмотр инвентаря (список и детали)
+    - Резервирование товаров для заказов
+    - Освобождение резерва при отмене
+
+    Permissions:
+    - Только партнёры (IsPartner)
+    - Каждый партнёр видит только свой инвентарь
+    """
+
+    permission_classes = [IsAuthenticated, IsPartner]
+
     def get_queryset(self):
-        from .models import PartnerInventory
-        queryset = PartnerInventory.objects.select_related('partner', 'product')
-        
-        if self.request.user.role == 'admin':
-            return queryset
-        elif self.request.user.role == 'partner':
-            return queryset.filter(partner=self.request.user)
-        return queryset.none()
+        """
+        Получить инвентарь ТОЛЬКО текущего партнёра.
+
+        Фильтры:
+        - product: ID товара
+        - has_stock: true/false (есть ли товар в наличии)
+        - min_quantity: минимальное количество
+        """
+        queryset = PartnerInventory.objects.filter(
+            partner=self.request.user
+        ).select_related('product').order_by('product__name')
+
+        # Фильтр по товару
+        product_id = self.request.query_params.get('product')
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+
+        # Фильтр: есть ли товар в наличии
+        has_stock = self.request.query_params.get('has_stock')
+        if has_stock == 'true':
+            queryset = queryset.filter(quantity__gt=Decimal('0'))
+        elif has_stock == 'false':
+            queryset = queryset.filter(quantity=Decimal('0'))
+
+        # Фильтр: минимальное количество
+        min_quantity = self.request.query_params.get('min_quantity')
+        if min_quantity:
+            try:
+                queryset = queryset.filter(quantity__gte=Decimal(min_quantity))
+            except (ValueError, TypeError):
+                pass
+
+        return queryset
+
+    def get_serializer_class(self):
+        """Выбрать сериализатор в зависимости от действия."""
+        if self.action == 'list':
+            return PartnerInventoryListSerializer
+        elif self.action == 'reserve':
+            return ReserveQuantitySerializer
+        elif self.action == 'release':
+            return ReleaseQuantitySerializer
+        return PartnerInventorySerializer
+
+    @action(detail=True, methods=['post'], url_path='reserve')
+    def reserve(self, request: Request, pk=None) -> Response:
+        """
+        Зарезервировать товар из инвентаря.
+
+        Используется при создании ручного заказа (manual order).
+        Резервирование предотвращает двойную продажу.
+        """
+        inventory = self.get_object()
+        serializer = ReserveQuantitySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        quantity = serializer.validated_data['quantity']
+
+        try:
+            PartnerInventoryService.reserve_quantity(
+                partner=request.user,
+                product=inventory.product,
+                quantity=quantity
+            )
+
+            # Обновить объект
+            inventory.refresh_from_db()
+
+            return Response(
+                {
+                    'message': 'Товар успешно зарезервирован',
+                    'inventory': PartnerInventorySerializer(inventory).data
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(detail=True, methods=['post'], url_path='release')
+    def release(self, request: Request, pk=None) -> Response:
+        """
+        Освободить зарезервированный товар.
+
+        Используется при отмене заказа или возврате товара.
+        """
+        inventory = self.get_object()
+        serializer = ReleaseQuantitySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        quantity = serializer.validated_data['quantity']
+
+        try:
+            PartnerInventoryService.release_reserved(
+                partner=request.user,
+                product=inventory.product,
+                quantity=quantity
+            )
+
+            # Обновить объект
+            inventory.refresh_from_db()
+
+            return Response(
+                {
+                    'message': 'Резерв успешно освобождён',
+                    'inventory': PartnerInventorySerializer(inventory).data
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+

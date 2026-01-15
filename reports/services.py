@@ -741,3 +741,134 @@ class PartnerStatisticsService:
             date_to = now
         
         return date_from, date_to
+
+
+# =============================================================================
+# PARTNER PROFILE SERVICE (v3.0)
+# =============================================================================
+
+class PartnerProfileService:
+    """
+    Сервис для получения профиля партнёра.
+    
+    ТЗ v3.0: "Профиль партнёра показывает историю продаж по магазинам
+    с детализацией по товарам за выбранный период."
+    """
+    
+    @staticmethod
+    def get_profile_data(
+        partner_id: int,
+        period: str = 'month',
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """
+        Получить данные профиля партнёра.
+        
+        Args:
+            partner_id: ID партнёра
+            period: Период (day/week/month/half_year/year/all_time)
+            date_from: Начальная дата (опционально)
+            date_to: Конечная дата (опционально)
+            
+        Returns:
+            Dict с данными:
+            - period: выбранный период
+            - stores: список магазинов с заказами
+            - total_all_stores: общая сумма по всем магазинам
+            
+        Пример структуры:
+            {
+                'period': 'month',
+                'date_from': '2026-01-01',
+                'date_to': '2026-01-31',
+                'stores': [
+                    {
+                        'store_name': 'Магазин №1',
+                        'store_inn': '01234567890123',
+                        'orders': [
+                            {
+                                'date': '2026-01-09',
+                                'product_name': 'Пельмени',
+                                'quantity': 20,
+                                'price_per_unit': '200.00',
+                                'total_amount': '4000.00'
+                            }
+                        ],
+                        'total_sold': '6250.00'
+                    }
+                ],
+                'total_all_stores': '25000.00'
+            }
+        """
+        from orders.models import StoreOrderItem
+        
+        # Определить диапазон дат
+        if not date_from or not date_to:
+            date_from, date_to = PartnerStatisticsService._get_date_range(period)
+        
+        # Получить заказы партнёра за период
+        orders = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            status=StoreOrderStatus.ACCEPTED,
+            confirmed_at__range=[date_from, date_to]
+        ).select_related('store').prefetch_related(
+            'items__product'
+        ).order_by('confirmed_at')
+        
+        # Группировка по магазинам
+        stores_data = {}
+        total_all_stores = Decimal('0')
+        
+        for order in orders:
+            store = order.store
+            store_key = store.id
+            
+            # Инициализация данных магазина
+            if store_key not in stores_data:
+                stores_data[store_key] = {
+                    'store_id': store.id,
+                    'store_name': store.name,
+                    'store_inn': store.inn,
+                    'store_owner': store.owner_name,
+                    'orders': [],
+                    'total_sold': Decimal('0')
+                }
+            
+            # Добавляем товары из заказа
+            for item in order.items.all():
+                product = item.product
+                
+                order_item_data = {
+                    'date': order.confirmed_at.strftime('%Y-%m-%d'),
+                    'product_name': product.name,
+                    'quantity': float(item.quantity),
+                    'weight': float(item.weight) if item.weight else None,
+                    'price_per_unit': str(item.price),
+                    'total_amount': str(item.total)
+                }
+                
+                stores_data[store_key]['orders'].append(order_item_data)
+                stores_data[store_key]['total_sold'] += item.total
+                total_all_stores += item.total
+        
+        # Преобразование в список
+        stores_list = []
+        for store_data in stores_data.values():
+            store_data['total_sold'] = str(store_data['total_sold'])
+            stores_list.append(store_data)
+        
+        # Сортировка по total_sold (убывание)
+        stores_list.sort(
+            key=lambda x: Decimal(x['total_sold']),
+            reverse=True
+        )
+        
+        return {
+            'period': period,
+            'date_from': date_from.date().isoformat() if date_from else None,
+            'date_to': date_to.date().isoformat() if date_to else None,
+            'stores': stores_list,
+            'total_all_stores': str(total_all_stores),
+            'stores_count': len(stores_list)
+        }

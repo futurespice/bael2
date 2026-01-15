@@ -873,3 +873,286 @@ class GeographyService:
     def get_cities_by_region(cls, region_id: int) -> QuerySet[City]:
         """Получить города региона."""
         return City.objects.filter(region_id=region_id).order_by('name')
+
+
+# =============================================================================
+# PARTNER INVENTORY SERVICE (v3.0)
+# =============================================================================
+
+class PartnerInventoryService:
+    """
+    Сервис для управления инвентарём партнёра (v3.0).
+    
+    ФУНКЦИОНАЛЬНОСТЬ:
+    - Добавление товаров в инвентарь (через одобрение PartnerRequest)
+    - Удаление товаров из инвентаря (через возврат админу)
+    - Резервирование товаров (для заказов)
+    - Освобождение зарезервированных товаров
+    
+    WORKFLOW:
+    1. Партнёр запрашивает товары у админа → PartnerRequest
+    2. Админ одобряет → товары добавляются в PartnerInventory
+    3. Партнёр создаёт заказ → товары резервируются
+    4. Заказ подтверждается → товары переходят в StoreInventory
+    5. Партнёр возвращает товары админу → PartnerRequest type=return
+    """
+    
+    @classmethod
+    @transaction.atomic
+    def add_to_inventory(
+        cls,
+        *,
+        partner: 'User',
+        product: 'Product',
+        quantity: Decimal,
+        source_request: Optional['PartnerRequest'] = None
+    ) -> 'PartnerInventory':
+        """
+        Добавить товары в инвентарь партнёра.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Количество
+            source_request: Запрос партнёра (если есть)
+            
+        Returns:
+            PartnerInventory запись
+            
+        Raises:
+            ValidationError: Если партнёр неверный или количество <= 0
+        """
+        from .models import PartnerInventory
+        
+        # Валидация
+        if partner.role != 'partner':
+            raise ValidationError('Только партнёры могут иметь инвентарь')
+            
+        if quantity <= Decimal('0'):
+            raise ValidationError('Количество должно быть больше 0')
+        
+        # Получить или создать инвентарь
+        inventory, created = PartnerInventory.objects.get_or_create(
+            partner=partner,
+            product=product,
+            defaults={'quantity': Decimal('0')}
+        )
+        
+        # Увеличить количество
+        inventory.quantity += quantity
+        inventory.save(update_fields=['quantity', 'updated_at'])
+        
+        logger.info(
+            f"Добавлено в инвентарь партнёра {partner.id}: "
+            f"{product.name} x{quantity} (итого: {inventory.quantity})"
+        )
+        
+        return inventory
+    
+    @classmethod
+    @transaction.atomic
+    def remove_from_inventory(
+        cls,
+        *,
+        partner: 'User',
+        product: 'Product',
+        quantity: Decimal
+    ) -> 'PartnerInventory':
+        """
+        Удалить товары из инвентаря партнёра.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Количество
+            
+        Returns:
+            PartnerInventory запись
+            
+        Raises:
+            ValidationError: Если недостаточно товаров
+        """
+        from .models import PartnerInventory
+        
+        try:
+            inventory = PartnerInventory.objects.get(
+                partner=partner,
+                product=product
+            )
+        except PartnerInventory.DoesNotExist:
+            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+        
+        # Проверка доступного количества
+        if inventory.available_quantity < quantity:
+            raise ValidationError(
+                f'Недостаточно товара {product.name}. '
+                f'Доступно: {inventory.available_quantity}, запрошено: {quantity}'
+            )
+        
+        # Уменьшить количество
+        inventory.quantity -= quantity
+        
+        # Удалить запись если количество = 0
+        if inventory.quantity == Decimal('0'):
+            inventory.delete()
+            logger.info(f"Удалена запись инвентаря: {product.name} у партнёра {partner.id}")
+        else:
+            inventory.save(update_fields=['quantity', 'updated_at'])
+            logger.info(
+                f"Удалено из инвентаря партнёра {partner.id}: "
+                f"{product.name} x{quantity} (осталось: {inventory.quantity})"
+            )
+        
+        return inventory
+    
+    @classmethod
+    @transaction.atomic
+    def reserve_quantity(
+        cls,
+        *,
+        partner: 'User',
+        product: 'Product',
+        quantity: Decimal
+    ) -> 'PartnerInventory':
+        """
+        Зарезервировать товары для заказа.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Количество
+            
+        Returns:
+            PartnerInventory запись
+            
+        Raises:
+            ValidationError: Если недостаточно доступных товаров
+        """
+        from .models import PartnerInventory
+        
+        try:
+            inventory = PartnerInventory.objects.select_for_update().get(
+                partner=partner,
+                product=product
+            )
+        except PartnerInventory.DoesNotExist:
+            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+        
+        # Проверка доступного количества
+        if inventory.available_quantity < quantity:
+            raise ValidationError(
+                f'Недостаточно товара {product.name}. '
+                f'Доступно: {inventory.available_quantity}, запрошено: {quantity}'
+            )
+        
+        # Зарезервировать
+        inventory.reserved_quantity += quantity
+        inventory.save(update_fields=['reserved_quantity', 'updated_at'])
+        
+        logger.info(
+            f"Зарезервировано у партнёра {partner.id}: "
+            f"{product.name} x{quantity} (всего зарезервировано: {inventory.reserved_quantity})"
+        )
+        
+        return inventory
+    
+    @classmethod
+    @transaction.atomic
+    def release_reserved(
+        cls,
+        *,
+        partner: 'User',
+        product: 'Product',
+        quantity: Decimal
+    ) -> 'PartnerInventory':
+        """
+        Освободить зарезервированные товары.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Количество
+            
+        Returns:
+            PartnerInventory запись
+            
+        Raises:
+            ValidationError: Если зарезервировано меньше чем пытаются освободить
+        """
+        from .models import PartnerInventory
+        
+        try:
+            inventory = PartnerInventory.objects.select_for_update().get(
+                partner=partner,
+                product=product
+            )
+        except PartnerInventory.DoesNotExist:
+            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+        
+        # Проверка
+        if inventory.reserved_quantity < quantity:
+            raise ValidationError(
+                f'Зарезервировано только {inventory.reserved_quantity}, '
+                f'попытка освободить {quantity}'
+            )
+        
+        # Освободить
+        inventory.reserved_quantity -= quantity
+        inventory.save(update_fields=['reserved_quantity', 'updated_at'])
+        
+        logger.info(
+            f"Освобождено у партнёра {partner.id}: "
+            f"{product.name} x{quantity} (осталось зарезервировано: {inventory.reserved_quantity})"
+        )
+        
+        return inventory
+    
+    @classmethod
+    def get_partner_inventory(cls, partner: 'User') -> QuerySet:
+        """
+        Получить весь инвентарь партнёра.
+        
+        Args:
+            partner: Партнёр
+            
+        Returns:
+            QuerySet[PartnerInventory]
+        """
+        from .models import PartnerInventory
+        
+        if partner.role != 'partner':
+            raise ValidationError('Только партнёры имеют инвентарь')
+        
+        return PartnerInventory.objects.filter(
+            partner=partner
+        ).select_related('product').order_by('product__name')
+    
+    @classmethod
+    def check_availability(
+        cls,
+        *,
+        partner: 'User',
+        product: 'Product',
+        quantity: Decimal
+    ) -> bool:
+        """
+        Проверить доступность товара в инвентаре.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Требуемое количество
+            
+        Returns:
+            True если товара достаточно, False иначе
+        """
+        from .models import PartnerInventory
+        
+        try:
+            inventory = PartnerInventory.objects.get(
+                partner=partner,
+                product=product
+            )
+            return inventory.available_quantity >= quantity
+        except PartnerInventory.DoesNotExist:
+            return False
