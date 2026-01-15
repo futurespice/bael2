@@ -51,40 +51,40 @@ class PartnerRequestStatus(models.TextChoices):
 
 class PartnerRequest(models.Model):
     """Запросы партнера на товары."""
-    
+
     partner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         limit_choices_to={'role': 'partner'},
         related_name='product_requests'
     )
-    
+
     product = models.ForeignKey(
         'products.Product',
         on_delete=models.PROTECT,
         related_name='partner_requests'
     )
-    
+
     request_type = models.CharField(
         max_length=10,
         choices=PartnerRequestType.choices
     )
-    
+
     status = models.CharField(
         max_length=10,
         choices=PartnerRequestStatus.choices,
         default=PartnerRequestStatus.PENDING,
         db_index=True
     )
-    
+
     quantity = models.DecimalField(
         max_digits=12,
         decimal_places=3,
         validators=[MinValueValidator(Decimal('0.001'))]
     )
-    
+
     reason = models.TextField(blank=True)
-    
+
     reviewed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -92,13 +92,13 @@ class PartnerRequest(models.Model):
         blank=True,
         related_name='reviewed_partner_requests'
     )
-    
+
     reviewed_at = models.DateTimeField(null=True, blank=True)
     rejection_reason = models.TextField(blank=True)
-    
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+
     class Meta:
         db_table = 'partner_requests'
         ordering = ['-created_at']
@@ -106,10 +106,10 @@ class PartnerRequest(models.Model):
             models.Index(fields=['partner', 'status']),
             models.Index(fields=['status', 'created_at']),
         ]
-    
+
     def __str__(self):
         return f"{self.get_request_type_display()}: {self.product.name} - {self.get_status_display()}"
-    
+
     @property
     def is_pending(self):
         return self.status == PartnerRequestStatus.PENDING
@@ -357,6 +357,12 @@ class StoreOrder(models.Model):
         verbose_name='Причина отказа'
     )
 
+    notes = models.TextField(
+        blank=True,
+        verbose_name='Примечания к заказу',
+        help_text='Дополнительные примечания (используется в ручных заказах)'
+    )
+
     # Idempotency
     idempotency_key = models.CharField(
         max_length=64,
@@ -521,63 +527,134 @@ class StoreOrderItem(models.Model):
 # =============================================================================
 
 class ReturnedItem(models.Model):
-    """Возвращенные товары из заказов."""
-    
+    """
+    Возвращенные товары из заказов (v3.0).
+
+    Для штучных товаров: используется quantity
+    Для весовых товаров: quantity=1, weight=вес в кг
+    """
+
     order = models.ForeignKey(
         'StoreOrder',
         on_delete=models.CASCADE,
-        related_name='returned_items'
+        related_name='returned_items',
+        verbose_name='Заказ'
     )
-    
+
     product = models.ForeignKey(
         'products.Product',
         on_delete=models.PROTECT,
-        related_name='returned_items'
+        related_name='returned_items',
+        verbose_name='Товар'
     )
-    
+
     quantity = models.DecimalField(
         max_digits=12,
         decimal_places=3,
-        validators=[MinValueValidator(Decimal('0.001'))]
+        validators=[MinValueValidator(Decimal('0.001'))],
+        verbose_name='Количество',
+        help_text='Для штучных: количество шт, для весовых: обычно 1'
     )
-    
+
+    weight = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.1'))],
+        verbose_name='Вес (кг)',
+        help_text='Только для весовых товаров, шаг 0.1 кг'
+    )
+
     price_at_return = models.DecimalField(
         max_digits=12,
         decimal_places=2,
-        validators=[MinValueValidator(Decimal('0'))]
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Цена на момент возврата',
+        help_text='За 1 шт или за 1 кг для весовых'
     )
-    
+
     total_amount = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        validators=[MinValueValidator(Decimal('0'))]
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Общая сумма'
     )
-    
-    reason = models.TextField(blank=True)
-    
+
+    reason = models.TextField(
+        blank=True,
+        verbose_name='Причина возврата'
+    )
+
     returned_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='returned_items'
+        related_name='returned_items',
+        verbose_name='Кто вернул'
     )
-    
-    returned_at = models.DateTimeField(auto_now_add=True)
-    
+
+    returned_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name='Дата возврата'
+    )
+
     class Meta:
         db_table = 'returned_items'
         ordering = ['-returned_at']
+        verbose_name = 'Возвращённый товар'
+        verbose_name_plural = 'Возвращённые товары'
         indexes = [
             models.Index(fields=['order', 'product']),
+            models.Index(fields=['-returned_at']),
         ]
-    
+
     def __str__(self):
-        return f"Возврат: {self.product.name} ({self.quantity}) из заказа #{self.order.id}"
-    
+        if self.weight:
+            return f"Возврат: {self.product.name} ({self.weight} кг) из заказа #{self.order.id}"
+        return f"Возврат: {self.product.name} ({self.quantity} шт) из заказа #{self.order.id}"
+
     def save(self, *args, **kwargs):
-        self.total_amount = self.quantity * self.price_at_return
+        """
+        Автоматический расчёт total_amount.
+
+        Для весовых: (price_at_return / 10) × (weight / 0.1)
+        Для штучных: price_at_return × quantity
+        """
+        if self.product.is_weight_based and self.weight:
+            # Весовой товар: цена за 100г × количество 100г
+            price_per_100g = self.price_at_return / Decimal('10')
+            units_100g = self.weight / Decimal('0.1')
+            self.total_amount = price_per_100g * units_100g
+        else:
+            # Штучный товар
+            self.total_amount = self.quantity * self.price_at_return
+
         super().save(*args, **kwargs)
+
+    def clean(self):
+        """Валидация данных."""
+        from django.core.exceptions import ValidationError
+
+        # Для весовых товаров обязателен weight
+        if self.product and self.product.is_weight_based:
+            if not self.weight:
+                raise ValidationError({
+                    'weight': 'Для весовых товаров обязательно указать вес'
+                })
+
+            # Проверка шага 0.1 кг
+            if self.weight % Decimal('0.1') != 0:
+                raise ValidationError({
+                    'weight': 'Вес должен быть кратен 0.1 кг (100 грамм)'
+                })
+
+        # Для штучных товаров weight должен быть пустым
+        elif self.weight:
+            raise ValidationError({
+                'weight': 'Штучные товары не имеют веса'
+            })
 
 
 # =============================================================================

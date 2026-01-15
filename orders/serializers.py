@@ -272,7 +272,7 @@ class StoreOrderDetailSerializer(serializers.ModelSerializer):
         source='get_status_display',
         read_only=True
     )
-    
+
     # Тип заказа (v3.0)
     order_type_display = serializers.CharField(
         source='get_order_type_display',
@@ -1087,7 +1087,7 @@ class ManualOrderItemReadSerializer(serializers.ModelSerializer):
             'product',
             'quantity',
             'price',
-            'total_amount',
+            'total',
             'is_bonus'
         ]
         read_only_fields = fields
@@ -1213,12 +1213,20 @@ class ManualOrderListSerializer(serializers.ModelSerializer):
 
 
 class ReturnedItemSerializer(serializers.ModelSerializer):
-    """Полная информация о возвращённом товаре."""
+    """
+    Полная информация о возвращённом товаре.
+
+    Поддерживает штучные и весовые товары.
+    """
 
     order = serializers.SerializerMethodField()
     product = ProductListSerializer(read_only=True)
     returned_by = serializers.SerializerMethodField()
-    total = serializers.SerializerMethodField()
+
+    # Добавляем человекочитаемое отображение
+    quantity_display = serializers.SerializerMethodField(
+        help_text='Количество с единицей измерения'
+    )
 
     class Meta:
         model = ReturnedItem
@@ -1228,12 +1236,14 @@ class ReturnedItemSerializer(serializers.ModelSerializer):
             'product',
             'quantity',
             'weight',
-            'price',
-            'total',
+            'quantity_display',
+            'price_at_return',
+            'total_amount',
             'reason',
             'returned_at',
             'returned_by',
         ]
+        read_only_fields = ['id', 'total_amount', 'returned_at']
 
     def get_order(self, obj) -> dict:
         """Информация о заказе."""
@@ -1254,23 +1264,43 @@ class ReturnedItemSerializer(serializers.ModelSerializer):
             }
         return None
 
-    def get_total(self, obj) -> Decimal:
-        """Общая стоимость возвращённых товаров."""
+    def get_quantity_display(self, obj) -> str:
+        """
+        Человекочитаемое отображение количества.
+
+        Примеры:
+        - Штучный: "10 шт"
+        - Весовой: "2.5 кг"
+        """
         if obj.product.is_weight_based and obj.weight:
             # Весовой товар
-            return (obj.price / 10) * (obj.weight / Decimal('0.1'))
+            weight = obj.weight
+            if weight == int(weight):
+                return f"{int(weight)} кг"
+            return f"{weight} кг"
         else:
             # Штучный товар
-            return obj.price * obj.quantity
+            qty = int(obj.quantity)
+            return f"{qty} шт"
 
 
 class ReturnedItemListSerializer(serializers.ModelSerializer):
-    """Упрощённый сериализатор для списка возвращённых товаров."""
+    """
+    Упрощённый сериализатор для списка возвращённых товаров.
+
+    Показывает краткую информацию с поддержкой весовых товаров.
+    """
 
     order_id = serializers.IntegerField(source='order.id', read_only=True)
     store_name = serializers.CharField(source='order.store.name', read_only=True)
     product_name = serializers.CharField(source='product.name', read_only=True)
-    total = serializers.SerializerMethodField()
+    is_weight_based = serializers.BooleanField(
+        source='product.is_weight_based',
+        read_only=True
+    )
+    quantity_display = serializers.SerializerMethodField(
+        help_text='Количество с единицей измерения'
+    )
 
     class Meta:
         model = ReturnedItem
@@ -1279,16 +1309,119 @@ class ReturnedItemListSerializer(serializers.ModelSerializer):
             'order_id',
             'store_name',
             'product_name',
+            'is_weight_based',
             'quantity',
             'weight',
-            'price',
-            'total',
+            'quantity_display',
+            'price_at_return',
+            'total_amount',
             'reason',
             'returned_at',
         ]
+        read_only_fields = fields
 
-    def get_total(self, obj) -> Decimal:
-        """Общая стоимость."""
+    def get_quantity_display(self, obj) -> str:
+        """
+        Человекочитаемое отображение количества.
+
+        Примеры:
+        - Штучный: "10 шт"
+        - Весовой: "2.5 кг"
+        """
         if obj.product.is_weight_based and obj.weight:
-            return (obj.price / 10) * (obj.weight / Decimal('0.1'))
-        return obj.price * obj.quantity
+            # Весовой товар
+            weight = obj.weight
+            if weight == int(weight):
+                return f"{int(weight)} кг"
+            return f"{weight} кг"
+        else:
+            # Штучный товар
+            qty = int(obj.quantity)
+            return f"{qty} шт"
+
+
+# =============================================================================
+# RETURNED ITEM CREATE SERIALIZER
+# =============================================================================
+
+class ReturnedItemCreateSerializer(serializers.Serializer):
+    """
+    Сериализатор для создания возврата товара.
+
+    Поддерживает штучные и весовые товары.
+    Валидирует данные в зависимости от типа товара.
+    """
+
+    product = serializers.IntegerField(
+        min_value=1,
+        help_text="ID товара"
+    )
+
+    quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        min_value=Decimal('0.001'),
+        help_text="Количество (для штучных) или 1 (для весовых)"
+    )
+
+    weight = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        required=False,
+        allow_null=True,
+        min_value=Decimal('0.1'),
+        help_text="Вес в кг (только для весовых товаров)"
+    )
+
+    reason = serializers.CharField(
+        max_length=500,
+        required=False,
+        allow_blank=True,
+        help_text="Причина возврата"
+    )
+
+    def validate(self, attrs):
+        """Валидация в зависимости от типа товара."""
+        from products.models import Product
+
+        try:
+            product = Product.objects.get(pk=attrs['product'])
+        except Product.DoesNotExist:
+            raise serializers.ValidationError({
+                'product': f"Товар с ID {attrs['product']} не найден"
+            })
+
+        if product.is_weight_based:
+            # Весовой товар - обязателен weight
+            if not attrs.get('weight'):
+                raise serializers.ValidationError({
+                    'weight': 'Для весовых товаров обязательно указать вес'
+                })
+
+            # Проверка шага 0.1 кг
+            weight = attrs['weight']
+            if weight % Decimal('0.1') != 0:
+                raise serializers.ValidationError({
+                    'weight': 'Вес должен быть кратен 0.1 кг (100 грамм)'
+                })
+
+            # Минимум 0.1 кг
+            if weight < Decimal('0.1'):
+                raise serializers.ValidationError({
+                    'weight': 'Минимальный вес: 0.1 кг'
+                })
+        else:
+            # Штучный товар - weight должен быть пустым
+            if attrs.get('weight'):
+                raise serializers.ValidationError({
+                    'weight': 'Штучные товары не имеют веса'
+                })
+
+            # Количество должно быть целым
+            quantity = attrs['quantity']
+            if quantity != int(quantity):
+                raise serializers.ValidationError({
+                    'quantity': 'Количество штучных товаров должно быть целым числом'
+                })
+
+        return attrs
