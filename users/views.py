@@ -17,6 +17,7 @@ from django.core.mail import send_mail
 from django.conf import settings
 from django.utils import timezone
 from datetime import timedelta
+from drf_spectacular.utils import extend_schema, inline_serializer
 import random
 import string
 
@@ -33,6 +34,7 @@ from .serializers import (
 )
 from .permissions import IsAdminUser
 from .throttles import LoginThrottle, PasswordResetThrottle, RegistrationThrottle
+from rest_framework import serializers as drf_serializers
 
 
 class UserRegistrationView(generics.CreateAPIView):
@@ -150,6 +152,16 @@ class LoginView(generics.CreateAPIView):
         })
 
 
+@extend_schema(
+    request=inline_serializer(
+        name='LogoutRequest',
+        fields={'refresh': drf_serializers.CharField(required=False)}
+    ),
+    responses={200: inline_serializer(
+        name='LogoutResponse',
+        fields={'message': drf_serializers.CharField()}
+    )}
+)
 class LogoutView(generics.CreateAPIView):
     """
     Выход из системы - добавление токена в blacklist.
@@ -163,6 +175,7 @@ class LogoutView(generics.CreateAPIView):
     """
 
     permission_classes = [IsAuthenticated]
+    serializer_class = None  # Используем inline_serializer в @extend_schema
 
     def create(self, request, *args, **kwargs):
         try:

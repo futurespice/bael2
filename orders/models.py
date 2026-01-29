@@ -50,7 +50,19 @@ class PartnerRequestStatus(models.TextChoices):
 
 
 class PartnerRequest(models.Model):
-    """Запросы партнера на товары."""
+    """
+    Запросы партнера на товары (v3.0).
+    
+    ИЗМЕНЕНИЯ v3.0:
+    - Поддержка НЕСКОЛЬКИХ товаров через PartnerRequestItem
+    - Поля product/quantity оставлены для обратной совместимости
+    - Добавлено поле notes
+    
+    WORKFLOW:
+    1. Партнёр создаёт запрос с items[]
+    2. Админ одобряет/отклоняет
+    3. При одобрении товары → PartnerInventory
+    """
 
     partner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -59,10 +71,14 @@ class PartnerRequest(models.Model):
         related_name='product_requests'
     )
 
+    # Оставлено для обратной совместимости (для запросов с одним товаром)
     product = models.ForeignKey(
         'products.Product',
         on_delete=models.PROTECT,
-        related_name='partner_requests'
+        related_name='partner_requests',
+        null=True,
+        blank=True,
+        help_text='Для обратной совместимости. Используйте items для v3.0'
     )
 
     request_type = models.CharField(
@@ -77,13 +93,24 @@ class PartnerRequest(models.Model):
         db_index=True
     )
 
+    # Оставлено для обратной совместимости
     quantity = models.DecimalField(
         max_digits=12,
         decimal_places=3,
-        validators=[MinValueValidator(Decimal('0.001'))]
+        validators=[MinValueValidator(Decimal('0.001'))],
+        null=True,
+        blank=True,
+        help_text='Для обратной совместимости. Используйте items для v3.0'
     )
 
     reason = models.TextField(blank=True)
+    
+    # v3.0: Примечания к запросу
+    notes = models.TextField(
+        blank=True,
+        verbose_name='Примечания',
+        help_text='Дополнительные примечания к запросу'
+    )
 
     reviewed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -102,17 +129,147 @@ class PartnerRequest(models.Model):
     class Meta:
         db_table = 'partner_requests'
         ordering = ['-created_at']
+        verbose_name = 'Запрос партнёра'
+        verbose_name_plural = 'Запросы партнёров'
         indexes = [
             models.Index(fields=['partner', 'status']),
             models.Index(fields=['status', 'created_at']),
         ]
 
     def __str__(self):
-        return f"{self.get_request_type_display()}: {self.product.name} - {self.get_status_display()}"
+        items_count = self.items.count() if hasattr(self, 'items') else 0
+        if items_count > 0:
+            return f"{self.get_request_type_display()}: {items_count} товаров - {self.get_status_display()}"
+        elif self.product:
+            return f"{self.get_request_type_display()}: {self.product.name} - {self.get_status_display()}"
+        return f"{self.get_request_type_display()} - {self.get_status_display()}"
 
     @property
     def is_pending(self):
         return self.status == PartnerRequestStatus.PENDING
+    
+    @property
+    def total_amount(self) -> Decimal:
+        """Общая сумма запроса."""
+        if hasattr(self, 'items') and self.items.exists():
+            return sum(
+                item.quantity * item.price_at_request
+                for item in self.items.all()
+            )
+        elif self.product and self.quantity:
+            return self.quantity * self.product.final_price
+        return Decimal('0')
+    
+    @property
+    def items_count(self) -> int:
+        """Количество товаров в запросе."""
+        if hasattr(self, 'items'):
+            return self.items.count()
+        return 1 if self.product else 0
+
+
+class PartnerRequestItem(models.Model):
+    """
+    Позиция в запросе партнёра (v3.0).
+    
+    Позволяет добавлять несколько товаров в один запрос.
+    
+    Поддерживает:
+    - Штучные товары: quantity
+    - Весовые товары: quantity + weight
+    """
+
+    request = models.ForeignKey(
+        PartnerRequest,
+        on_delete=models.CASCADE,
+        related_name='items',
+        verbose_name='Запрос'
+    )
+
+    product = models.ForeignKey(
+        'products.Product',
+        on_delete=models.PROTECT,
+        related_name='partner_request_items',
+        verbose_name='Товар'
+    )
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal('0.001'))],
+        verbose_name='Количество',
+        help_text='Для штучных: количество шт. Для весовых: обычно 1'
+    )
+
+    weight = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.1'))],
+        verbose_name='Вес (кг)',
+        help_text='Только для весовых товаров, шаг 0.1 кг'
+    )
+
+    price_at_request = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Цена на момент запроса',
+        help_text='За 1 шт или за 1 кг для весовых'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'partner_request_items'
+        verbose_name = 'Позиция запроса партнёра'
+        verbose_name_plural = 'Позиции запросов партнёров'
+        unique_together = [['request', 'product']]
+        indexes = [
+            models.Index(fields=['request', 'product']),
+        ]
+
+    def __str__(self):
+        if self.weight:
+            return f"{self.product.name}: {self.weight} кг"
+        return f"{self.product.name}: {self.quantity} шт"
+
+    @property
+    def total_amount(self) -> Decimal:
+        """Общая сумма позиции."""
+        if self.product.is_weight_based and self.weight:
+            # Весовой: цена за 100г × кол-во 100г
+            price_per_100g = self.price_at_request / Decimal('10')
+            units_100g = self.weight / Decimal('0.1')
+            return price_per_100g * units_100g
+        else:
+            # Штучный
+            return self.quantity * self.price_at_request
+
+    def save(self, *args, **kwargs):
+        """Автоматическое заполнение цены."""
+        if not self.price_at_request and self.product:
+            self.price_at_request = self.product.final_price
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        """Валидация данных."""
+        from django.core.exceptions import ValidationError
+
+        if self.product and self.product.is_weight_based:
+            if not self.weight:
+                raise ValidationError({
+                    'weight': 'Для весовых товаров обязательно указать вес'
+                })
+            if self.weight % Decimal('0.1') != 0:
+                raise ValidationError({
+                    'weight': 'Вес должен быть кратен 0.1 кг'
+                })
+        elif self.weight:
+            raise ValidationError({
+                'weight': 'Штучные товары не имеют веса'
+            })
 
 
 # =============================================================================
@@ -482,6 +639,17 @@ class StoreOrderItem(models.Model):
         verbose_name='Количество'
     )
 
+    # v3.0: Вес для весовых товаров
+    weight = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.1'))],
+        verbose_name='Вес (кг)',
+        help_text='Только для весовых товаров, шаг 0.1 кг'
+    )
+
     price = models.DecimalField(
         max_digits=10,
         decimal_places=2,
@@ -698,6 +866,17 @@ class DefectiveProduct(models.Model):
         decimal_places=3,
         validators=[MinValueValidator(Decimal('0.001'))],
         verbose_name='Количество'
+    )
+
+    # v3.0: Вес для весовых товаров
+    weight = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.1'))],
+        verbose_name='Вес (кг)',
+        help_text='Только для весовых товаров'
     )
 
     price = models.DecimalField(

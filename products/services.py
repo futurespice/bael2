@@ -575,6 +575,10 @@ class ProductionService:
             notes=notes
         )
 
+        # Обновляем количество на складе (ТЗ v3.0)
+        product.stock_quantity += result.quantity_produced
+        product.save(update_fields=['stock_quantity'])
+
         return batch
 
     @classmethod
@@ -614,5 +618,9 @@ class ProductionService:
             input_type='suzerain',
             notes=notes
         )
+
+        # Обновляем количество на складе (ТЗ v3.0)
+        product.stock_quantity += result.quantity_produced
+        product.save(update_fields=['stock_quantity'])
 
         return batch

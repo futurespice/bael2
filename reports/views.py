@@ -17,9 +17,25 @@ from stores.models import Store
 from .serializers import ReportFiltersSerializer, StoreHistoryFiltersSerializer, PartnerStoreSerializer, PartnerTrackerOrderSerializer, PartnerStatisticsSerializer, PartnerProfileSerializer
 from .services import ReportService, ReportFilters, TimePeriod, PartnerProfileService, PartnerStatisticsService
 from users.permissions import IsPartnerUser
-from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
 from django.db.models import Q, Max, Count
 
+
+@extend_schema(
+    summary="Статистика (круговая диаграмма)",
+    description="Получить статистику с круговой диаграммой (ТЗ v2.0)",
+    parameters=[
+        OpenApiParameter('period', str, enum=['day', 'week', 'month', 'half_year', 'year', 'all_time']),
+        OpenApiParameter('start_date', str, description='YYYY-MM-DD'),
+        OpenApiParameter('end_date', str, description='YYYY-MM-DD'),
+        OpenApiParameter('store_id', int),
+        OpenApiParameter('partner_id', int),
+        OpenApiParameter('region_id', int),
+        OpenApiParameter('city_id', int),
+    ],
+    responses={200: OpenApiResponse(description="Statistics response")},
+    tags=['Reports']
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_statistics(request: Request) -> Response:
@@ -86,6 +102,16 @@ def get_statistics(request: Request) -> Response:
     return Response(result)
 
 
+@extend_schema(
+    summary="История магазина",
+    description="История магазина с фильтрацией по дате (ТЗ v2.0)",
+    parameters=[
+        OpenApiParameter('start_date', str, description='YYYY-MM-DD'),
+        OpenApiParameter('end_date', str, description='YYYY-MM-DD'),
+    ],
+    responses={200: OpenApiResponse(description="Store history response")},
+    tags=['Reports']
+)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_store_history(request: Request, store_id: int) -> Response:
@@ -296,6 +322,10 @@ class PartnerTrackerViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         """Получить заказы партнёра."""
         from orders.models import StoreOrder
+        
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return StoreOrder.objects.none()
 
         order_type = self.request.query_params.get('type', 'all')
 

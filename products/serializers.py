@@ -12,6 +12,8 @@
 from rest_framework import serializers
 from decimal import Decimal
 from datetime import date
+from drf_spectacular.utils import extend_schema_field
+from typing import List, Dict, Any
 
 from .models import (
     Expense,
@@ -24,6 +26,27 @@ from .models import (
     ProductExpenseRelation,
     PartnerExpense,
 )
+
+
+# =============================================================================
+# ВАЛИДАЦИЯ ИЗОБРАЖЕНИЙ
+# =============================================================================
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+def validate_image_size(image):
+    """
+    Валидация размера изображения (макс 5 МБ).
+    
+    ТЗ v3.0: Изображения до 5 МБ, JPG/PNG.
+    """
+    if image.size > MAX_IMAGE_SIZE:
+        size_mb = image.size / 1024 / 1024
+        raise serializers.ValidationError(
+            f'Изображение слишком большое ({size_mb:.1f} МБ). Максимум 5 МБ.'
+        )
+    return image
 
 
 # =============================================================================
@@ -237,6 +260,10 @@ class ProductImageSerializer(serializers.ModelSerializer):
         fields = ['id', 'image', 'order', 'created_at']
         read_only_fields = ['id', 'created_at']
 
+    def validate_image(self, value):
+        """Валидация размера изображения (макс 5 МБ)."""
+        return validate_image_size(value)
+
 
 class ProductListSerializer(serializers.ModelSerializer):
     """Список товаров (для партнёров и магазинов)."""
@@ -262,7 +289,8 @@ class ProductListSerializer(serializers.ModelSerializer):
             'images'
         ]
 
-    def get_images(self, obj):
+    @extend_schema_field(serializers.ListSerializer(child=serializers.DictField()))
+    def get_images(self, obj) -> List[Dict[str, Any]]:
         return [
             {
                 'id': img.id,
@@ -276,7 +304,13 @@ class ProductListSerializer(serializers.ModelSerializer):
 class ProductDetailSerializer(serializers.ModelSerializer):
     """Детальная информация о товаре (для админа)."""
 
-    images = serializers.SerializerMethodField()
+    images_read = serializers.SerializerMethodField(source='images')
+    images = serializers.ListField(
+        child=serializers.ImageField(),
+        max_length=3,
+        required=False,
+        write_only=True
+    )
     recipe_items = ProductRecipeSerializer(many=True, read_only=True)
     unit_display = serializers.CharField(source='get_unit_display', read_only=True)
     profit = serializers.DecimalField(
@@ -307,6 +341,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'is_available',
             'popularity_weight',
             'images',
+            'images_read',
             'recipe_items',
             'created_at',
             'updated_at'
@@ -316,7 +351,9 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'price_per_100g', 'profit', 'created_at', 'updated_at'
         ]
 
-    def get_images(self, obj):
+    @extend_schema_field(serializers.ListSerializer(child=serializers.DictField()))
+    def get_images_read(self, obj) -> List[Dict[str, Any]]:
+        """Возвращает список изображений для чтения."""
         return [
             {
                 'id': img.id,
@@ -325,6 +362,33 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             }
             for img in obj.images.all()
         ]
+
+    def validate_images(self, value):
+        """Валидация размера изображений (макс 5 МБ)."""
+        for image in value:
+            validate_image_size(image)
+        return value
+
+    def update(self, instance, validated_data):
+        """Обновление товара с изображениями."""
+        images_data = validated_data.pop('images', None)
+
+        # Обновляем поля товара
+        instance = super().update(instance, validated_data)
+
+        # Если переданы изображения, заменяем старые
+        if images_data is not None:
+            # Удаляем старые изображения
+            instance.images.all().delete()
+            # Создаём новые
+            for i, image in enumerate(images_data[:3]):
+                ProductImage.objects.create(
+                    product=instance,
+                    image=image,
+                    order=i
+                )
+
+        return instance
 
 
 class ProductCreateSerializer(serializers.ModelSerializer):
@@ -359,6 +423,12 @@ class ProductCreateSerializer(serializers.ModelSerializer):
                 f'Товар с названием "{value}" уже существует'
             )
         return value.strip()
+
+    def validate_images(self, value):
+        """Валидация размера изображений (макс 5 МБ)."""
+        for image in value:
+            validate_image_size(image)
+        return value
 
     def validate(self, attrs):
         """Валидация."""

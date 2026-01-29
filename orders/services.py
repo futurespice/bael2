@@ -279,6 +279,169 @@ class OrderWorkflowService:
         return order
 
     # =========================================================================
+    # ПРИНЯТИЕ ПАРТНЁРОМ (v3.0) - PENDING → IN_TRANSIT
+    # =========================================================================
+
+    @classmethod
+    @transaction.atomic
+    def partner_accept_preorder(
+            cls,
+            *,
+            order: StoreOrder,
+            partner_user,
+    ) -> StoreOrder:
+        """
+        Партнёр принимает предзаказ (ТЗ v3.0).
+
+        ИЗМЕНЕНИЕ v3.0:
+        - Вместо админа заказ принимает партнёр
+        - PENDING → IN_TRANSIT
+        - Товары уменьшаются на складе
+        - Заказ появляется в "корзине" магазина
+
+        Args:
+            order: Заказ со статусом PENDING
+            partner_user: Партнёр
+
+        Returns:
+            StoreOrder
+
+        Raises:
+            ValidationError: При ошибках
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Валидация
+        if partner_user.role != 'partner':
+            raise ValidationError('Только партнёры могут принимать предзаказы')
+
+        if order.status != StoreOrderStatus.PENDING:
+            raise ValidationError(
+                f'Невозможно принять заказ в статусе "{order.get_status_display()}"'
+            )
+
+        if order.order_type != 'preorder':
+            raise ValidationError(
+                f'Только предзаказы можно принимать. Текущий тип: {order.order_type}'
+            )
+
+        # Проверка наличия товаров на складе и уменьшение остатков
+        order_items = order.items.select_related('product').all()
+
+        for item in order_items:
+            product = item.product
+
+            if product.stock_quantity < item.quantity:
+                raise ValidationError(
+                    f'Недостаточно товара "{product.name}" на складе. '
+                    f'Доступно: {product.stock_quantity}, требуется: {item.quantity}'
+                )
+
+        # Уменьшаем остатки на складе
+        for item in order_items:
+            product = item.product
+            product.stock_quantity -= item.quantity
+
+            if product.stock_quantity <= Decimal('0'):
+                product.stock_quantity = Decimal('0')
+                product.is_available = False
+
+            product.save(update_fields=['stock_quantity', 'is_available'])
+
+        # Изменение статуса
+        old_status = order.status
+        order.status = StoreOrderStatus.IN_TRANSIT
+        order.partner = partner_user
+        order.reviewed_by = partner_user
+        order.reviewed_at = timezone.now()
+
+        order.save(update_fields=['status', 'partner', 'reviewed_by', 'reviewed_at'])
+
+        # История
+        OrderHistory.objects.create(
+            order_type=OrderType.STORE,
+            order_id=order.id,
+            old_status=old_status,
+            new_status=StoreOrderStatus.IN_TRANSIT,
+            changed_by=partner_user,
+            comment=(
+                f'Предзаказ принят партнёром {partner_user.get_full_name()}. '
+                f'Товары в корзине магазина "{order.store.name}". '
+                f'Ожидает подтверждения.'
+            )
+        )
+
+        logger.info(
+            f"Предзаказ #{order.id} принят партнёром {partner_user.id} | "
+            f"Store: {order.store.name} | Amount: {order.total_amount}"
+        )
+
+        return order
+
+    # =========================================================================
+    # ОТКЛОНЕНИЕ ПАРТНЁРОМ (v3.0) - PENDING → REJECTED
+    # =========================================================================
+
+    @classmethod
+    @transaction.atomic
+    def partner_reject_preorder(
+            cls,
+            *,
+            order: StoreOrder,
+            partner_user,
+            reason: str = ''
+    ) -> StoreOrder:
+        """
+        Партнёр отклоняет предзаказ (ТЗ v3.0).
+
+        Args:
+            order: Заказ
+            partner_user: Партнёр
+            reason: Причина отклонения
+
+        Returns:
+            StoreOrder
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Валидация
+        if partner_user.role != 'partner':
+            raise ValidationError('Только партнёры могут отклонять предзаказы')
+
+        if order.status != StoreOrderStatus.PENDING:
+            raise ValidationError(
+                f'Невозможно отклонить заказ в статусе "{order.get_status_display()}"'
+            )
+
+        old_status = order.status
+        order.status = StoreOrderStatus.REJECTED
+        order.partner = partner_user
+        order.reviewed_by = partner_user
+        order.reviewed_at = timezone.now()
+        order.reject_reason = reason
+
+        order.save(update_fields=['status', 'partner', 'reviewed_by', 'reviewed_at', 'reject_reason'])
+
+        # История
+        OrderHistory.objects.create(
+            order_type=OrderType.STORE,
+            order_id=order.id,
+            old_status=old_status,
+            new_status=StoreOrderStatus.REJECTED,
+            changed_by=partner_user,
+            comment=f'Предзаказ отклонён партнёром. Причина: {reason}' if reason else 'Предзаказ отклонён'
+        )
+
+        logger.info(
+            f"Предзаказ #{order.id} отклонён партнёром {partner_user.id} | "
+            f"Reason: {reason}"
+        )
+
+        return order
+
+    # =========================================================================
     # ОТКЛОНЕНИЕ АДМИНОМ (PENDING → REJECTED)
     # =========================================================================
 
@@ -772,19 +935,24 @@ class PartnerRequestService:
     """
     Сервис для управления запросами партнёра (v3.0).
     
+    ИЗМЕНЕНИЯ v3.0:
+    - Поддержка нескольких товаров (items[])
+    - Создание PartnerRequestItem для каждого товара
+    - Поле notes вместо reason
+    
     ТИПЫ ЗАПРОСОВ:
     - REQUEST: Партнёр запрашивает товары у админа
     - RETURN: Партнёр возвращает товары админу
     
     WORKFLOW REQUEST:
-    1. Партнёр создаёт запрос (status=PENDING)
+    1. Партнёр создаёт запрос с items[] (status=PENDING)
     2. Админ одобряет (status=APPROVED)
        - Товары добавляются в PartnerInventory
        - Количество в каталоге админа уменьшается
     3. Админ отклоняет (status=REJECTED)
     
     WORKFLOW RETURN:
-    1. Партнёр создаёт возврат (status=PENDING)
+    1. Партнёр создаёт возврат с items[] (status=PENDING)
        - Товары резервируются в PartnerInventory
     2. Админ одобряет (status=APPROVED)
        - Товары удаляются из PartnerInventory
@@ -799,20 +967,18 @@ class PartnerRequestService:
         cls,
         *,
         partner: 'User',
-        product: Product,
-        quantity: Decimal,
         request_type: str,
-        reason: str = ''
+        items: List[dict],
+        notes: str = ''
     ) -> PartnerRequest:
         """
-        Создать запрос партнёра.
+        Создать запрос партнёра с несколькими товарами (v3.0).
         
         Args:
             partner: Партнёр
-            product: Товар
-            quantity: Количество
             request_type: Тип запроса (request/return)
-            reason: Причина запроса
+            items: Список товаров [{product: int, quantity: Decimal, weight: Decimal?}]
+            notes: Примечания к запросу
             
         Returns:
             PartnerRequest
@@ -821,6 +987,7 @@ class PartnerRequestService:
             ValidationError: При ошибках валидации
         """
         from stores.services import PartnerInventoryService
+        from .models import PartnerRequestItem
         import logging
         logger = logging.getLogger(__name__)
         
@@ -828,47 +995,80 @@ class PartnerRequestService:
         if partner.role != 'partner':
             raise ValidationError('Только партнёры могут создавать запросы')
             
-        if quantity <= Decimal('0'):
-            raise ValidationError('Количество должно быть больше 0')
+        if not items:
+            raise ValidationError('Список товаров не может быть пустым')
             
         if request_type not in [PartnerRequestType.REQUEST, PartnerRequestType.RETURN]:
             raise ValidationError(f'Неверный тип запроса: {request_type}')
         
-        # Дополнительная валидация для возврата
-        if request_type == PartnerRequestType.RETURN:
-            # Проверяем наличие товара в инвентаре партнёра
-            has_inventory = PartnerInventoryService.check_availability(
-                partner=partner,
-                product=product,
-                quantity=quantity
-            )
-            if not has_inventory:
-                raise ValidationError(
-                    f'Недостаточно товара {product.name} в инвентаре для возврата'
-                )
-            
-            # Резервируем товары
-            PartnerInventoryService.reserve_quantity(
-                partner=partner,
-                product=product,
-                quantity=quantity
-            )
-        
-        # Создаём запрос
+        # Создаём запрос (без product/quantity - они теперь в items)
         request = PartnerRequest.objects.create(
             partner=partner,
-            product=product,
-            quantity=quantity,
             request_type=request_type,
             status=PartnerRequestStatus.PENDING,
-            reason=reason,
-            price_at_request=product.price
+            notes=notes
         )
+        
+        # Создаём позиции запроса
+        for item_data in items:
+            product_id = item_data.get('product')
+            quantity = Decimal(str(item_data.get('quantity', 0)))
+            weight = item_data.get('weight')
+            
+            # Валидация
+            if quantity <= Decimal('0'):
+                request.delete()
+                raise ValidationError(f'Количество должно быть больше 0 для товара {product_id}')
+            
+            try:
+                product = Product.objects.get(pk=product_id)
+            except Product.DoesNotExist:
+                request.delete()
+                raise ValidationError(f'Товар с ID {product_id} не найден')
+            
+            # Валидация весовых товаров
+            if product.is_weight_based:
+                if not weight:
+                    request.delete()
+                    raise ValidationError(f'Для весового товара "{product.name}" необходимо указать вес')
+                weight = Decimal(str(weight))
+                if weight % Decimal('0.1') != 0:
+                    request.delete()
+                    raise ValidationError(f'Вес товара "{product.name}" должен быть кратен 0.1 кг')
+            
+            # Дополнительная валидация для возврата
+            if request_type == PartnerRequestType.RETURN:
+                has_inventory = PartnerInventoryService.check_availability(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity
+                )
+                if not has_inventory:
+                    request.delete()
+                    raise ValidationError(
+                        f'Недостаточно товара "{product.name}" в инвентаре для возврата'
+                    )
+                
+                # Резервируем товары
+                PartnerInventoryService.reserve_quantity(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity
+                )
+            
+            # Создаём позицию
+            PartnerRequestItem.objects.create(
+                request=request,
+                product=product,
+                quantity=quantity,
+                weight=weight if product.is_weight_based else None,
+                price_at_request=product.price
+            )
         
         logger.info(
             f"Создан запрос партнёра #{request.id} | "
             f"Partner: {partner.id} | Type: {request_type} | "
-            f"Product: {product.name} | Qty: {quantity}"
+            f"Items: {len(items)}"
         )
         
         return request

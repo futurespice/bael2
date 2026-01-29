@@ -294,6 +294,69 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
+    def set_pricing(self, request, pk=None):
+        """
+        Установить наценку товара (ТЗ v3.0).
+
+        POST /api/products/products/{id}/set-pricing/
+        Body: {"markup_percent": 400}
+        ИЛИ:  {"markup_amount": 170.87}
+
+        Ответ:
+        {
+            "id": 1,
+            "name": "Пельмени",
+            "average_cost_price": "79.13",
+            "markup_percentage": "400.00",
+            "final_price": "395.65",
+            "profit_per_unit": "316.52"
+        }
+        """
+        from decimal import Decimal
+
+        product = self.get_object()
+
+        markup_percent = request.data.get('markup_percent')
+        markup_amount = request.data.get('markup_amount')
+
+        if markup_percent is None and markup_amount is None:
+            return Response(
+                {'error': 'Укажите markup_percent или markup_amount'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                if markup_percent is not None:
+                    # Вариант 1: процент наценки
+                    product.markup_percentage = Decimal(str(markup_percent))
+                    product.manual_price = None  # Сбрасываем ручную цену
+                elif markup_amount is not None:
+                    # Вариант 2: сумма наценки
+                    markup_amount = Decimal(str(markup_amount))
+                    new_price = product.average_cost_price + markup_amount
+                    product.manual_price = new_price
+                    # Рассчитываем process от себестоимости
+                    if product.average_cost_price > 0:
+                        product.markup_percentage = (markup_amount / product.average_cost_price * 100).quantize(Decimal('0.01'))
+
+                product.save()
+
+            return Response({
+                'id': product.id,
+                'name': product.name,
+                'average_cost_price': str(product.average_cost_price),
+                'markup_percentage': str(product.markup_percentage),
+                'final_price': str(product.final_price),
+                'profit_per_unit': str(product.final_price - product.average_cost_price)
+            })
+
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 # =============================================================================
 # PRODUCTION BATCH VIEWSET
@@ -474,6 +537,10 @@ class PartnerExpenseViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Фильтрация."""
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return PartnerExpense.objects.none()
+        
         if self.request.user.role == 'admin':
             # Админ видит все расходы
             queryset = PartnerExpense.objects.all().select_related('partner')

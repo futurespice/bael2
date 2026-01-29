@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import Dict, Any, List, Optional
 from stores.models import Store
 from rest_framework import serializers
+from drf_spectacular.utils import extend_schema_field
 
 from products.models import Product
 from products.serializers import ProductListSerializer
@@ -933,28 +934,62 @@ class PartnerRequestItemReadSerializer(serializers.Serializer):
 
 
 class PartnerRequestCreateSerializer(serializers.Serializer):
-    """Сериализатор для создания запроса партнёра."""
+    """
+    Сериализатор для создания запроса партнёра.
+    
+    ТЗ v3.0: Поддержка ключей 'products' и 'reason'
+    + Обратная совместимость: 'items' и 'notes'
+    """
 
     request_type = serializers.ChoiceField(
         choices=['request', 'return'],
         help_text="Тип запроса: request (запрос товаров) или return (возврат)"
     )
+    
+    # ТЗ v3.0: основные ключи
+    products = PartnerRequestItemSerializer(
+        many=True,
+        required=False,
+        help_text="Список товаров (ТЗ v3.0)"
+    )
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=1000,
+        help_text="Примечания к запросу (ТЗ v3.0)"
+    )
+    
+    # Обратная совместимость
     items = PartnerRequestItemSerializer(
         many=True,
-        help_text="Список товаров"
+        required=False,
+        help_text="Список товаров (устаревший, используйте products)"
     )
     notes = serializers.CharField(
         required=False,
         allow_blank=True,
         max_length=1000,
-        help_text="Примечания к запросу"
+        help_text="Примечания к запросу (устаревший, используйте reason)"
     )
 
-    def validate_items(self, value):
-        """Проверить, что список товаров не пустой."""
-        if not value:
-            raise serializers.ValidationError("Список товаров не может быть пустым")
-        return value
+    def validate(self, attrs):
+        """Объединение ТЗ v3.0 и обратной совместимости."""
+        # Приоритет: products > items
+        products = attrs.get('products') or attrs.get('items')
+        if not products:
+            raise serializers.ValidationError({
+                "products": "Список товаров не может быть пустым"
+            })
+        
+        # Приоритет: reason > notes
+        reason = attrs.get('reason') or attrs.get('notes') or ''
+        
+        # Возвращаем унифицированные данные
+        return {
+            'request_type': attrs['request_type'],
+            'items': products,  # Внутренне используем items для сервиса
+            'notes': reason,    # Внутренне используем notes для сервиса
+        }
 
 
 class PartnerRequestSerializer(serializers.Serializer):
@@ -973,7 +1008,8 @@ class PartnerRequestSerializer(serializers.Serializer):
     approved_at = serializers.DateTimeField(read_only=True, allow_null=True)
     rejected_at = serializers.DateTimeField(read_only=True, allow_null=True)
 
-    def get_partner(self, obj):
+    @extend_schema_field(serializers.DictField())
+    def get_partner(self, obj) -> Optional[Dict[str, Any]]:
         """Информация о партнёре."""
         if hasattr(obj, 'partner'):
             return {

@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from drf_spectacular.utils import extend_schema_field
 from .models import User, PasswordResetRequest
 
 
@@ -142,7 +143,7 @@ class LoginSerializer(serializers.Serializer):
 class UserProfileSerializer(serializers.ModelSerializer):
     """Сериализатор профиля пользователя для просмотра и редактирования"""
 
-    full_name = serializers.ReadOnlyField()
+    full_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -151,6 +152,10 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'role', 'approval_status', 'is_active', 'avatar', 'created_at', 'last_login'
         ]
         read_only_fields = ['id', 'role', 'approval_status', 'is_active', 'created_at', 'last_login']
+
+    @extend_schema_field(serializers.CharField())
+    def get_full_name(self, obj) -> str:
+        return obj.full_name
 
     def validate_email(self, value):
         """Валидация email при изменении"""
@@ -184,7 +189,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
 class AdminUserListSerializer(serializers.ModelSerializer):
     """Сериализатор для списка пользователей (админ)"""
 
-    full_name = serializers.ReadOnlyField()
+    full_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -192,6 +197,10 @@ class AdminUserListSerializer(serializers.ModelSerializer):
             'id', 'phone', 'email', 'full_name', 'name', 'second_name',
             'role', 'approval_status', 'is_active', 'avatar', 'created_at', 'last_login'
         ]
+
+    @extend_schema_field(serializers.CharField())
+    def get_full_name(self, obj) -> str:
+        return obj.full_name
 
 
 class UserModerationSerializer(serializers.ModelSerializer):

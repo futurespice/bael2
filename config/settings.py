@@ -384,9 +384,7 @@ SPECTACULAR_SETTINGS = {
         'tryItOutEnabled': True,
     },
 
-    # ИСПРАВЛЕНО: используем CDN вместо SIDECAR
-    # Это избавляет от необходимости устанавливать drf-spectacular-sidecar
-    # и собирать статику для Swagger UI
+    # Используем CDN для Swagger UI (не SIDECAR)
 }
 
 # =============================================================================

@@ -606,11 +606,17 @@ class StoreInventory(models.Model):
     """
     Инвентарь магазина - все товары на складе магазина.
 
-    БИЗНЕС-ЛОГИКА (ТЗ v2.0):
+    БИЗНЕС-ЛОГИКА (ТЗ v3.0):
     1. Товары добавляются при одобрении заказа админом
     2. Все заказы складываются в ОДИН инвентарь
     3. Партнёр может удалить товары из инвентаря при подтверждении
     4. Магазин видит инвентарь только после статуса ACCEPTED
+    
+    ПОЛЯ УЧЁТА v3.0:
+    - quantity: Общее количество товара
+    - bonus_count: Количество бонусных товаров (каждый 21-й)
+    - paid_count: Количество оплаченных товаров
+    - defective_count: Количество бракованных товаров
     """
 
     store = models.ForeignKey(
@@ -632,7 +638,49 @@ class StoreInventory(models.Model):
         decimal_places=3,
         default=Decimal('0'),
         validators=[MinValueValidator(Decimal('0'))],
-        verbose_name='Количество'
+        verbose_name='Общее количество'
+    )
+
+    # v3.0: Вес для весовых товаров
+    weight = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.1'))],
+        verbose_name='Общий вес (кг)',
+        help_text='Только для весовых товаров'
+    )
+
+    # =========================================================================
+    # ПОЛЯ УЧЁТА v3.0
+    # =========================================================================
+    
+    bonus_count = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Бонусных товаров',
+        help_text='Количество бесплатных товаров (каждый 21-й)'
+    )
+
+    paid_count = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Оплаченных товаров',
+        help_text='Количество товаров, за которые магазин заплатил'
+    )
+
+    defective_count = models.DecimalField(
+        max_digits=10,
+        decimal_places=3,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Бракованных товаров',
+        help_text='Количество товаров, отмеченных как брак'
     )
 
     last_updated = models.DateTimeField(
@@ -671,6 +719,16 @@ class StoreInventory(models.Model):
         """Проверка: весовой ли товар."""
         return self.product.is_weight_based if self.product else False
 
+    @property
+    def available_count(self) -> Decimal:
+        """Доступное количество (общее - бракованное)."""
+        return self.quantity - self.defective_count
+
+    @property
+    def unpaid_count(self) -> Decimal:
+        """Неоплаченное количество товаров."""
+        return self.quantity - self.paid_count - self.bonus_count - self.defective_count
+
     def clean(self) -> None:
         """Валидация инвентаря."""
         super().clean()
@@ -681,12 +739,17 @@ class StoreInventory(models.Model):
 
     @transaction.atomic
     def add_quantity(self, amount: Decimal) -> None:
-        """Добавить количество товара в инвентарь."""
+        """Добавить количество товара в инвентарь и пересчитать бонусы."""
         if amount <= Decimal('0'):
             raise ValidationError('Количество для добавления должно быть больше 0')
 
         self.quantity += amount
-        self.save(update_fields=['quantity', 'last_updated'])
+        
+        # v3.0: Пересчитываем бонусы для штучных бонусных товаров
+        if self.product and self.product.is_bonus and not self.product.is_weight_based:
+            self.update_bonus_count()
+        else:
+            self.save(update_fields=['quantity', 'last_updated'])
 
     @transaction.atomic
     def subtract_quantity(self, amount: Decimal) -> None:
@@ -705,6 +768,27 @@ class StoreInventory(models.Model):
 
         if self.quantity == Decimal('0'):
             self.delete()
+
+    @transaction.atomic
+    def update_bonus_count(self) -> None:
+        """
+        Кумулятивный расчёт бонусов (ТЗ v3.0).
+        
+        Правило: каждый 21-й товар бесплатно.
+        Формула: bonus_count = total_quantity // 21
+        
+        ВАЖНО: Применяется только для штучных бонусных товаров!
+        """
+        if not self.product or self.product.is_weight_based or not self.product.is_bonus:
+            return
+        
+        total_qty = int(self.quantity)
+        new_bonus_count = total_qty // 21
+        new_paid_count = total_qty - new_bonus_count
+        
+        self.bonus_count = Decimal(str(new_bonus_count))
+        self.paid_count = Decimal(str(new_paid_count))
+        self.save(update_fields=['quantity', 'bonus_count', 'paid_count', 'last_updated'])
 
 
 # =============================================================================
@@ -739,6 +823,17 @@ class PartnerInventory(models.Model):
         decimal_places=3,
         default=Decimal('0'),
         validators=[MinValueValidator(Decimal('0'))]
+    )
+    
+    # v3.0: Связь с последним запросом партнёра
+    last_partner_request = models.ForeignKey(
+        'orders.PartnerRequest',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='inventory_updates',
+        verbose_name='Последний запрос',
+        help_text='Запрос, через который товары попали в инвентарь'
     )
     
     created_at = models.DateTimeField(auto_now_add=True)

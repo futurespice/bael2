@@ -102,6 +102,10 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self) -> QuerySet[StoreOrder]:
         """Получение заказов в зависимости от роли."""
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return StoreOrder.objects.none()
+        
         user = self.request.user
 
         if user.role == 'admin':
@@ -295,6 +299,13 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
     # ACTIONS ДЛЯ МАГАЗИНА
     # =========================================================================
 
+    @extend_schema(
+        summary="Заказы текущего магазина",
+        description="Список заказов, созданных текущим выбранным магазином",
+        operation_id="orders_store_my_orders_list",
+        responses={200: StoreOrderForStoreListSerializer(many=True)},
+        tags=['Магазин - Заказы']
+    )
     @action(
         detail=False,
         methods=['get'],
@@ -361,6 +372,21 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         serializer = StoreOrderForStoreListSerializer(orders, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary="Детали заказа магазина",
+        description="Детальная информация о конкретном заказе текущего магазина",
+        operation_id="orders_store_my_order_detail",
+        parameters=[
+            OpenApiParameter(
+                name='order_id',
+                type=int,
+                location=OpenApiParameter.PATH,
+                description='ID заказа'
+            )
+        ],
+        responses={200: StoreOrderDetailForStoreSerializer},
+        tags=['Магазин - Заказы']
+    )
     @action(
         detail=False,
         methods=['get'],
@@ -439,6 +465,144 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
             )
 
         serializer = StoreOrderDetailForStoreSerializer(order)
+        return Response(serializer.data)
+
+    # =========================================================================
+    # ACTIONS ДЛЯ ПАРТНЁРА (v3.0)
+    # =========================================================================
+
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='accept-preorder',
+        permission_classes=[IsAuthenticated, IsPartner]
+    )
+    def accept_preorder(self, request: Request, pk=None) -> Response:
+        """
+        Партнёр принимает предзаказ (ТЗ v3.0).
+
+        POST /api/orders/store-orders/{id}/accept-preorder/
+
+        WORKFLOW v3.0:
+        - Статус: PENDING → IN_TRANSIT
+        - Товары уменьшаются на складе
+        - Заказ появляется в "корзине" магазина
+        - Ожидает confirm_basket
+        """
+        order = self.get_object()
+
+        # Проверка статуса
+        if order.status != StoreOrderStatus.PENDING:
+            return Response(
+                {
+                    'error': f'Невозможно принять заказ в статусе "{order.get_status_display()}"',
+                    'current_status': order.status,
+                    'required_status': StoreOrderStatus.PENDING
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Проверка типа заказа
+        if order.order_type != 'preorder':
+            return Response(
+                {
+                    'error': 'Только предзаказы можно принимать через этот endpoint',
+                    'current_type': order.order_type
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            order = OrderWorkflowService.partner_accept_preorder(
+                order=order,
+                partner_user=request.user
+            )
+
+            output = StoreOrderDetailSerializer(order)
+            return Response(output.data)
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='reject-preorder',
+        permission_classes=[IsAuthenticated, IsPartner]
+    )
+    def reject_preorder(self, request: Request, pk=None) -> Response:
+        """
+        Партнёр отклоняет предзаказ (ТЗ v3.0).
+
+        POST /api/orders/store-orders/{id}/reject-preorder/
+        Body: {"reason": "Нет возможности доставить"}
+
+        WORKFLOW v3.0:
+        - Статус: PENDING → REJECTED
+        - Товары НЕ уменьшаются на складе
+        """
+        order = self.get_object()
+
+        # Проверка статуса
+        if order.status != StoreOrderStatus.PENDING:
+            return Response(
+                {
+                    'error': f'Невозможно отклонить заказ в статусе "{order.get_status_display()}"',
+                    'current_status': order.status,
+                    'required_status': StoreOrderStatus.PENDING
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = OrderRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            order = OrderWorkflowService.partner_reject_preorder(
+                order=order,
+                partner_user=request.user,
+                reason=serializer.validated_data.get('reason', '')
+            )
+
+            output = StoreOrderDetailSerializer(order)
+            return Response(output.data)
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='pending-preorders',
+        permission_classes=[IsAuthenticated, IsPartner]
+    )
+    def pending_preorders(self, request: Request) -> Response:
+        """
+        Список предзаказов в ожидании (ТЗ v3.0).
+
+        GET /api/orders/store-orders/pending-preorders/
+
+        Партнёр видит все предзаказы со статусом PENDING,
+        которые он может принять или отклонить.
+        """
+        orders = StoreOrder.objects.filter(
+            status=StoreOrderStatus.PENDING,
+            order_type='preorder'
+        ).select_related('store').prefetch_related('items__product__images').order_by('-created_at')
+
+        # Пагинация
+        page = self.paginate_queryset(orders)
+        if page is not None:
+            serializer = StoreOrderListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StoreOrderListSerializer(orders, many=True)
         return Response(serializer.data)
 
     # =========================================================================
@@ -640,6 +804,10 @@ class PartnerRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Получить запросы ТОЛЬКО текущего партнёра."""
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return PartnerRequest.objects.none()
+        
         queryset = PartnerRequest.objects.filter(
             partner=self.request.user
         ).prefetch_related('items__product').order_by('-created_at')
@@ -752,6 +920,10 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
     
     def get_queryset(self):
         from .models import ReturnedItem
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return ReturnedItem.objects.none()
+        
         queryset = ReturnedItem.objects.select_related('order', 'order__store', 'product')
         
         if self.request.user.role == 'admin':
@@ -959,6 +1131,10 @@ class ManualOrderViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         """Только ручные заказы текущего партнёра."""
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return StoreOrder.objects.none()
+        
         user = self.request.user
 
         queryset = StoreOrder.objects.filter(
@@ -1104,6 +1280,10 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
         - Партнёр: только возвраты из своих заказов
         - Админ: все возвраты
         """
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return ReturnedItem.objects.none()
+        
         user = self.request.user
 
         queryset = ReturnedItem.objects.select_related(

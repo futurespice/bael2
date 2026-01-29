@@ -52,14 +52,14 @@ class StoreOrderFilter(django_filters.FilterSet):
 #
 # =============================================================================
 
-class ReturnedItemFilter(filters.Filter):
+class ReturnedItemFilter(django_filters.FilterSet):
     """Фильтры для возвращённых товаров."""
 
-    order = filters.NumberFilter(field_name='order__id')
-    store = filters.NumberFilter(field_name='order__store__id')
-    product = filters.NumberFilter(field_name='product__id')
-    date_from = filters.DateFilter(field_name='returned_at', lookup_expr='gte')
-    date_to = filters.DateFilter(field_name='returned_at', lookup_expr='lte')
+    order = django_filters.NumberFilter(field_name='order__id')
+    store = django_filters.NumberFilter(field_name='order__store__id')
+    product = django_filters.NumberFilter(field_name='product__id')
+    date_from = django_filters.DateFilter(field_name='returned_at', lookup_expr='gte')
+    date_to = django_filters.DateFilter(field_name='returned_at', lookup_expr='lte')
 
     class Meta:
         model = ReturnedItem

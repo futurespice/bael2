@@ -1837,6 +1837,10 @@ class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
         - has_stock: true/false (есть ли товар в наличии)
         - min_quantity: минимальное количество
         """
+        # ✅ Защита от drf-spectacular schema generation
+        if getattr(self, 'swagger_fake_view', False):
+            return PartnerInventory.objects.none()
+        
         queryset = PartnerInventory.objects.filter(
             partner=self.request.user
         ).select_related('product').order_by('product__name')

@@ -604,7 +604,13 @@ class ReportService:
 # =============================================================================
 
 class PartnerStatisticsService:
-    """Сервис для расчета статистики партнера."""
+    """
+    Сервис для расчета статистики партнера (v3.0).
+    
+    ИЗМЕНЕНИЯ v3.0:
+    - Добавлен подсчёт возвратов (returned_amount)
+    - Возвраты учитываются в total_profit
+    """
     
     @staticmethod
     def calculate_statistics(
@@ -616,13 +622,28 @@ class PartnerStatisticsService:
         """
         Рассчитать статистику партнера.
         
+        ПОКАЗАТЕЛИ (ТЗ v3.0):
+        1. Запрошено у админа (requested_from_admin)
+        2. Продано магазинам (sold_to_stores)
+        3. Остаток в инвентаре (inventory_balance)
+        4. Расходы (expenses)
+        5. Брак (defective)
+        6. Бонус (bonus)
+        7. Долг непогашенный (unpaid_debt)
+        8. Долг погашенный (paid_debt)
+        9. Возвраты (returned_amount) - НОВОЕ v3.0
+        10. Общая сумма/прибыль (total_profit)
+        
         Args:
             partner_id: ID партнера
             period: Период (day/week/month/half_year/year/all_time)
             date_from: Начальная дата (опционально)
             date_to: Конечная дата (опционально)
+            
+        Returns:
+            Dict с 10 показателями
         """
-        from orders.models import PartnerRequest, PartnerRequestStatus
+        from orders.models import PartnerRequest, PartnerRequestStatus, ReturnedItem
         from stores.models import PartnerInventory
         
         # Определить диапазон дат
@@ -666,16 +687,23 @@ class PartnerStatisticsService:
         )['total'] or Decimal('0')
         
         # 5. Брак
-        defective = StoreOrder.objects.filter(
-            partner_id=partner_id,
-            status=StoreOrderStatus.ACCEPTED,
-            confirmed_at__range=[date_from, date_to]
+        defective = DefectiveProduct.objects.filter(
+            order__partner_id=partner_id,
+            status=DefectiveProduct.DefectStatus.APPROVED,
+            created_at__range=[date_from, date_to]
         ).aggregate(
-            total=Sum('defective_items__total_amount')
+            total=Sum('total_amount')
         )['total'] or Decimal('0')
         
         # 6. Бонус (количество)
-        bonus = 0  # TODO: Уточнить логику подсчета бонусов партнера
+        bonus = StoreOrderItem.objects.filter(
+            order__partner_id=partner_id,
+            order__status=StoreOrderStatus.ACCEPTED,
+            order__confirmed_at__range=[date_from, date_to],
+            is_bonus=True
+        ).aggregate(
+            total=Sum('quantity')
+        )['total'] or 0
         
         # 7. Долг (непогашенный)
         unpaid_debt = StoreOrder.objects.filter(
@@ -686,33 +714,70 @@ class PartnerStatisticsService:
         )['total'] or Decimal('0')
         
         # 8. Погашенный долг
-        paid_debt = StoreOrder.objects.filter(
-            partner_id=partner_id,
-            confirmed_at__range=[date_from, date_to]
+        paid_debt = DebtPayment.objects.filter(
+            order__partner_id=partner_id,
+            created_at__range=[date_from, date_to]
         ).aggregate(
-            total=Sum('paid_amount')
+            total=Sum('amount')
         )['total'] or Decimal('0')
         
-        # 9. Общая сумма (прибыль)
-        total_profit = sold_to_stores - expenses - defective
+        # =========================================================================
+        # 9. ВОЗВРАТЫ - НОВОЕ v3.0
+        # =========================================================================
+        returned_amount = ReturnedItem.objects.filter(
+            order__partner_id=partner_id,
+            returned_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum('total_amount')
+        )['total'] or Decimal('0')
         
-        # 10. Итого
+        returned_count = ReturnedItem.objects.filter(
+            order__partner_id=partner_id,
+            returned_at__range=[date_from, date_to]
+        ).count()
+        
+        # 10. Общая сумма (прибыль)
+        # Формула: продажи - расходы - брак - возвраты
+        total_profit = sold_to_stores - expenses - defective - returned_amount
+        
+        # 11. Итого (с учётом долга)
         grand_total = total_profit + paid_debt - unpaid_debt
         
         return {
-            'requested_from_admin': requested_from_admin,
-            'sold_to_stores': sold_to_stores,
-            'inventory_balance': inventory_balance,
-            'expenses': expenses,
-            'defective': defective,
-            'bonus': bonus,
-            'unpaid_debt': unpaid_debt,
-            'paid_debt': paid_debt,
-            'total_profit': total_profit,
-            'grand_total': grand_total,
+            # Поступления
+            'requested_from_admin': str(requested_from_admin),
+            
+            # Продажи
+            'sold_to_stores': str(sold_to_stores),
+            
+            # Инвентарь
+            'inventory_balance': str(inventory_balance),
+            
+            # Расходы
+            'expenses': str(expenses),
+            
+            # Брак
+            'defective': str(defective),
+            
+            # Бонусы
+            'bonus_count': int(bonus),
+            
+            # Долги
+            'unpaid_debt': str(unpaid_debt),
+            'paid_debt': str(paid_debt),
+            
+            # Возвраты - НОВОЕ v3.0
+            'returned_amount': str(returned_amount),
+            'returned_count': returned_count,
+            
+            # Итоги
+            'total_profit': str(total_profit),
+            'grand_total': str(grand_total),
+            
+            # Метаданные
             'period': period,
-            'date_from': date_from.date() if date_from else None,
-            'date_to': date_to.date() if date_to else None,
+            'date_from': date_from.date().isoformat() if date_from else None,
+            'date_to': date_to.date().isoformat() if date_to else None,
         }
     
     @staticmethod
