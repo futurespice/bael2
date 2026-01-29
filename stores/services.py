@@ -431,18 +431,23 @@ class StoreSelectionService:
         Returns:
             Store или None
         """
-        try:
-            selection = StoreSelection.objects.select_related('store').get(user=user)
-            
-            # 🔴 v3.0: Дополнительная проверка владельца
-            if selection.store.owner != user:
-                # Владелец изменился - сбросить выбор
-                selection.delete()
-                return None
-            
-            return selection.store
-        except StoreSelection.DoesNotExist:
+        # ✅ ИСПРАВЛЕНИЕ: Используем filter().first() вместо get()
+        # чтобы избежать MultipleObjectsReturned при дубликатах
+        selection = StoreSelection.objects.select_related('store').filter(
+            user=user,
+            is_current=True
+        ).first()
+        
+        if not selection:
             return None
+        
+        # 🔴 v3.0: Дополнительная проверка владельца
+        if selection.store.owner != user:
+            # Владелец изменился - сбросить выбор
+            selection.delete()
+            return None
+        
+        return selection.store
 
     @classmethod
     @transaction.atomic
