@@ -692,8 +692,9 @@ class ProductImage(models.Model):
         unique_together = [['product', 'order']]
 
     def clean(self):
-        if not self.pk:
-            existing = ProductImage.objects.filter(product=self.product).count()
+        # Проверяем только если это новое изображение и product уже сохранён
+        if not self.pk and self.product_id:
+            existing = ProductImage.objects.filter(product_id=self.product_id).count()
             if existing >= 3:
                 raise ValidationError('Максимум 3 изображения')
 

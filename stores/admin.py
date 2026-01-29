@@ -157,7 +157,7 @@ class StoreAdmin(admin.ModelAdmin):
         'users_count_display'
     ]
 
-    autocomplete_fields = ['region', 'city']
+    autocomplete_fields = ['region', 'city', 'owner']
 
     inlines = [StoreInventoryInline]
 
@@ -165,6 +165,7 @@ class StoreAdmin(admin.ModelAdmin):
         ('Основное', {
             'fields': [
                 'name',
+                'owner',
                 'owner_name',
                 'phone',
                 'inn'
