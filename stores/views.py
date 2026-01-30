@@ -323,24 +323,33 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         # =====================================================================
         # v3.0: Фильтр по типу заказа (предзаказ / ручной сбор)
+        # 
+        # WORKFLOW:
+        # 1. Магазин создаёт заказ → status=PENDING
+        # 2. Партнёр подтверждает через accept-preorder → status=IN_TRANSIT (попадает в корзину)
+        # 3. Партнёр подтверждает корзину → status=ACCEPTED, товары → инвентарь магазина
+        #
+        # ФИЛЬТРЫ:
+        # - preorder: Магазины с заказами в статусе IN_TRANSIT (в корзине партнёра)
+        # - manual: Магазины БЕЗ активных заказов (доступны для ручного сбора)
         # =====================================================================
         order_type_filter = self.request.query_params.get('order_type')
         if order_type_filter == 'preorder':
-            # Магазины с предзаказами (store-orders с order_type='preorder')
-            # Которые подтверждены (IN_TRANSIT или ACCEPTED)
+            # Магазины с предзаказами в статусе IN_TRANSIT
+            # (партнёр принял через accept-preorder, товары в корзине)
             from orders.models import StoreOrder, StoreOrderStatus
             store_ids = StoreOrder.objects.filter(
-                order_type='preorder',
-                status__in=[StoreOrderStatus.IN_TRANSIT, StoreOrderStatus.ACCEPTED]
+                status=StoreOrderStatus.IN_TRANSIT
             ).values_list('store_id', flat=True).distinct()
             queryset = queryset.filter(id__in=store_ids)
         elif order_type_filter == 'manual':
-            # Магазины с ручными заказами (от партнёра через manual-orders)
-            from orders.models import StoreOrder
-            store_ids = StoreOrder.objects.filter(
-                order_type='manual'
+            # Магазины БЕЗ активных заказов (нет PENDING и IN_TRANSIT)
+            # Эти магазины доступны для ручного сбора партнёром
+            from orders.models import StoreOrder, StoreOrderStatus
+            stores_with_active_orders = StoreOrder.objects.filter(
+                status__in=[StoreOrderStatus.PENDING, StoreOrderStatus.IN_TRANSIT]
             ).values_list('store_id', flat=True).distinct()
-            queryset = queryset.filter(id__in=store_ids)
+            queryset = queryset.exclude(id__in=stores_with_active_orders)
 
         return queryset.select_related('region', 'city').order_by('-created_at')
 
