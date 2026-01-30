@@ -232,9 +232,104 @@ class OrderHistoryAdmin(admin.ModelAdmin):
 
 @admin.register(PartnerRequest)
 class PartnerRequestAdmin(admin.ModelAdmin):
-    list_display = ['id', 'partner', 'product', 'request_type', 'status', 'quantity', 'created_at']
+    """
+    Admin для запросов партнёров.
+    
+    ВАЖНО: Используйте actions для одобрения/отклонения, чтобы
+    товары корректно добавлялись в инвентарь партнёра!
+    """
+    list_display = ['id', 'partner', 'request_type', 'status', 'items_count', 'created_at']
     list_filter = ['request_type', 'status', 'created_at']
-    search_fields = ['partner__name', 'product__name']
+    search_fields = ['partner__phone', 'partner__name']
+    readonly_fields = ['reviewed_by', 'reviewed_at', 'created_at', 'updated_at']
+    
+    fieldsets = [
+        ('Основное', {
+            'fields': ['partner', 'request_type', 'status', 'notes']
+        }),
+        ('Обработка', {
+            'fields': ['reviewed_by', 'reviewed_at', 'rejection_reason']
+        }),
+        ('Системное', {
+            'fields': ['created_at', 'updated_at'],
+            'classes': ['collapse']
+        }),
+    ]
+    
+    def items_count(self, obj):
+        """Количество товаров в запросе."""
+        return obj.items.count()
+    items_count.short_description = 'Товаров'
+    
+    actions = ['approve_requests', 'reject_requests']
+    
+    def approve_requests(self, request, queryset):
+        """
+        Одобрить выбранные запросы через сервис.
+        
+        ВАЖНО: Вызывает PartnerRequestService.approve_request(),
+        который добавляет товары в инвентарь партнёра!
+        """
+        from .services import PartnerRequestService
+        from .models import PartnerRequestStatus
+        from django.core.exceptions import ValidationError
+        
+        approved_count = 0
+        errors = []
+        
+        for partner_request in queryset.filter(status=PartnerRequestStatus.PENDING):
+            try:
+                PartnerRequestService.approve_request(
+                    request=partner_request,
+                    approved_by=request.user
+                )
+                approved_count += 1
+            except ValidationError as e:
+                errors.append(f'Запрос #{partner_request.id}: {str(e)}')
+            except Exception as e:
+                errors.append(f'Запрос #{partner_request.id}: {str(e)}')
+        
+        if approved_count:
+            self.message_user(
+                request, 
+                f'✅ Одобрено {approved_count} запросов. Товары добавлены в инвентарь партнёров.'
+            )
+        
+        if errors:
+            for error in errors:
+                self.message_user(request, f'❌ {error}', level='ERROR')
+    
+    approve_requests.short_description = '✅ Одобрить (товары → инвентарь партнёра)'
+    
+    def reject_requests(self, request, queryset):
+        """Отклонить выбранные запросы."""
+        from .services import PartnerRequestService
+        from .models import PartnerRequestStatus
+        from django.core.exceptions import ValidationError
+        
+        rejected_count = 0
+        errors = []
+        
+        for partner_request in queryset.filter(status=PartnerRequestStatus.PENDING):
+            try:
+                PartnerRequestService.reject_request(
+                    request=partner_request,
+                    rejection_reason='Отклонено администратором через панель управления'
+                )
+                rejected_count += 1
+            except ValidationError as e:
+                errors.append(f'Запрос #{partner_request.id}: {str(e)}')
+            except Exception as e:
+                errors.append(f'Запрос #{partner_request.id}: {str(e)}')
+        
+        if rejected_count:
+            self.message_user(request, f'❌ Отклонено {rejected_count} запросов.')
+        
+        if errors:
+            for error in errors:
+                self.message_user(request, f'Ошибка: {error}', level='ERROR')
+    
+    reject_requests.short_description = '❌ Отклонить запросы'
 
 
 @admin.register(ReturnedItem)

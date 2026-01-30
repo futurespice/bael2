@@ -321,6 +321,27 @@ class StoreViewSet(viewsets.ModelViewSet):
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
 
+        # =====================================================================
+        # v3.0: Фильтр по типу заказа (предзаказ / ручной сбор)
+        # =====================================================================
+        order_type_filter = self.request.query_params.get('order_type')
+        if order_type_filter == 'preorder':
+            # Магазины с предзаказами (store-orders с order_type='preorder')
+            # Которые подтверждены (IN_TRANSIT или ACCEPTED)
+            from orders.models import StoreOrder, StoreOrderStatus
+            store_ids = StoreOrder.objects.filter(
+                order_type='preorder',
+                status__in=[StoreOrderStatus.IN_TRANSIT, StoreOrderStatus.ACCEPTED]
+            ).values_list('store_id', flat=True).distinct()
+            queryset = queryset.filter(id__in=store_ids)
+        elif order_type_filter == 'manual':
+            # Магазины с ручными заказами (от партнёра через manual-orders)
+            from orders.models import StoreOrder
+            store_ids = StoreOrder.objects.filter(
+                order_type='manual'
+            ).values_list('store_id', flat=True).distinct()
+            queryset = queryset.filter(id__in=store_ids)
+
         return queryset.select_related('region', 'city').order_by('-created_at')
 
     def get_serializer_class(self):
@@ -1253,6 +1274,152 @@ class StoreViewSet(viewsets.ModelViewSet):
             'store_debt': float(store.debt),
         })
 
+    @extend_schema(
+        summary="Передать товары из инвентаря партнёра в магазин",
+        description="""
+            Партнёр передаёт товары ИЗ СВОЕГО инвентаря напрямую в магазин.
+            
+            Это отдельный endpoint для ручного сбора, когда партнёр:
+            1. Выбирает магазин
+            2. Выбирает товары из своего инвентаря
+            3. Подтверждает передачу через этот endpoint
+            
+            WORKFLOW:
+            1. Проверяется наличие товаров в PartnerInventory
+            2. Товары перемещаются: PartnerInventory → StoreInventory
+            3. Создаётся заказ со статусом ACCEPTED (order_type='manual')
+            4. Создаётся долг магазина
+            """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'items': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'product_id': {'type': 'integer'},
+                                'quantity': {'type': 'number'},
+                                'price': {'type': 'number', 'description': 'Опционально, если не указана - берётся из товара'}
+                            }
+                        }
+                    },
+                    'prepayment_amount': {'type': 'number', 'default': 0},
+                    'notes': {'type': 'string'}
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="Товары переданы, создан заказ"),
+            400: OpenApiResponse(description="Ошибка валидации"),
+            403: OpenApiResponse(description="Только партнёры"),
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='partner-basket/confirm')
+    @transaction.atomic
+    def confirm_partner_basket(self, request: Request, pk=None) -> Response:
+        """
+        Партнёр передаёт товары из своего инвентаря в магазин.
+
+        POST /api/stores/stores/{id}/partner-basket/confirm/
+        Body: {
+            "items": [
+                {"product_id": 1, "quantity": 10},
+                {"product_id": 2, "quantity": 5, "price": 200.00}
+            ],
+            "prepayment_amount": 0,
+            "notes": "Ручной сбор"
+        }
+        """
+        store = self.get_object()
+        user = request.user
+
+        if user.role != 'partner':
+            return Response(
+                {'error': 'Только партнёры могут передавать товары из своего инвентаря'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Парсинг входных данных
+        items = request.data.get('items', [])
+        prepayment_amount = request.data.get('prepayment_amount', 0)
+        notes = request.data.get('notes', '')
+
+        if not items:
+            return Response(
+                {'error': 'Не указаны товары для передачи'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            prepayment_amount = Decimal(str(prepayment_amount))
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Некорректное значение prepayment_amount'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Импортируем сервис и модели
+            from orders.services import ManualOrderService, OrderItemData
+            from products.models import Product
+
+            # Преобразуем данные товаров
+            items_data = []
+            for item in items:
+                product_id = item.get('product_id')
+                quantity = item.get('quantity')
+                price = item.get('price')
+
+                if not product_id or quantity is None:
+                    continue
+
+                items_data.append(
+                    OrderItemData(
+                        product_id=product_id,
+                        quantity=Decimal(str(quantity)),
+                        price=Decimal(str(price)) if price else None,
+                        is_bonus=item.get('is_bonus', False)
+                    )
+                )
+
+            if not items_data:
+                return Response(
+                    {'error': 'Не указаны валидные товары'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Создаём заказ через сервис (товары переносятся автоматически)
+            order = ManualOrderService.create_manual_order(
+                partner=user,
+                store=store,
+                items=items_data,
+                prepayment_amount=prepayment_amount,
+                notes=notes
+            )
+
+            return Response({
+                'success': True,
+                'message': f'Товары успешно переданы магазину "{store.name}"',
+                'order_id': order.id,
+                'order_type': order.order_type,
+                'total_amount': float(order.total_amount),
+                'prepayment': float(order.prepayment_amount),
+                'debt_amount': float(order.debt_amount),
+                'items_count': order.items.count(),
+            })
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Ошибка при передаче товаров: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['get'], url_path='inventory')
     def inventory(self, request: Request, pk=None) -> Response:
@@ -1916,11 +2083,17 @@ class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
     @action(detail=True, methods=['post'], url_path='release')
+    @transaction.atomic
     def release(self, request: Request, pk=None) -> Response:
         """
-        Освободить зарезервированный товар.
+        Вернуть товар из инвентаря партнёра в каталог админа.
 
-        Используется при отмене заказа или возврате товара.
+        POST /api/stores/partner-inventory/{id}/release/
+        Body: {"quantity": 10}
+        
+        Workflow:
+        1. Уменьшает quantity в PartnerInventory
+        2. Увеличивает stock_quantity в Product (каталог админа)
         """
         inventory = self.get_object()
         serializer = ReleaseQuantitySerializer(data=request.data)
@@ -1929,19 +2102,31 @@ class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
         quantity = serializer.validated_data['quantity']
 
         try:
-            PartnerInventoryService.release_reserved(
+            # 1. Удалить из инвентаря партнёра
+            PartnerInventoryService.remove_from_inventory(
                 partner=request.user,
                 product=inventory.product,
                 quantity=quantity
             )
 
-            # Обновить объект
-            inventory.refresh_from_db()
+            # 2. Вернуть на склад админа
+            product = inventory.product
+            product.stock_quantity += quantity
+            product.is_available = True
+            product.save(update_fields=['stock_quantity', 'is_available'])
+
+            # Обновить объект (может быть удалён если quantity=0)
+            try:
+                inventory.refresh_from_db()
+                inventory_data = PartnerInventorySerializer(inventory).data
+            except PartnerInventory.DoesNotExist:
+                inventory_data = None
 
             return Response(
                 {
-                    'message': 'Резерв успешно освобождён',
-                    'inventory': PartnerInventorySerializer(inventory).data
+                    'message': f'Товар успешно возвращён в каталог ({quantity} шт/кг)',
+                    'returned_to_catalog': float(quantity),
+                    'inventory': inventory_data
                 },
                 status=status.HTTP_200_OK
             )
