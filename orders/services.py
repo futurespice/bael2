@@ -1084,6 +1084,8 @@ class PartnerRequestService:
         """
         Одобрить запрос партнёра (только админ).
         
+        v3.0: Поддержка нескольких товаров через items.
+        
         Args:
             request: Запрос
             approved_by: Кто одобрил (админ)
@@ -1107,61 +1109,92 @@ class PartnerRequestService:
                 f'Запрос уже обработан (статус: {request.get_status_display()})'
             )
         
-        product = request.product
-        quantity = request.quantity
         partner = request.partner
+        
+        # v3.0: Работаем с items (несколько товаров)
+        items = request.items.select_related('product').all()
+        
+        if not items.exists():
+            # Обратная совместимость: старая логика (один товар)
+            if request.product and request.quantity:
+                # Создаём временный объект для итерации
+                class LegacyItem:
+                    def __init__(self, product, quantity):
+                        self.product = product
+                        self.quantity = quantity
+                items = [LegacyItem(request.product, request.quantity)]
+            else:
+                raise ValidationError('Запрос не содержит товаров')
         
         if request.request_type == PartnerRequestType.REQUEST:
             # ЗАПРОС ТОВАРОВ: Админ → Партнёр
             
-            # Проверяем наличие в каталоге админа
-            if product.quantity < quantity:
-                raise ValidationError(
-                    f'Недостаточно товара {product.name} на складе. '
-                    f'Доступно: {product.quantity}, запрошено: {quantity}'
+            # Сначала проверяем наличие ВСЕХ товаров
+            for item in items:
+                product = item.product
+                quantity = item.quantity
+                
+                if product.stock_quantity < quantity:
+                    raise ValidationError(
+                        f'Недостаточно товара "{product.name}" на складе. '
+                        f'Доступно: {product.stock_quantity}, запрошено: {quantity}'
+                    )
+            
+            # Теперь обрабатываем товары
+            for item in items:
+                product = item.product
+                quantity = item.quantity
+                
+                # Уменьшаем количество в каталоге
+                product.stock_quantity -= quantity
+                if product.stock_quantity <= Decimal('0'):
+                    product.stock_quantity = Decimal('0')
+                    product.is_available = False
+                product.save(update_fields=['stock_quantity', 'is_available'])
+                
+                # Добавляем в инвентарь партнёра
+                PartnerInventoryService.add_to_inventory(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity,
+                    source_request=request
                 )
-            
-            # Уменьшаем количество в каталоге
-            product.quantity -= quantity
-            product.save(update_fields=['quantity'])
-            
-            # Добавляем в инвентарь партнёра
-            PartnerInventoryService.add_to_inventory(
-                partner=partner,
-                product=product,
-                quantity=quantity,
-                source_request=request
-            )
-            
-            logger.info(
-                f"Запрос #{request.id} одобрен | "
-                f"Товар {product.name} x{quantity} добавлен в инвентарь партнёра {partner.id}"
-            )
+                
+                logger.info(
+                    f"Запрос #{request.id} | "
+                    f"Товар '{product.name}' x{quantity} добавлен в инвентарь партнёра {partner.id}"
+                )
             
         else:  # RETURN
             # ВОЗВРАТ ТОВАРОВ: Партнёр → Админ
-            
-            # Удаляем из инвентаря партнёра (зарезервированные товары)
-            PartnerInventoryService.remove_from_inventory(
-                partner=partner,
-                product=product,
-                quantity=quantity
-            )
-            
-            # Увеличиваем количество в каталоге
-            product.quantity += quantity
-            product.save(update_fields=['quantity'])
-            
-            logger.info(
-                f"Возврат #{request.id} одобрен | "
-                f"Товар {product.name} x{quantity} возвращён на склад админа"
-            )
+            for item in items:
+                product = item.product
+                quantity = item.quantity
+                
+                # Удаляем из инвентаря партнёра
+                PartnerInventoryService.remove_from_inventory(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity
+                )
+                
+                # Увеличиваем количество в каталоге
+                product.stock_quantity += quantity
+                product.is_available = True
+                product.save(update_fields=['stock_quantity', 'is_available'])
+                
+                logger.info(
+                    f"Возврат #{request.id} | "
+                    f"Товар '{product.name}' x{quantity} возвращён на склад админа"
+                )
         
         # Обновляем статус запроса
         request.status = PartnerRequestStatus.APPROVED
         request.reviewed_by = approved_by
         request.reviewed_at = timezone.now()
         request.save(update_fields=['status', 'reviewed_by', 'reviewed_at'])
+        
+        logger.info(f"Запрос #{request.id} одобрен админом {approved_by.id}")
         
         return request
     
@@ -1171,11 +1204,13 @@ class PartnerRequestService:
         cls,
         *,
         request: PartnerRequest,
-        rejected_by: 'User',
-        rejection_reason: str
+        rejected_by: 'User' = None,
+        rejection_reason: str = ''
     ) -> PartnerRequest:
         """
         Отклонить запрос партнёра (только админ).
+        
+        v3.0: Поддержка нескольких товаров через items.
         
         Args:
             request: Запрос
@@ -1193,7 +1228,7 @@ class PartnerRequestService:
         logger = logging.getLogger(__name__)
         
         # Валидация
-        if rejected_by.role != 'admin':
+        if rejected_by and rejected_by.role != 'admin':
             raise ValidationError('Только админ может отклонять запросы')
             
         if request.status != PartnerRequestStatus.PENDING:
@@ -1204,13 +1239,25 @@ class PartnerRequestService:
         if not rejection_reason:
             raise ValidationError('Необходимо указать причину отклонения')
         
-        # Для возврата - освобождаем резервирование
+        # Для возврата - освобождаем резервирование (v3.0: итерируем по items)
         if request.request_type == PartnerRequestType.RETURN:
-            PartnerInventoryService.release_reserved(
-                partner=request.partner,
-                product=request.product,
-                quantity=request.quantity
-            )
+            items = request.items.select_related('product').all()
+            
+            if items.exists():
+                # v3.0: несколько товаров
+                for item in items:
+                    PartnerInventoryService.release_reserved(
+                        partner=request.partner,
+                        product=item.product,
+                        quantity=item.quantity
+                    )
+            elif request.product and request.quantity:
+                # Обратная совместимость
+                PartnerInventoryService.release_reserved(
+                    partner=request.partner,
+                    product=request.product,
+                    quantity=request.quantity
+                )
         
         # Обновляем статус
         request.status = PartnerRequestStatus.REJECTED
@@ -1232,12 +1279,13 @@ class PartnerRequestService:
     @transaction.atomic
     def cancel_request(
         cls,
-        *,
         request: PartnerRequest,
-        cancelled_by: 'User'
+        cancelled_by: 'User' = None
     ) -> PartnerRequest:
         """
         Отменить запрос партнёром (только если PENDING).
+        
+        v3.0: Поддержка нескольких товаров через items.
         
         Args:
             request: Запрос
@@ -1254,7 +1302,7 @@ class PartnerRequestService:
         logger = logging.getLogger(__name__)
         
         # Валидация
-        if request.partner != cancelled_by:
+        if cancelled_by and request.partner != cancelled_by:
             raise ValidationError('Только владелец запроса может его отменить')
             
         if request.status != PartnerRequestStatus.PENDING:
@@ -1262,19 +1310,33 @@ class PartnerRequestService:
                 f'Нельзя отменить обработанный запрос (статус: {request.get_status_display()})'
             )
         
-        # Для возврата - освобождаем резервирование
+        request_id = request.id
+        
+        # Для возврата - освобождаем резервирование (v3.0: итерируем по items)
         if request.request_type == PartnerRequestType.RETURN:
-            PartnerInventoryService.release_reserved(
-                partner=request.partner,
-                product=request.product,
-                quantity=request.quantity
-            )
+            items = request.items.select_related('product').all()
+            
+            if items.exists():
+                # v3.0: несколько товаров
+                for item in items:
+                    PartnerInventoryService.release_reserved(
+                        partner=request.partner,
+                        product=item.product,
+                        quantity=item.quantity
+                    )
+            elif request.product and request.quantity:
+                # Обратная совместимость
+                PartnerInventoryService.release_reserved(
+                    partner=request.partner,
+                    product=request.product,
+                    quantity=request.quantity
+                )
         
         # Удаляем запрос
         request.delete()
         
         logger.info(
-            f"Запрос #{request.id} отменён партнёром {cancelled_by.id}"
+            f"Запрос #{request_id} отменён партнёром {cancelled_by.id if cancelled_by else 'system'}"
         )
         
         return request
@@ -1439,7 +1501,7 @@ class ManualOrderService:
             )
             
             # Создаём позицию заказа
-            price = item_data.price or product.price
+            price = item_data.price or product.final_price
             item_total = price * item_data.quantity
             
             StoreOrderItem.objects.create(

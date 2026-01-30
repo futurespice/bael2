@@ -1075,7 +1075,7 @@ class PartnerInventoryListSerializer(serializers.ModelSerializer):
     product_id = serializers.IntegerField(source='product.id', read_only=True)
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_price = serializers.DecimalField(
-        source='product.price',
+        source='product.final_price',
         max_digits=12,
         decimal_places=2,
         read_only=True
@@ -1110,8 +1110,8 @@ class PartnerInventoryListSerializer(serializers.ModelSerializer):
 
     def get_total_value(self, obj: PartnerInventory) -> str:
         """Рассчитать общую стоимость товара в инвентаре."""
-        if obj.product and obj.product.price:
-            total = obj.available_quantity * obj.product.price
+        if obj.product and obj.product.final_price:
+            total = obj.available_quantity * obj.product.final_price
             return str(total)
         return "0.00"
 
