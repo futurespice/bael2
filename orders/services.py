@@ -1062,7 +1062,7 @@ class PartnerRequestService:
                 product=product,
                 quantity=quantity,
                 weight=weight if product.is_weight_based else None,
-                price_at_request=product.price
+                price_at_request=product.final_price
             )
         
         logger.info(
