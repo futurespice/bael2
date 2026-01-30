@@ -1015,33 +1015,40 @@ class PartnerRequestService:
             quantity = Decimal(str(item_data.get('quantity', 0)))
             weight = item_data.get('weight')
             
-            # Валидация
-            if quantity <= Decimal('0'):
-                request.delete()
-                raise ValidationError(f'Количество должно быть больше 0 для товара {product_id}')
-            
             try:
                 product = Product.objects.get(pk=product_id)
             except Product.DoesNotExist:
                 request.delete()
                 raise ValidationError(f'Товар с ID {product_id} не найден')
             
-            # Валидация весовых товаров
+            # Для весовых товаров: используем weight как основную величину
+            # Мобильное приложение передаёт 0.001 как заглушку в quantity для весовых товаров
             if product.is_weight_based:
                 if not weight:
                     request.delete()
                     raise ValidationError(f'Для весового товара "{product.name}" необходимо указать вес')
                 weight = Decimal(str(weight))
+                if weight <= Decimal('0'):
+                    request.delete()
+                    raise ValidationError(f'Вес должен быть больше 0 для товара "{product.name}"')
                 if weight % Decimal('0.1') != 0:
                     request.delete()
                     raise ValidationError(f'Вес товара "{product.name}" должен быть кратен 0.1 кг')
+                # Для весовых товаров: quantity = weight (для совместимости с расчётами)
+                effective_quantity = weight
+            else:
+                # Для штучных товаров: используем quantity
+                if quantity <= Decimal('0'):
+                    request.delete()
+                    raise ValidationError(f'Количество должно быть больше 0 для товара {product_id}')
+                effective_quantity = quantity
             
             # Дополнительная валидация для возврата
             if request_type == PartnerRequestType.RETURN:
                 has_inventory = PartnerInventoryService.check_availability(
                     partner=partner,
                     product=product,
-                    quantity=quantity
+                    quantity=effective_quantity
                 )
                 if not has_inventory:
                     request.delete()
@@ -1053,14 +1060,15 @@ class PartnerRequestService:
                 PartnerInventoryService.reserve_quantity(
                     partner=partner,
                     product=product,
-                    quantity=quantity
+                    quantity=effective_quantity
                 )
             
             # Создаём позицию
+            # Для весовых: quantity = weight (для правильного расчёта суммы)
             PartnerRequestItem.objects.create(
                 request=request,
                 product=product,
-                quantity=quantity,
+                quantity=effective_quantity,
                 weight=weight if product.is_weight_based else None,
                 price_at_request=product.final_price
             )
