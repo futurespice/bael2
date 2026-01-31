@@ -1517,7 +1517,7 @@ class ManualOrderService:
                 product=product,
                 quantity=item_data.quantity,
                 price=price,
-                total_amount=item_total,
+                total=item_total,
                 is_bonus=item_data.is_bonus
             )
             
