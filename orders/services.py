@@ -1539,7 +1539,7 @@ class ManualOrderService:
         OrderHistory.objects.create(
             order_type=OrderType.STORE,
             order_id=order.id,
-            old_status=None,
+            old_status='created',  # Для нового заказа используем 'created'
             new_status=StoreOrderStatus.ACCEPTED,
             changed_by=partner,
             comment=(
