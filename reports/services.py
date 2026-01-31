@@ -605,11 +605,11 @@ class ReportService:
 
 class PartnerStatisticsService:
     """
-    Сервис для расчета статистики партнера (v3.0).
+    Сервис для расчета статистики партнера (v3.1).
     
-    ИЗМЕНЕНИЯ v3.0:
-    - Добавлен подсчёт возвратов (returned_amount)
-    - Возвраты учитываются в total_profit
+    ИЗМЕНЕНИЯ v3.1:
+    - Добавлены детализированные списки товаров для каждого показателя
+    - Структура ответа соответствует макету мобильного приложения
     """
     
     @staticmethod
@@ -620,19 +620,18 @@ class PartnerStatisticsService:
         date_to: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """
-        Рассчитать статистику партнера.
+        Рассчитать статистику партнера с детализацией товаров.
         
-        ПОКАЗАТЕЛИ (ТЗ v3.0):
-        1. Запрошено у админа (requested_from_admin)
-        2. Продано магазинам (sold_to_stores)
-        3. Остаток в инвентаре (inventory_balance)
-        4. Расходы (expenses)
-        5. Брак (defective)
-        6. Бонус (bonus)
-        7. Долг непогашенный (unpaid_debt)
-        8. Долг погашенный (paid_debt)
-        9. Возвраты (returned_amount) - НОВОЕ v3.0
-        10. Общая сумма/прибыль (total_profit)
+        ПОКАЗАТЕЛИ (согласно макету):
+        1. Запрошено (requested) - товары, запрошенные у админа
+        2. Продано (sold) - товары, проданные магазинам
+        3. Остаток товара (inventory) - текущий инвентарь партнёра
+        4. Расходы (expenses) - детализированные расходы
+        5. Брак (defective) - бракованные товары
+        6. Бонус (bonus) - бонусные товары
+        7. Долг (debt) - непогашенный долг магазинов
+        8. Погашенный долг (paid_debt)
+        9. Общая сумма (grand_total)
         
         Args:
             partner_id: ID партнера
@@ -641,71 +640,188 @@ class PartnerStatisticsService:
             date_to: Конечная дата (опционально)
             
         Returns:
-            Dict с 10 показателями
+            Dict с детализированными показателями
         """
-        from orders.models import PartnerRequest, PartnerRequestStatus, ReturnedItem
+        from orders.models import PartnerRequest, PartnerRequestStatus, PartnerRequestItem
         from stores.models import PartnerInventory
         
         # Определить диапазон дат
         if not date_from or not date_to:
             date_from, date_to = PartnerStatisticsService._get_date_range(period)
         
-        # 1. Запрошено у админа
-        requested_from_admin = PartnerRequest.objects.filter(
-            partner_id=partner_id,
-            request_type='request',
-            status=PartnerRequestStatus.APPROVED,
-            created_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum(F('quantity') * F('product__price'))
-        )['total'] or Decimal('0')
-        
-        # 2. Продано магазинам
-        sold_to_stores = StoreOrder.objects.filter(
-            partner_id=partner_id,
-            status=StoreOrderStatus.ACCEPTED,
-            confirmed_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum('total_amount')
-        )['total'] or Decimal('0')
-        
-        # 3. Остаток товара в инвентаре
-        inventory = PartnerInventory.objects.filter(
-            partner_id=partner_id
+        # =========================================================================
+        # 1. ЗАПРОШЕНО У АДМИНА (с детализацией)
+        # =========================================================================
+        requested_items = PartnerRequestItem.objects.filter(
+            request__partner_id=partner_id,
+            request__request_type='request',
+            request__status=PartnerRequestStatus.APPROVED,
+            request__created_at__range=[date_from, date_to]
         ).select_related('product')
         
-        inventory_balance = sum(
-            (item.quantity * item.product.price) for item in inventory
-        )
+        requested_total = Decimal('0')
+        requested_piece_count = 0
+        requested_weight_total = Decimal('0')
+        requested_list = []
         
-        # 4. Расходы партнера
-        expenses = PartnerExpense.objects.filter(
+        for item in requested_items:
+            product = item.product
+            item_total = item.quantity * product.price
+            requested_total += item_total
+            
+            if product.is_weight_based:
+                requested_weight_total += item.quantity
+                unit = 'кг'
+            else:
+                requested_piece_count += int(item.quantity)
+                unit = 'шт'
+            
+            requested_list.append({
+                'name': product.name,
+                'quantity': float(item.quantity),
+                'unit': unit,
+                'price': str(product.price),
+                'total': str(item_total)
+            })
+        
+        # =========================================================================
+        # 2. ПРОДАНО МАГАЗИНАМ (с детализацией)
+        # =========================================================================
+        sold_items = StoreOrderItem.objects.filter(
+            order__partner_id=partner_id,
+            order__status=StoreOrderStatus.ACCEPTED,
+            order__confirmed_at__range=[date_from, date_to],
+            is_bonus=False  # Исключаем бонусы
+        ).select_related('product')
+        
+        sold_total = Decimal('0')
+        sold_piece_count = 0
+        sold_weight_total = Decimal('0')
+        sold_list = []
+        
+        for item in sold_items:
+            product = item.product
+            sold_total += item.total
+            
+            if product.is_weight_based:
+                sold_weight_total += item.quantity
+                unit = 'кг'
+            else:
+                sold_piece_count += int(item.quantity)
+                unit = 'шт'
+            
+            sold_list.append({
+                'name': product.name,
+                'quantity': float(item.quantity),
+                'unit': unit,
+                'price': str(item.price),
+                'total': str(item.total)
+            })
+        
+        # =========================================================================
+        # 3. ОСТАТОК ТОВАРА В ИНВЕНТАРЕ (с детализацией)
+        # =========================================================================
+        inventory = PartnerInventory.objects.filter(
+            partner_id=partner_id,
+            quantity__gt=0
+        ).select_related('product')
+        
+        inventory_total = Decimal('0')
+        inventory_piece_count = 0
+        inventory_weight_total = Decimal('0')
+        inventory_list = []
+        
+        for item in inventory:
+            product = item.product
+            item_total = item.quantity * product.price
+            inventory_total += item_total
+            
+            if product.is_weight_based:
+                inventory_weight_total += item.quantity
+                unit = 'кг'
+            else:
+                inventory_piece_count += int(item.quantity)
+                unit = 'шт'
+            
+            inventory_list.append({
+                'name': product.name,
+                'quantity': float(item.quantity),
+                'unit': unit,
+                'price': str(product.price),
+                'total': str(item_total)
+            })
+        
+        # =========================================================================
+        # 4. РАСХОДЫ (с детализацией)
+        # =========================================================================
+        expenses_qs = PartnerExpense.objects.filter(
             partner_id=partner_id,
             created_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum('amount')
-        )['total'] or Decimal('0')
+        )
         
-        # 5. Брак
-        defective = DefectiveProduct.objects.filter(
+        expenses_total = Decimal('0')
+        expenses_list = []
+        
+        for expense in expenses_qs:
+            expenses_total += expense.amount
+            expenses_list.append({
+                'name': expense.description or 'Без описания',
+                'amount': str(expense.amount)
+            })
+        
+        # =========================================================================
+        # 5. БРАК (с детализацией)
+        # =========================================================================
+        defective_qs = DefectiveProduct.objects.filter(
             order__partner_id=partner_id,
             status=DefectiveProduct.DefectStatus.APPROVED,
             created_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum('total_amount')
-        )['total'] or Decimal('0')
+        ).select_related('product')
         
-        # 6. Бонус (количество)
-        bonus = StoreOrderItem.objects.filter(
+        defective_total = Decimal('0')
+        defective_list = []
+        
+        for defect in defective_qs:
+            product = defect.product
+            defective_total += defect.total_amount
+            
+            unit = 'кг' if product.is_weight_based else 'шт'
+            
+            defective_list.append({
+                'name': product.name,
+                'quantity': float(defect.quantity),
+                'unit': unit,
+                'amount': str(defect.total_amount)
+            })
+        
+        # =========================================================================
+        # 6. БОНУСЫ (с детализацией)
+        # =========================================================================
+        bonus_items = StoreOrderItem.objects.filter(
             order__partner_id=partner_id,
             order__status=StoreOrderStatus.ACCEPTED,
             order__confirmed_at__range=[date_from, date_to],
             is_bonus=True
-        ).aggregate(
-            total=Sum('quantity')
-        )['total'] or 0
+        ).select_related('product')
         
-        # 7. Долг (непогашенный)
+        bonus_total = Decimal('0')
+        bonus_count = 0
+        bonus_list = []
+        
+        for item in bonus_items:
+            product = item.product
+            bonus_total += item.total
+            bonus_count += int(item.quantity)
+            
+            bonus_list.append({
+                'name': product.name,
+                'quantity': int(item.quantity),
+                'price': str(item.price)
+            })
+        
+        # =========================================================================
+        # 7. ДОЛГИ
+        # =========================================================================
         unpaid_debt = StoreOrder.objects.filter(
             partner_id=partner_id,
             status=StoreOrderStatus.ACCEPTED
@@ -713,7 +829,13 @@ class PartnerStatisticsService:
             total=Sum(F('debt_amount') - F('paid_amount'))
         )['total'] or Decimal('0')
         
-        # 8. Погашенный долг
+        # Только положительный долг
+        if unpaid_debt < 0:
+            unpaid_debt = Decimal('0')
+        
+        # =========================================================================
+        # 8. ПОГАШЕННЫЙ ДОЛГ
+        # =========================================================================
         paid_debt = DebtPayment.objects.filter(
             order__partner_id=partner_id,
             created_at__range=[date_from, date_to]
@@ -722,56 +844,63 @@ class PartnerStatisticsService:
         )['total'] or Decimal('0')
         
         # =========================================================================
-        # 9. ВОЗВРАТЫ - НОВОЕ v3.0
+        # 9. ОБЩАЯ СУММА
+        # Формула: продажи - расходы - брак + погашенный долг - непогашенный долг
         # =========================================================================
-        returned_amount = ReturnedItem.objects.filter(
-            order__partner_id=partner_id,
-            returned_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum('total_amount')
-        )['total'] or Decimal('0')
+        grand_total = sold_total - expenses_total - defective_total + paid_debt - unpaid_debt
         
-        returned_count = ReturnedItem.objects.filter(
-            order__partner_id=partner_id,
-            returned_at__range=[date_from, date_to]
-        ).count()
-        
-        # 10. Общая сумма (прибыль)
-        # Формула: продажи - расходы - брак - возвраты
-        total_profit = sold_to_stores - expenses - defective - returned_amount
-        
-        # 11. Итого (с учётом долга)
-        grand_total = total_profit + paid_debt - unpaid_debt
-        
+        # =========================================================================
+        # ФОРМИРУЕМ ОТВЕТ
+        # =========================================================================
         return {
-            # Поступления
-            'requested_from_admin': str(requested_from_admin),
+            # Запрошено у админа
+            'requested': {
+                'total_amount': str(requested_total),
+                'piece_count': requested_piece_count,
+                'weight_total': str(requested_weight_total),
+                'items': requested_list
+            },
             
-            # Продажи
-            'sold_to_stores': str(sold_to_stores),
+            # Продано магазинам
+            'sold': {
+                'total_amount': str(sold_total),
+                'piece_count': sold_piece_count,
+                'weight_total': str(sold_weight_total),
+                'items': sold_list
+            },
             
-            # Инвентарь
-            'inventory_balance': str(inventory_balance),
+            # Остаток товара
+            'inventory': {
+                'total_amount': str(inventory_total),
+                'piece_count': inventory_piece_count,
+                'weight_total': str(inventory_weight_total),
+                'items': inventory_list
+            },
             
             # Расходы
-            'expenses': str(expenses),
+            'expenses': {
+                'total_amount': str(expenses_total),
+                'items': expenses_list
+            },
             
             # Брак
-            'defective': str(defective),
+            'defective': {
+                'total_amount': str(defective_total),
+                'items': defective_list
+            },
             
             # Бонусы
-            'bonus_count': int(bonus),
+            'bonus': {
+                'total_amount': str(bonus_total),
+                'count': bonus_count,
+                'items': bonus_list
+            },
             
             # Долги
-            'unpaid_debt': str(unpaid_debt),
+            'debt': str(unpaid_debt),
             'paid_debt': str(paid_debt),
             
-            # Возвраты - НОВОЕ v3.0
-            'returned_amount': str(returned_amount),
-            'returned_count': returned_count,
-            
-            # Итоги
-            'total_profit': str(total_profit),
+            # Итого
             'grand_total': str(grand_total),
             
             # Метаданные
@@ -814,126 +943,170 @@ class PartnerStatisticsService:
 
 class PartnerProfileService:
     """
-    Сервис для получения профиля партнёра.
+    Сервис для получения профиля партнёра (v3.1).
     
-    ТЗ v3.0: "Профиль партнёра показывает историю продаж по магазинам
-    с детализацией по товарам за выбранный период."
+    ИЗМЕНЕНИЯ v3.1:
+    - Возвращает ПЛОСКУЮ таблицу продаж (не группированную по магазинам)
+    - Добавлен список доступных магазинов для фильтра
+    - Добавлен фильтр по store_id
+    - Добавлены итоги (piece_count, weight_total, total_amount)
+    
+    Структура соответствует макету мобильного приложения.
     """
     
     @staticmethod
     def get_profile_data(
         partner_id: int,
         period: str = 'month',
+        store_id: Optional[int] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """
-        Получить данные профиля партнёра.
+        Получить данные профиля партнёра в формате таблицы продаж.
         
         Args:
             partner_id: ID партнёра
             period: Период (day/week/month/half_year/year/all_time)
+            store_id: Фильтр по магазину (опционально)
             date_from: Начальная дата (опционально)
             date_to: Конечная дата (опционально)
             
         Returns:
             Dict с данными:
-            - period: выбранный период
-            - stores: список магазинов с заказами
-            - total_all_stores: общая сумма по всем магазинам
+            - available_stores: список магазинов для фильтра
+            - sales: плоская таблица продаж
+            - totals: итоги
             
         Пример структуры:
             {
-                'period': 'month',
-                'date_from': '2026-01-01',
-                'date_to': '2026-01-31',
-                'stores': [
+                'period': 'week',
+                'date_from': '2025-05-08',
+                'date_to': '2025-05-14',
+                'available_stores': [
+                    {'id': 1, 'name': 'Оси сила', 'inn': '82630930114'},
+                    {'id': 2, 'name': 'Тынчтык', 'inn': '12345678'}
+                ],
+                'sales': [
                     {
-                        'store_name': 'Магазин №1',
-                        'store_inn': '01234567890123',
-                        'orders': [
-                            {
-                                'date': '2026-01-09',
-                                'product_name': 'Пельмени',
-                                'quantity': 20,
-                                'price_per_unit': '200.00',
-                                'total_amount': '4000.00'
-                            }
-                        ],
-                        'total_sold': '6250.00'
+                        'date': '01.05.25',
+                        'store_name': 'Тынчтык',
+                        'store_inn': '12345678',
+                        'product_name': 'Пельмени Хуторок',
+                        'quantity': 2,
+                        'unit': 'шт',
+                        'price': '600',
+                        'total': '1200'
                     }
                 ],
-                'total_all_stores': '25000.00'
+                'totals': {
+                    'piece_count': 48,
+                    'weight_total': '10.5',
+                    'total_amount': '4900'
+                }
             }
         """
         from orders.models import StoreOrderItem
+        from stores.models import Store
         
         # Определить диапазон дат
         if not date_from or not date_to:
             date_from, date_to = PartnerStatisticsService._get_date_range(period)
         
-        # Получить заказы партнёра за период
-        orders = StoreOrder.objects.filter(
+        # =========================================================================
+        # 1. ПОЛУЧИТЬ СПИСОК ДОСТУПНЫХ МАГАЗИНОВ ДЛЯ ФИЛЬТРА
+        # =========================================================================
+        store_ids_with_orders = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            status=StoreOrderStatus.ACCEPTED
+        ).values_list('store_id', flat=True).distinct()
+        
+        available_stores = Store.objects.filter(
+            id__in=store_ids_with_orders
+        ).values('id', 'name', 'inn').order_by('name')
+        
+        available_stores_list = [
+            {'id': s['id'], 'name': s['name'], 'inn': s['inn']}
+            for s in available_stores
+        ]
+        
+        # =========================================================================
+        # 2. ПОЛУЧИТЬ ЗАКАЗЫ ПАРТНЁРА ЗА ПЕРИОД
+        # =========================================================================
+        orders_qs = StoreOrder.objects.filter(
             partner_id=partner_id,
             status=StoreOrderStatus.ACCEPTED,
             confirmed_at__range=[date_from, date_to]
-        ).select_related('store').prefetch_related(
+        )
+        
+        # Применить фильтр по магазину
+        if store_id:
+            orders_qs = orders_qs.filter(store_id=store_id)
+        
+        orders = orders_qs.select_related('store').prefetch_related(
             'items__product'
         ).order_by('confirmed_at')
         
-        # Группировка по магазинам
-        stores_data = {}
-        total_all_stores = Decimal('0')
+        # =========================================================================
+        # 3. ФОРМИРОВАТЬ ПЛОСКУЮ ТАБЛИЦУ ПРОДАЖ
+        # =========================================================================
+        sales = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
         
         for order in orders:
             store = order.store
-            store_key = store.id
+            order_date = order.confirmed_at.strftime('%d.%m.%y')
             
-            # Инициализация данных магазина
-            if store_key not in stores_data:
-                stores_data[store_key] = {
-                    'store_id': store.id,
-                    'store_name': store.name,
-                    'store_inn': store.inn,
-                    'store_owner': store.owner_name,
-                    'orders': [],
-                    'total_sold': Decimal('0')
-                }
-            
-            # Добавляем товары из заказа
             for item in order.items.all():
                 product = item.product
                 
-                order_item_data = {
-                    'date': order.confirmed_at.strftime('%Y-%m-%d'),
+                if product.is_weight_based:
+                    unit = 'кг'
+                    weight_total += item.quantity
+                else:
+                    unit = 'шт'
+                    piece_count += int(item.quantity)
+                
+                total_amount += item.total
+                
+                sales.append({
+                    'date': order_date,
+                    'store_id': store.id,
+                    'store_name': store.name,
+                    'store_inn': store.inn,
                     'product_name': product.name,
                     'quantity': float(item.quantity),
-                    'weight': float(item.weight) if item.weight else None,
-                    'price_per_unit': str(item.price),
-                    'total_amount': str(item.total)
-                }
-                
-                stores_data[store_key]['orders'].append(order_item_data)
-                stores_data[store_key]['total_sold'] += item.total
-                total_all_stores += item.total
+                    'unit': unit,
+                    'price': str(item.price),
+                    'total': str(item.total)
+                })
         
-        # Преобразование в список
-        stores_list = []
-        for store_data in stores_data.values():
-            store_data['total_sold'] = str(store_data['total_sold'])
-            stores_list.append(store_data)
-        
-        # Сортировка по total_sold (убывание)
-        stores_list.sort(
-            key=lambda x: Decimal(x['total_sold']),
-            reverse=True
-        )
-        
+        # =========================================================================
+        # 4. ФОРМИРОВАТЬ ОТВЕТ
+        # =========================================================================
         return {
             'period': period,
             'date_from': date_from.date().isoformat() if date_from else None,
             'date_to': date_to.date().isoformat() if date_to else None,
-            'stores': stores_list,
-            'total_all_stores': str(total_all_stores),
-            'stores_count': len(stores_list)
+            
+            # Список магазинов для фильтра
+            'available_stores': available_stores_list,
+            
+            # Применённый фильтр
+            'filter': {
+                'store_id': store_id
+            },
+            
+            # Плоская таблица продаж
+            'sales': sales,
+            
+            # Итоги
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(weight_total),
+                'total_amount': str(total_amount),
+                'sales_count': len(sales)
+            }
         }

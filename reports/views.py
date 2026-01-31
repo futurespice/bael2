@@ -212,13 +212,12 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
 
         # Получаем статистику через сервис
         try:
-            stats = PartnerStatisticsService.get_partner_statistics(
-                partner=request.user,
+            stats = PartnerStatisticsService.calculate_statistics(
+                partner_id=request.user.id,
                 period=period
             )
 
-            serializer = PartnerStatisticsSerializer(stats)
-            return Response(serializer.data)
+            return Response(stats)
 
         except Exception as e:
             return Response(
@@ -288,13 +287,18 @@ class PartnerProfileViewSet(viewsets.ViewSet):
             )
 
         try:
-            profile = PartnerProfileService.get_partner_profile(
-                partner=request.user,
-                period=period
+            # Получаем store_id для фильтрации
+            store_id = request.query_params.get('store_id')
+            if store_id:
+                store_id = int(store_id)
+            
+            profile = PartnerProfileService.get_profile_data(
+                partner_id=request.user.id,
+                period=period,
+                store_id=store_id
             )
 
-            serializer = PartnerProfileSerializer(profile)
-            return Response(serializer.data)
+            return Response(profile)
 
         except Exception as e:
             return Response(
