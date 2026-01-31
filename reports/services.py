@@ -666,7 +666,7 @@ class PartnerStatisticsService:
         
         for item in requested_items:
             product = item.product
-            item_total = item.quantity * product.price
+            item_total = item.quantity * product.final_price
             requested_total += item_total
             
             if product.is_weight_based:
@@ -680,7 +680,7 @@ class PartnerStatisticsService:
                 'name': product.name,
                 'quantity': float(item.quantity),
                 'unit': unit,
-                'price': str(product.price),
+                'price': str(product.final_price),
                 'total': str(item_total)
             })
         
@@ -733,7 +733,7 @@ class PartnerStatisticsService:
         
         for item in inventory:
             product = item.product
-            item_total = item.quantity * product.price
+            item_total = item.quantity * product.final_price
             inventory_total += item_total
             
             if product.is_weight_based:
@@ -747,7 +747,7 @@ class PartnerStatisticsService:
                 'name': product.name,
                 'quantity': float(item.quantity),
                 'unit': unit,
-                'price': str(product.price),
+                'price': str(product.final_price),
                 'total': str(item_total)
             })
         
