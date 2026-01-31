@@ -1480,11 +1480,11 @@ class StoreViewSet(viewsets.ModelViewSet):
         request={
             'application/json': {
                 'type': 'object',
-                'required': ['product_id', 'quantity', 'reason'],
+                'required': ['product_id', 'quantity'],
                 'properties': {
                     'product_id': {'type': 'integer', 'description': 'ID товара из инвентаря'},
                     'quantity': {'type': 'number', 'description': 'Количество брака'},
-                    'reason': {'type': 'string', 'description': 'Причина брака'}
+                    'reason': {'type': 'string', 'description': 'Причина брака (необязательно)'}
                 }
             }
         },
@@ -1524,11 +1524,6 @@ class StoreViewSet(viewsets.ModelViewSet):
         if not quantity:
             return Response(
                 {'error': 'Укажите quantity'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if not reason:
-            return Response(
-                {'error': 'Укажите причину брака'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 

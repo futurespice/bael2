@@ -1000,15 +1000,16 @@ class ReportDefectRequestSerializer(serializers.Serializer):
     )
     reason = serializers.CharField(
         max_length=500,
-        help_text='Причина брака'
+        required=False,
+        allow_blank=True,
+        help_text='Причина брака (необязательно)'
     )
 
     def validate_reason(self, value):
         """Валидация причины."""
-        value = value.strip()
-        if not value:
-            raise serializers.ValidationError('Причина брака обязательна')
-        return value
+        if value:
+            return value.strip()
+        return ''
 
 
 class DefectInfoSerializer(serializers.Serializer):
