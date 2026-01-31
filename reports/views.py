@@ -186,14 +186,32 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
 
     @extend_schema(
         summary="Статистика партнёра (10 показателей)",
-        description="Получить статистику партнёра за выбранный период",
+        description="Получить статистику партнёра за выбранный период или дату",
         parameters=[
             OpenApiParameter(
                 name='period',
                 type=str,
                 enum=['day', 'week', 'month', 'year'],
-                description='Период статистики',
-                required=True
+                description='Период статистики (игнорируется если указаны date или date_from/date_to)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date',
+                type=str,
+                description='Конкретная дата (YYYY-MM-DD). Если указано, возвращает статистику за этот день.',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date_from',
+                type=str,
+                description='Начало периода (YYYY-MM-DD)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date_to',
+                type=str,
+                description='Конец периода (YYYY-MM-DD)',
+                required=False
             ),
         ],
         responses={
@@ -202,11 +220,53 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
     )
     def list(self, request):
         """Получить статистику партнёра."""
+        from datetime import datetime
+        from django.utils import timezone
+        
         period = request.query_params.get('period', 'week')
-
-        if period not in ['day', 'week', 'month', 'year']:
+        date_str = request.query_params.get('date')
+        date_from_str = request.query_params.get('date_from')
+        date_to_str = request.query_params.get('date_to')
+        
+        date_from = None
+        date_to = None
+        
+        # Приоритет: date > date_from/date_to > period
+        try:
+            if date_str:
+                # Конкретный день
+                specific_date = datetime.strptime(date_str, '%Y-%m-%d')
+                date_from = timezone.make_aware(datetime.combine(specific_date.date(), datetime.min.time()))
+                date_to = timezone.make_aware(datetime.combine(specific_date.date(), datetime.max.time()))
+                period = 'day'
+            elif date_from_str and date_to_str:
+                # Диапазон дат
+                date_from = timezone.make_aware(datetime.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = timezone.make_aware(datetime.combine(
+                    datetime.strptime(date_to_str, '%Y-%m-%d').date(), 
+                    datetime.max.time()
+                ))
+            elif date_from_str:
+                # Только начальная дата — до сегодня
+                date_from = timezone.make_aware(datetime.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = timezone.now()
+            elif date_to_str:
+                # Только конечная дата — с начала времён
+                date_from = timezone.make_aware(datetime(2020, 1, 1))
+                date_to = timezone.make_aware(datetime.combine(
+                    datetime.strptime(date_to_str, '%Y-%m-%d').date(), 
+                    datetime.max.time()
+                ))
+            else:
+                # Используем period
+                if period not in ['day', 'week', 'month', 'year']:
+                    return Response(
+                        {'error': 'Неверный период. Используйте: day, week, month, year'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+        except ValueError as e:
             return Response(
-                {'error': 'Неверный период. Используйте: day, week, month, year'},
+                {'error': f'Неверный формат даты. Используйте YYYY-MM-DD. {e}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -214,7 +274,9 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
         try:
             stats = PartnerStatisticsService.calculate_statistics(
                 partner_id=request.user.id,
-                period=period
+                period=period,
+                date_from=date_from,
+                date_to=date_to
             )
 
             return Response(stats)
@@ -268,8 +330,32 @@ class PartnerProfileViewSet(viewsets.ViewSet):
                 name='period',
                 type=str,
                 enum=['day', 'week', 'month', 'year'],
-                description='Период профиля',
-                required=True
+                description='Период профиля (игнорируется если указаны date или date_from/date_to)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date',
+                type=str,
+                description='Конкретная дата (YYYY-MM-DD)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date_from',
+                type=str,
+                description='Начало периода (YYYY-MM-DD)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date_to',
+                type=str,
+                description='Конец периода (YYYY-MM-DD)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='store_id',
+                type=int,
+                description='ID магазина для фильтрации',
+                required=False
             ),
         ],
         responses={
@@ -278,11 +364,50 @@ class PartnerProfileViewSet(viewsets.ViewSet):
     )
     def list(self, request):
         """Получить профиль партнёра."""
+        from datetime import datetime
+        from django.utils import timezone
+        
         period = request.query_params.get('period', 'month')
-
-        if period not in ['day', 'week', 'month', 'year']:
+        date_str = request.query_params.get('date')
+        date_from_str = request.query_params.get('date_from')
+        date_to_str = request.query_params.get('date_to')
+        
+        date_from = None
+        date_to = None
+        
+        # Приоритет: date > date_from/date_to > period
+        try:
+            if date_str:
+                # Конкретный день
+                specific_date = datetime.strptime(date_str, '%Y-%m-%d')
+                date_from = timezone.make_aware(datetime.combine(specific_date.date(), datetime.min.time()))
+                date_to = timezone.make_aware(datetime.combine(specific_date.date(), datetime.max.time()))
+                period = 'day'
+            elif date_from_str and date_to_str:
+                # Диапазон дат
+                date_from = timezone.make_aware(datetime.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = timezone.make_aware(datetime.combine(
+                    datetime.strptime(date_to_str, '%Y-%m-%d').date(), 
+                    datetime.max.time()
+                ))
+            elif date_from_str:
+                date_from = timezone.make_aware(datetime.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = timezone.now()
+            elif date_to_str:
+                date_from = timezone.make_aware(datetime(2020, 1, 1))
+                date_to = timezone.make_aware(datetime.combine(
+                    datetime.strptime(date_to_str, '%Y-%m-%d').date(), 
+                    datetime.max.time()
+                ))
+            else:
+                if period not in ['day', 'week', 'month', 'year']:
+                    return Response(
+                        {'error': 'Неверный период. Используйте: day, week, month, year'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+        except ValueError as e:
             return Response(
-                {'error': 'Неверный период. Используйте: day, week, month, year'},
+                {'error': f'Неверный формат даты. Используйте YYYY-MM-DD. {e}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -295,7 +420,9 @@ class PartnerProfileViewSet(viewsets.ViewSet):
             profile = PartnerProfileService.get_profile_data(
                 partner_id=request.user.id,
                 period=period,
-                store_id=store_id
+                store_id=store_id,
+                date_from=date_from,
+                date_to=date_to
             )
 
             return Response(profile)

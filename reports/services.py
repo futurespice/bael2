@@ -359,19 +359,8 @@ class ReportService:
 
         # 7b. РАСХОДЫ ПРОИЗВОДСТВА (себестоимость)
         try:
-            expenses_result = ExpenseService.calculate_total_expenses_with_hierarchy()
-
-            # Количество дней в периоде
-            days_count = (end_date - start_date).days + 1
-
-            # Дневные расходы * количество дней
-            daily_production = expenses_result.daily_expenses * days_count
-
-            # Месячные расходы в пересчёте на период
-            monthly_production = expenses_result.monthly_per_day * days_count
-
-            # Общая сумма производственных расходов
-            production_expenses = daily_production + monthly_production
+            # ExpenseService.calculate_total_expenses_with_hierarchy() возвращает Decimal
+            production_expenses = ExpenseService.calculate_total_expenses_with_hierarchy()
 
         except Exception as e:
             import logging
