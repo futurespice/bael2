@@ -35,3 +35,14 @@ class IsStore(permissions.BasePermission):
                 request.user.is_authenticated and
                 request.user.role == 'store'
         )
+
+
+class IsAdminOrPartner(permissions.BasePermission):
+    """Администраторы или партнёры."""
+
+    def has_permission(self, request, view):
+        return (
+                request.user and
+                request.user.is_authenticated and
+                request.user.role in ('admin', 'partner')
+        )

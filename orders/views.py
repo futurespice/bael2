@@ -56,7 +56,7 @@ from .services import (
     OrderWorkflowService,
     OrderItemData, PartnerRequestService, ManualOrderService,
 )
-from .permissions import IsAdmin, IsPartner, IsStore
+from .permissions import IsAdmin, IsPartner, IsStore, IsAdminOrPartner
 from .filters import ReturnedItemFilter
 
 
@@ -108,17 +108,10 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
         
         user = self.request.user
 
-        if user.role == 'admin':
+        if user.role == 'admin' or user.role == 'partner':
+            # Админ и Партнёр видят все заказы
             return StoreOrder.objects.all().select_related(
                 'store', 'partner', 'reviewed_by', 'confirmed_by'
-            ).prefetch_related('items__product__images').order_by('-created_at')
-
-        elif user.role == 'partner':
-            # Партнёр видит только IN_TRANSIT
-            return StoreOrder.objects.filter(
-                status=StoreOrderStatus.IN_TRANSIT
-            ).select_related(
-                'store', 'reviewed_by'
             ).prefetch_related('items__product__images').order_by('-created_at')
 
         elif user.role == 'store':
@@ -612,7 +605,7 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
     @action(
         detail=True,
         methods=['post'],
-        permission_classes=[IsAuthenticated, IsAdmin]
+        permission_classes=[IsAuthenticated, IsAdminOrPartner]
     )
     def approve(self, request: Request, pk=None) -> Response:
         """
@@ -668,7 +661,7 @@ class StoreOrderViewSet(viewsets.ModelViewSet):
     @action(
         detail=True,
         methods=['post'],
-        permission_classes=[IsAuthenticated, IsAdmin]
+        permission_classes=[IsAuthenticated, IsAdminOrPartner]
     )
     def reject(self, request: Request, pk=None) -> Response:
         """
