@@ -1607,6 +1607,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 'id': defect.id,
                 'product_id': product_id,
                 'product_name': product.name,
+                'is_weight_based': product.is_weight_based,
+                'unit': product.unit,
                 'quantity': float(quantity),
                 'price': float(price),
                 'total_amount': float(defect_amount),

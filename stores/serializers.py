@@ -1018,10 +1018,12 @@ class DefectInfoSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     product_id = serializers.IntegerField()
     product_name = serializers.CharField()
+    is_weight_based = serializers.BooleanField()
+    unit = serializers.CharField()
     quantity = serializers.FloatField()
     price = serializers.FloatField()
     total_amount = serializers.FloatField()
-    reason = serializers.CharField()
+    reason = serializers.CharField(allow_blank=True)
 
 
 class ReportDefectResponseSerializer(serializers.Serializer):
