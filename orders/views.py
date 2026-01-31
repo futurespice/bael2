@@ -1230,11 +1230,18 @@ class ManualOrderViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
         except ValidationError as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"ManualOrder ValidationError: {e}")
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
+            import logging
+            import traceback
+            logger = logging.getLogger(__name__)
+            logger.error(f"ManualOrder Exception: {e}\n{traceback.format_exc()}")
             return Response(
                 {'error': f'Ошибка создания заказа: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

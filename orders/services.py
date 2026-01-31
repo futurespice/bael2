@@ -1523,15 +1523,16 @@ class ManualOrderService:
             
             total_amount += item_total
         
-        # Обновляем заказ
-        debt_amount = total_amount - prepayment_amount
+        # Обновляем заказ (округляем до 2 знаков после запятой)
+        total_amount = total_amount.quantize(Decimal('0.01'))
+        debt_amount = (total_amount - prepayment_amount).quantize(Decimal('0.01'))
         order.total_amount = total_amount
         order.debt_amount = debt_amount
         order.save(update_fields=['total_amount', 'debt_amount'])
         
         # Обновляем долг магазина
         store = Store.objects.select_for_update().get(pk=store.pk)
-        store.debt += debt_amount
+        store.debt = (store.debt + debt_amount).quantize(Decimal('0.01'))
         store.save(update_fields=['debt'])
         
         # История
