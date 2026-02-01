@@ -60,8 +60,19 @@ class OrderCreationThrottle(UserRateThrottle):
 class BurstThrottle(UserRateThrottle):
     """
     Throttle для защиты от burst-атак.
-    
+
     Ограничение: 60 запросов в минуту.
     """
     scope = 'burst'
     rate = '60/minute'
+
+
+class StoreSelectionThrottle(UserRateThrottle):
+    """
+    Throttle для выбора магазина.
+
+    Защита от race condition при параллельных запросах.
+    5 запросов в минуту на пользователя.
+    """
+    scope = 'store_selection'
+    rate = '5/minute'

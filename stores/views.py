@@ -51,6 +51,7 @@ from django.utils import timezone
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
 from drf_spectacular.types import OpenApiTypes
 
+from users.throttles import StoreSelectionThrottle
 from .permissions import IsPartner, IsStoreOwner, CanAccessStore
 
 from .models import (
@@ -1795,10 +1796,14 @@ class SelectStoreView(APIView):
     """
     Выбрать магазин для работы (только для role='store').
 
-    ✅ ИСПРАВЛЕНО: Поддерживает store_id из body И query params.
+    ✅ ИСПРАВЛЕНО v3.1:
+    - Поддерживает store_id из body И query params.
+    - Обработка race condition (IntegrityError) с retry
+    - Rate limiting: 5 запросов в минуту (защита от параллельных запросов)
     """
 
     permission_classes = [IsAuthenticated, IsStore]
+    throttle_classes = [StoreSelectionThrottle]  # ✅ Rate limiting для защиты от race condition
 
     @extend_schema(
         summary="Выбрать магазин",
@@ -1819,8 +1824,12 @@ class SelectStoreView(APIView):
         ],
     )
     def post(self, request: Request) -> Response:
-        """Выбрать магазин."""
-        # ✅ ИСПРАВЛЕНО: Поддержка store_id из query params ИЛИ body
+        """Выбрать магазин с защитой от race condition."""
+        from django.db import IntegrityError
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # ✅ Поддержка store_id из query params ИЛИ body
         store_id = request.query_params.get('store_id') or request.data.get('store_id')
 
         if not store_id:
@@ -1832,14 +1841,45 @@ class SelectStoreView(APIView):
         # Валидация
         serializer = StoreSelectionCreateSerializer(data={'store_id': store_id})
         serializer.is_valid(raise_exception=True)
+        
+        validated_store_id = serializer.validated_data['store_id']
 
-        selection = StoreSelectionService.select_store(
-            user=request.user,
-            store_id=serializer.validated_data['store_id']
-        )
+        try:
+            selection = StoreSelectionService.select_store(
+                user=request.user,
+                store_id=validated_store_id
+            )
+            output_serializer = StoreSelectionSerializer(selection)
+            return Response(output_serializer.data, status=status.HTTP_200_OK)
+            
+        except IntegrityError as e:
+            # ✅ Race condition detected - retry with atomic transaction
+            logger.warning(f"Race condition in select_store for user {request.user.id}: {e}")
+            
+            try:
+                with transaction.atomic():
+                    # Сбрасываем все активные выборы принудительно
+                    StoreSelection.objects.filter(
+                        user=request.user,
+                        is_current=True
+                    ).update(is_current=False, deselected_at=timezone.now())
+                    
+                    # Retry selection
+                    selection = StoreSelectionService.select_store(
+                        user=request.user,
+                        store_id=validated_store_id
+                    )
+                    
+                output_serializer = StoreSelectionSerializer(selection)
+                return Response(output_serializer.data, status=status.HTTP_200_OK)
+                
+            except Exception as retry_error:
+                logger.error(f"Failed to select store after retry for user {request.user.id}: {retry_error}")
+                return Response(
+                    {'error': 'Не удалось выбрать магазин. Попробуйте еще раз.'},
+                    status=status.HTTP_409_CONFLICT  # 409 Conflict для race condition
+                )
 
-        output_serializer = StoreSelectionSerializer(selection)
-        return Response(output_serializer.data, status=status.HTTP_200_OK)
 
 
 class DeselectStoreView(APIView):

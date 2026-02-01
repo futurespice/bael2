@@ -329,6 +329,7 @@ REST_FRAMEWORK = {
         'login': '5/minute',
         'password_reset': '3/hour',
         'registration': '10/hour',
+        'store_selection': '5/minute',  # Защита от race condition
     },
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
 }

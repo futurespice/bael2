@@ -15,6 +15,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from django.db import transaction
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
 
 from .models import (
     Expense,
@@ -192,6 +194,13 @@ class ProductViewSet(viewsets.ModelViewSet):
             return ProductDetailSerializer
         return ProductListSerializer
 
+    @method_decorator(cache_page(60 * 15))
+    def list(self, request, *args, **kwargs):
+        """
+        Список товаров (кеш 15 минут).
+        """
+        return super().list(request, *args, **kwargs)
+
     def get_queryset(self):
         """Фильтрация."""
         queryset = super().get_queryset()
@@ -217,6 +226,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(name__icontains=search)
 
         return queryset
+
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
     def calculate_production(self, request, pk=None):

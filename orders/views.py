@@ -29,6 +29,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
 from drf_spectacular.utils import extend_schema_view, extend_schema, OpenApiParameter, OpenApiResponse
 from stores.models import Store
 from stores.services import StoreSelectionService
@@ -1357,7 +1359,7 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
 
     @extend_schema(
         summary="Статистика возвратов",
-        description="Получить статистику по возвращённым товарам",
+        description="Получить статистику по возвращённым товарам. Кешируется на 5 минут.",
         responses={
             200: {
                 'type': 'object',
@@ -1370,10 +1372,11 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
             }
         }
     )
+    @method_decorator(cache_page(60 * 5))
     @action(detail=False, methods=['get'])
     def statistics(self, request):
         """
-        Статистика по возвратам.
+        Статистика по возвратам (кеш 5 минут).
 
         **Ответ:**
         ```json
@@ -1399,6 +1402,9 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
 
         # Применяем фильтры
         queryset = self.filter_queryset(queryset)
+
+        # ✅ ИСПРАВЛЕНИЕ N+1: явный select_related после фильтрации
+        queryset = queryset.select_related('product', 'order', 'order__store')
 
         # Общая статистика
         total_items = queryset.count()
@@ -1427,7 +1433,7 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
             by_product[product_name]['amount'] += item_total
 
             # По магазинам
-            store_name = item.order.store.name
+            store_name = item.order.store.name if item.order and item.order.store else 'Unknown'
             if store_name not in by_store:
                 by_store[store_name] = {
                     'count': 0,
