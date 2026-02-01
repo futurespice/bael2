@@ -205,60 +205,74 @@ class OrderWorkflowService:
             assign_to_partner=None
     ) -> StoreOrder:
         """
-        Админ одобряет заказ (ТЗ v2.0).
+        Одобряет заказ (ТЗ v3.0).
 
-        ВАЖНО: Товары НЕ добавляются в StoreInventory!
-        Они остаются в StoreOrderItem и образуют "корзину" для партнёра.
+        ИЗМЕНЕНИЯ v3.0:
+        - Товары резервируются из PartnerInventory (не со склада админа!)
+        - Партнёр должен быть указан или вызывающий должен быть партнёром
+        - available_quantity проверяется перед резервированием
 
         Args:
             order: Заказ
-            admin_user: Админ
-            assign_to_partner: Партнёр (опционально)
+            admin_user: Пользователь (админ или партнёр)
+            assign_to_partner: Партнёр (опционально, если вызывает админ)
 
         Returns:
             StoreOrder
         """
+        from stores.services import PartnerInventoryService
+        
         if order.status != StoreOrderStatus.PENDING:
             raise ValidationError(
                 f'Невозможно одобрить заказ в статусе "{order.get_status_display()}"'
             )
 
-        # Проверка наличия товаров на складе и уменьшение остатков
+        # Определяем партнёра
+        partner = None
+        if admin_user.role == 'partner':
+            # Партнёр сам принимает заказ
+            partner = admin_user
+        elif assign_to_partner:
+            # Админ назначил партнёра
+            if assign_to_partner.role != 'partner':
+                raise ValidationError("Можно назначить только партнёра")
+            partner = assign_to_partner
+        else:
+            raise ValidationError(
+                "Необходимо указать партнёра (assign_to_partner_id) "
+                "или вызывать от имени партнёра"
+            )
+
+        # Проверка наличия товаров в PartnerInventory
         order_items = order.items.select_related('product').all()
 
         for item in order_items:
             product = item.product
-
-            if product.stock_quantity < item.quantity:
+            
+            if not PartnerInventoryService.check_availability(
+                partner=partner,
+                product=product,
+                quantity=item.quantity
+            ):
                 raise ValidationError(
-                    f'Недостаточно товара "{product.name}" на складе. '
-                    f'Доступно: {product.stock_quantity}, требуется: {item.quantity}'
+                    f'Недостаточно товара "{product.name}" в инвентаре партнёра. '
+                    f'Требуется: {item.quantity}'
                 )
 
-        # Уменьшаем остатки на складе
+        # Резервируем товары в PartnerInventory
         for item in order_items:
-            product = item.product
-            product.stock_quantity -= item.quantity
-
-            if product.stock_quantity <= Decimal('0'):
-                product.stock_quantity = Decimal('0')
-                product.is_available = False
-
-            product.save(update_fields=['stock_quantity', 'is_available'])
-
-        # ❌ УБРАНО: Добавление в StoreInventory
-        # Товары остаются в StoreOrderItem и образуют "корзину"
+            PartnerInventoryService.reserve_quantity(
+                partner=partner,
+                product=item.product,
+                quantity=item.quantity
+            )
 
         # Изменение статуса
         old_status = order.status
         order.status = StoreOrderStatus.IN_TRANSIT
         order.reviewed_by = admin_user
         order.reviewed_at = timezone.now()
-
-        if assign_to_partner:
-            if assign_to_partner.role != 'partner':
-                raise ValidationError("Можно назначить только партнёра")
-            order.partner = assign_to_partner
+        order.partner = partner
 
         order.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'partner'])
 
@@ -270,13 +284,14 @@ class OrderWorkflowService:
             new_status=StoreOrderStatus.IN_TRANSIT,
             changed_by=admin_user,
             comment=(
-                f'Заказ одобрен админом. '
-                f'Товары в корзине магазина "{order.store.name}". '
-                f'Ожидает подтверждения партнёром.'
+                f'Заказ одобрен. Партнёр: {partner.get_full_name()}. '
+                f'Товары зарезервированы в инвентаре партнёра. '
+                f'Ожидает подтверждения корзины.'
             )
         )
 
         return order
+
 
     # =========================================================================
     # ПРИНЯТИЕ ПАРТНЁРОМ (v3.0) - PENDING → IN_TRANSIT
@@ -646,15 +661,18 @@ class BasketService:
         Returns:
             dict с результатом
 
-        WORKFLOW:
+        WORKFLOW v3.0:
         1. Удаляем/изменяем товары в StoreOrderItem
-        2. Пересчитываем суммы заказов
-        3. Меняем статус заказов: IN_TRANSIT → ACCEPTED
-        4. Добавляем товары в StoreInventory
-        5. Создаём долг
+        2. Освобождаем резерв в PartnerInventory при удалении
+        3. Пересчитываем суммы заказов
+        4. Меняем статус заказов: IN_TRANSIT → ACCEPTED
+        5. Списываем товары из PartnerInventory
+        6. Добавляем товары в StoreInventory
+        7. Создаём долг
         """
         import logging
         logger = logging.getLogger(__name__)
+        from stores.services import PartnerInventoryService
 
         items_to_remove = items_to_remove or []
         items_to_modify = items_to_modify or []
@@ -692,9 +710,12 @@ class BasketService:
                     'order_id': item.order_id,
                 })
 
-                # Возвращаем товар на склад
-                item.product.stock_quantity += item.quantity
-                item.product.save(update_fields=['stock_quantity'])
+                # v3.0: Освобождаем резерв в PartnerInventory
+                PartnerInventoryService.release_reserved(
+                    partner=partner_user,
+                    product=item.product,
+                    quantity=item.quantity
+                )
 
             deleted_items.delete()
 
@@ -865,8 +886,15 @@ class BasketService:
                 'prepayment_amount', 'debt_amount'
             ])
 
-            # Переносим товары в инвентарь
+            # v3.0: Списываем из PartnerInventory и переносим в StoreInventory
             for item in order.items.all():
+                # Завершаем резервацию (списываем и quantity и reserved_quantity)
+                PartnerInventoryService.complete_reservation(
+                    partner=partner_user,
+                    product=item.product,
+                    quantity=item.quantity
+                )
+                # Добавляем в инвентарь магазина
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=item.product,

@@ -1113,6 +1113,70 @@ class PartnerInventoryService:
         return inventory
     
     @classmethod
+    @transaction.atomic
+    def complete_reservation(
+        cls,
+        *,
+        partner: 'User',
+        product: 'Product',
+        quantity: Decimal
+    ) -> 'PartnerInventory':
+        """
+        Завершить резервацию - списать зарезервированные товары.
+        
+        Используется при подтверждении корзины, когда товары переходят
+        из инвентаря партнёра в инвентарь магазина.
+        
+        Args:
+            partner: Партнёр
+            product: Товар
+            quantity: Количество
+            
+        Returns:
+            PartnerInventory запись или None если удалена
+            
+        Raises:
+            ValidationError: Если зарезервировано меньше чем нужно списать
+        """
+        from .models import PartnerInventory
+        
+        try:
+            inventory = PartnerInventory.objects.select_for_update().get(
+                partner=partner,
+                product=product
+            )
+        except PartnerInventory.DoesNotExist:
+            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+        
+        # Проверка резерва
+        if inventory.reserved_quantity < quantity:
+            raise ValidationError(
+                f'Зарезервировано только {inventory.reserved_quantity}, '
+                f'попытка списать {quantity}'
+            )
+        
+        # Уменьшаем и количество и резерв
+        inventory.quantity -= quantity
+        inventory.reserved_quantity -= quantity
+        
+        # Удалить запись если количество = 0
+        if inventory.quantity <= Decimal('0'):
+            inventory.delete()
+            logger.info(
+                f"Завершена резервация, удалена запись инвентаря: "
+                f"{product.name} у партнёра {partner.id}"
+            )
+            return None
+        else:
+            inventory.save(update_fields=['quantity', 'reserved_quantity', 'updated_at'])
+            logger.info(
+                f"Завершена резервация у партнёра {partner.id}: "
+                f"{product.name} x{quantity} (осталось: {inventory.quantity})"
+            )
+        
+        return inventory
+    
+    @classmethod
     def get_partner_inventory(cls, partner: 'User') -> QuerySet:
         """
         Получить весь инвентарь партнёра.
