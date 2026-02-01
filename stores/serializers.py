@@ -413,6 +413,7 @@ class StoreInventorySerializer(serializers.ModelSerializer):
 
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_unit = serializers.CharField(source='product.unit', read_only=True)
+    unit = serializers.CharField(source='product.unit', read_only=True)  # ✅ Для мобилки
     product_price = serializers.DecimalField(
         source='product.final_price',
         max_digits=10,
@@ -437,6 +438,7 @@ class StoreInventorySerializer(serializers.ModelSerializer):
             'product',
             'product_name',
             'product_unit',
+            'unit',
             'product_price',
             'is_weight_based',
             'quantity',
@@ -465,6 +467,11 @@ class StoreInventoryListSerializer(serializers.ModelSerializer):
         decimal_places=2,
         read_only=True
     )
+    is_weight_based = serializers.BooleanField(
+        source='product.is_weight_based',
+        read_only=True
+    )
+    unit = serializers.CharField(source='product.unit', read_only=True)
 
     class Meta:
         model = StoreInventory
@@ -475,7 +482,9 @@ class StoreInventoryListSerializer(serializers.ModelSerializer):
             'product_price',
             'quantity',
             'total_price',
-            'last_updated'
+            'last_updated',
+            'is_weight_based',
+            'unit'
         ]
         read_only_fields = ['id', 'last_updated']
 
