@@ -243,28 +243,17 @@ class OrderWorkflowService:
                 "или вызывать от имени партнёра"
             )
 
-        # Проверка наличия товаров в PartnerInventory
+        # Проверка наличия товаров ОТКЛЮЧЕНА для возможности принятия заказа с нехваткой
+        # Пользователь имеет возможность удалить недостающие товары из корзины позже
         order_items = order.items.select_related('product').all()
 
-        for item in order_items:
-            product = item.product
-            
-            if not PartnerInventoryService.check_availability(
-                partner=partner,
-                product=product,
-                quantity=item.quantity
-            ):
-                raise ValidationError(
-                    f'Недостаточно товара "{product.name}" в инвентаре партнёра. '
-                    f'Требуется: {item.quantity}'
-                )
-
-        # Резервируем товары в PartnerInventory
+        # Резервируем товары в PartnerInventory (с перерасходом если нужно)
         for item in order_items:
             PartnerInventoryService.reserve_quantity(
                 partner=partner,
                 product=item.product,
-                quantity=item.quantity
+                quantity=item.quantity,
+                check_availability=False
             )
 
         # Изменение статуса

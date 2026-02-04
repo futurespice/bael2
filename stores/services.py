@@ -1017,7 +1017,8 @@ class PartnerInventoryService:
         *,
         partner: 'User',
         product: 'Product',
-        quantity: Decimal
+        quantity: Decimal,
+        check_availability: bool = True
     ) -> 'PartnerInventory':
         """
         Зарезервировать товары для заказа.
@@ -1026,12 +1027,13 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Количество
+            check_availability: Проверять доступность
             
         Returns:
             PartnerInventory запись
             
         Raises:
-            ValidationError: Если недостаточно доступных товаров
+            ValidationError: Если недостаточно доступных товаров и check_availability=True
         """
         from .models import PartnerInventory
         
@@ -1041,10 +1043,19 @@ class PartnerInventoryService:
                 product=product
             )
         except PartnerInventory.DoesNotExist:
-            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+            if check_availability:
+                raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+            else:
+                # Если не проверяем наличие, создаём пустую запись для резерва
+                inventory = PartnerInventory.objects.create(
+                    partner=partner,
+                    product=product,
+                    quantity=Decimal('0'),
+                    reserved_quantity=Decimal('0')
+                )
         
         # Проверка доступного количества
-        if inventory.available_quantity < quantity:
+        if check_availability and inventory.available_quantity < quantity:
             raise ValidationError(
                 f'Недостаточно товара {product.name}. '
                 f'Доступно: {inventory.available_quantity}, запрошено: {quantity}'
