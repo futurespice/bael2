@@ -901,33 +901,6 @@ class PartnerRequestViewSet(viewsets.ModelViewSet):
             )
 
 
-# =============================================================================
-# RETURNED ITEMS (v3.0)
-# =============================================================================
-
-class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated]
-    pagination_class = StandardPagination
-    
-    def get_serializer_class(self):
-        from .serializers import ReturnedItemSerializer
-        return ReturnedItemSerializer
-    
-    def get_queryset(self):
-        from .models import ReturnedItem
-        # ✅ Защита от drf-spectacular schema generation
-        if getattr(self, 'swagger_fake_view', False):
-            return ReturnedItem.objects.none()
-        
-        queryset = ReturnedItem.objects.select_related('order', 'order__store', 'product')
-        
-        if self.request.user.role == 'admin':
-            return queryset
-        elif self.request.user.role == 'partner':
-            return queryset.filter(order__partner=self.request.user)
-        return queryset.none()
-
-
 @extend_schema_view(
     list=extend_schema(
         summary="Список всех запросов партнёров",

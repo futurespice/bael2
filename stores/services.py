@@ -107,21 +107,33 @@ class StoreService:
             cls,
             *,
             data: StoreCreateData,
-            created_by: Optional['User'] = None
+            created_by: Optional['User'] = None,
+            owner: Optional['User'] = None
     ) -> Store:
         """
         Регистрация нового магазина (ТЗ v2.0, раздел 1.4).
 
         Args:
             data: Данные магазина
-            created_by: Пользователь, создавший магазин
+            created_by: Пользователь, создавший магазин (может быть партнёр)
+            owner: Владелец магазина (пользователь с role='store')
 
         Returns:
-            Store в статусе PENDING
+            Store в статусе APPROVED
 
         Raises:
             ValidationError: Если данные некорректны
         """
+        # Если owner не указан — берём created_by
+        if not owner:
+            owner = created_by
+
+        # Проверка: owner должен иметь роль 'store'
+        if owner and owner.role != 'store':
+            raise ValidationError(
+                f'Owner должен иметь роль "store", получена роль "{owner.role}"'
+            )
+
         # Проверка: ИНН уникален
         if Store.objects.filter(inn=data.inn).exists():
             raise ValidationError(f'Магазин с ИНН {data.inn} уже зарегистрирован')
@@ -138,7 +150,6 @@ class StoreService:
             )
 
         # Создаём магазин
-        # ✅ ИСПРАВЛЕНИЕ v2.0: Автоматическое одобрение магазина
         store = Store.objects.create(
             name=data.name,
             inn=data.inn,
@@ -150,8 +161,13 @@ class StoreService:
             latitude=data.latitude,
             longitude=data.longitude,
             created_by=created_by,
-            owner=created_by,  # v3.0: Owner обязателен
-            approval_status=Store.ApprovalStatus.APPROVED  # ✅ Было PENDING
+            owner=owner,
+            approval_status=Store.ApprovalStatus.APPROVED
+        )
+
+        logger.info(
+            f'Магазин создан: {store.name} (ИНН: {store.inn}), '
+            f'created_by={created_by}, owner={owner}'
         )
 
         return store

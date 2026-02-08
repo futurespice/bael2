@@ -235,7 +235,15 @@ class StoreCreateSerializer(serializers.ModelSerializer):
     - Город
     - Область
     - Адрес магазина
+    - owner_id (обязательно для партнёров)
     """
+
+    owner_id = serializers.IntegerField(
+        write_only=True,
+        required=False,
+        allow_null=True,
+        help_text='ID пользователя с ролью store (обязательно для партнёров)'
+    )
 
     class Meta:
         model = Store
@@ -248,8 +256,36 @@ class StoreCreateSerializer(serializers.ModelSerializer):
             'city',
             'address',
             'latitude',
-            'longitude'
+            'longitude',
+            'owner_id'
         ]
+
+    def validate_owner_id(self, value):
+        """Валидация owner_id для партнёров."""
+        request = self.context.get('request')
+
+        # Если партнёр — owner_id обязателен
+        if request and request.user.role == 'partner':
+            if not value:
+                raise serializers.ValidationError(
+                    'Партнёр должен указать owner_id (пользователь с ролью store)'
+                )
+
+            # Проверяем существование пользователя
+            try:
+                from users.models import User
+                owner = User.objects.get(id=value)
+
+                if owner.role != 'store':
+                    raise serializers.ValidationError(
+                        f'Пользователь {owner.email} не имеет роль "store"'
+                    )
+            except User.DoesNotExist:
+                raise serializers.ValidationError(
+                    f'Пользователь с ID {value} не найден'
+                )
+
+        return value
 
     def validate_inn(self, value: str) -> str:
         """Валидация ИНН."""

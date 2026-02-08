@@ -365,9 +365,37 @@ class StoreViewSet(viewsets.ModelViewSet):
         return StoreSerializer
 
     def create(self, request: Request, *args, **kwargs) -> Response:
-        """Регистрация нового магазина."""
-        serializer = self.get_serializer(data=request.data)
+        """
+        Создание нового магазина.
+
+        Партнёр ДОЛЖЕН указать owner_id (пользователь с role='store').
+        Пользователь role='store' становится owner автоматически.
+        """
+        serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
+
+        # Определяем owner в зависимости от роли
+        if request.user.role == 'partner':
+            # Партнёр ОБЯЗАН указать owner_id
+            owner_id = serializer.validated_data.get('owner_id')
+            if not owner_id:
+                return Response(
+                    {'error': 'Партнёр должен указать owner_id (пользователь с ролью store)'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Получаем пользователя с ролью store
+            from users.models import User
+            try:
+                owner = User.objects.get(id=owner_id, role='store')
+            except User.DoesNotExist:
+                return Response(
+                    {'error': 'Пользователь не найден или не имеет роль store'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            # Для role='store' — owner = сам пользователь
+            owner = request.user
 
         data = StoreCreateData(
             name=serializer.validated_data['name'],
@@ -383,7 +411,8 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         store = StoreService.create_store(
             data=data,
-            created_by=request.user
+            created_by=request.user,
+            owner=owner
         )
 
         output_serializer = StoreSerializer(store)
