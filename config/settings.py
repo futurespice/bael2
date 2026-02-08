@@ -125,9 +125,17 @@ TEMPLATES = [
 # DATABASE
 # =============================================================================
 
+FORCE_SQLITE = os.environ.get('FORCE_SQLITE', 'False').lower() in ('true', '1', 'yes')
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
-if DATABASE_URL:
+if FORCE_SQLITE:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+elif DATABASE_URL:
     DATABASES = {
         'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
     }
@@ -189,6 +197,16 @@ CELERY_BEAT_SCHEDULE = {
     'recalculate-store-debts': {
         'task': 'stores.tasks.recalculate_store_debts',
         'schedule': 3600,  # Каждый час
+    },
+    # ТЗ Бахрам акя: пересчёт себестоимости раз в 1.5 недели (11 дней)
+    'recalculate-costs-by-sales': {
+        'task': 'products.tasks.recalculate_costs_by_sales',
+        'schedule': 950400,  # 11 дней = 11 * 24 * 3600 = 950400 секунд
+    },
+    # Обновление популярности товаров раз в неделю
+    'update-product-popularity': {
+        'task': 'products.tasks.update_product_popularity',
+        'schedule': 604800,  # 7 дней
     },
 }
 

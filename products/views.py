@@ -368,6 +368,258 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated, IsAdmin])
+    def pricing_analytics(self, request, pk=None):
+        """
+        Аналитика ценообразования товара (ТЗ Бахрам акя).
+
+        GET /api/products/products/{id}/pricing_analytics/
+        Query params:
+        - period_days: период анализа (по умолчанию 11 = 1.5 недели)
+
+        Ответ:
+        {
+            "product": {...},
+            "sales_stats": {
+                "quantity_sold": 1000,
+                "revenue": 50000,
+                "sales_share": 15.5  // доля в общих продажах %
+            },
+            "cost_analysis": {
+                "physical_cost": 30000,
+                "overhead_share": 5000,
+                "total_cost": 35000,
+                "cost_per_unit": 35.00
+            },
+            "pricing": {
+                "current_price": 50.00,
+                "recommended_price": 52.50,  // на основе рыночной ситуации
+                "profit_per_unit": 15.00,
+                "margin_percent": 30.0
+            },
+            "recommendations": [
+                "Товар продаётся хорошо, можно поднять цену на 5%",
+                "Себестоимость снизилась на 10% за период"
+            ]
+        }
+        """
+        from decimal import Decimal
+        from datetime import date, timedelta
+        from django.db.models import Sum, Avg, Count
+        from orders.models import StoreOrderItem, StoreOrderStatus
+        from .services import OverheadDistributor, ProductionCalculator
+        from .models import ProductRecipe, ExpenseStatus, ExpenseType
+
+        product = self.get_object()
+
+        # Параметры
+        period_days = int(request.query_params.get('period_days', 11))
+        today = date.today()
+        start_date = today - timedelta(days=period_days)
+
+        # =====================================================================
+        # 1. СТАТИСТИКА ПРОДАЖ
+        # =====================================================================
+
+        sales_data = StoreOrderItem.objects.filter(
+            product=product,
+            order__created_at__date__gte=start_date,
+            order__created_at__date__lte=today,
+            order__status=StoreOrderStatus.ACCEPTED,
+            is_bonus=False
+        ).aggregate(
+            quantity_sold=Sum('quantity'),
+            revenue=Sum('total'),
+            orders_count=Count('order', distinct=True)
+        )
+
+        quantity_sold = sales_data['quantity_sold'] or Decimal('0')
+        revenue = sales_data['revenue'] or Decimal('0')
+        orders_count = sales_data['orders_count'] or 0
+
+        # Общие продажи для расчёта доли
+        total_sales = StoreOrderItem.objects.filter(
+            order__created_at__date__gte=start_date,
+            order__status=StoreOrderStatus.ACCEPTED,
+            is_bonus=False
+        ).aggregate(total=Sum('quantity'))['total'] or Decimal('1')
+
+        sales_share = (quantity_sold / total_sales * 100).quantize(Decimal('0.01'))
+
+        # =====================================================================
+        # 2. АНАЛИЗ СЕБЕСТОИМОСТИ
+        # =====================================================================
+
+        # Физические расходы
+        total_physical = Decimal('0')
+        physical_details = []
+
+        suzerain_recipe = ProductRecipe.objects.filter(
+            product=product,
+            expense__expense_status=ExpenseStatus.SUZERAIN
+        ).select_related('expense').first()
+
+        if suzerain_recipe and quantity_sold > 0:
+            suzerain_volume = quantity_sold * suzerain_recipe.quantity_per_unit
+            suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
+            total_physical += suzerain_cost
+
+            physical_details.append({
+                'name': suzerain_recipe.expense.name,
+                'is_suzerain': True,
+                'quantity': float(suzerain_volume),
+                'unit_price': float(suzerain_recipe.expense.price_per_unit or 0),
+                'total': float(suzerain_cost)
+            })
+
+            # Остальные физические
+            other_recipes = ProductRecipe.objects.filter(
+                product=product,
+                expense__expense_type=ExpenseType.PHYSICAL
+            ).exclude(
+                expense__expense_status=ExpenseStatus.SUZERAIN
+            ).select_related('expense')
+
+            for recipe in other_recipes:
+                if recipe.proportion:
+                    item_volume = suzerain_volume * recipe.proportion
+                    item_cost = item_volume * (recipe.expense.price_per_unit or Decimal('0'))
+                    total_physical += item_cost
+
+                    physical_details.append({
+                        'name': recipe.expense.name,
+                        'is_suzerain': False,
+                        'proportion': float(recipe.proportion),
+                        'quantity': float(item_volume),
+                        'unit_price': float(recipe.expense.price_per_unit or 0),
+                        'total': float(item_cost)
+                    })
+
+        # Накладные расходы
+        overhead_breakdown = OverheadDistributor.get_overhead_breakdown_for_product(
+            product=product,
+            quantity_produced=quantity_sold if quantity_sold > 0 else Decimal('1'),
+            period_days=period_days
+        )
+
+        overhead_share = sum(item.total_cost for item in overhead_breakdown)
+        overhead_share_period = overhead_share * period_days  # За весь период
+
+        overhead_details = [
+            {
+                'name': item.expense_name,
+                'daily_amount': float(item.unit_price),
+                'product_share': float(item.total_cost),
+                'period_total': float(item.total_cost * period_days)
+            }
+            for item in overhead_breakdown
+        ]
+
+        # Итого
+        total_cost = total_physical + overhead_share_period
+
+        if quantity_sold > 0:
+            cost_per_unit = (total_cost / quantity_sold).quantize(Decimal('0.01'))
+        else:
+            cost_per_unit = product.average_cost_price or Decimal('0')
+
+        # =====================================================================
+        # 3. АНАЛИЗ ЦЕНЫ И РЕКОМЕНДАЦИИ
+        # =====================================================================
+
+        current_price = product.final_price or Decimal('0')
+        profit_per_unit = current_price - cost_per_unit
+
+        if cost_per_unit > 0:
+            margin_percent = ((current_price - cost_per_unit) / cost_per_unit * 100).quantize(Decimal('0.01'))
+        else:
+            margin_percent = Decimal('0')
+
+        # Рекомендуемая цена (себестоимость + стандартная наценка 30%)
+        recommended_price = (cost_per_unit * Decimal('1.3')).quantize(Decimal('0.01'))
+
+        # Генерация рекомендаций
+        recommendations = []
+
+        # Анализ продаж
+        if sales_share > 20:
+            recommendations.append(
+                f'🔥 Товар популярен ({sales_share}% продаж). '
+                f'Можно рассмотреть повышение цены на 5-10%.'
+            )
+        elif sales_share < 5:
+            recommendations.append(
+                f'📉 Низкие продажи ({sales_share}% от общих). '
+                f'Рассмотрите снижение цены для стимуляции спроса.'
+            )
+
+        # Анализ маржи
+        if margin_percent < 20:
+            recommendations.append(
+                f'⚠️ Низкая маржа ({margin_percent}%). '
+                f'Рекомендуется поднять цену минимум до {recommended_price} сом.'
+            )
+        elif margin_percent > 50:
+            recommendations.append(
+                f'✅ Хорошая маржа ({margin_percent}%). '
+                f'Цена конкурентоспособна.'
+            )
+
+        # Сравнение с рекомендуемой ценой
+        if current_price < recommended_price * Decimal('0.9'):
+            recommendations.append(
+                f'💡 Текущая цена ({current_price}) ниже рекомендуемой ({recommended_price}). '
+                f'Есть потенциал для роста.'
+            )
+        elif current_price > recommended_price * Decimal('1.2'):
+            recommendations.append(
+                f'📊 Текущая цена ({current_price}) выше рекомендуемой ({recommended_price}). '
+                f'Следите за объёмом продаж.'
+            )
+
+        # =====================================================================
+        # 4. ФОРМИРУЕМ ОТВЕТ
+        # =====================================================================
+
+        return Response({
+            'product': {
+                'id': product.id,
+                'name': product.name,
+                'unit': product.unit,
+                'is_weight_based': product.is_weight_based,
+            },
+            'period': {
+                'days': period_days,
+                'start_date': str(start_date),
+                'end_date': str(today),
+            },
+            'sales_stats': {
+                'quantity_sold': float(quantity_sold),
+                'revenue': float(revenue),
+                'orders_count': orders_count,
+                'sales_share': float(sales_share),
+                'avg_quantity_per_day': float((quantity_sold / period_days).quantize(Decimal('0.01'))) if period_days > 0 else 0,
+            },
+            'cost_analysis': {
+                'physical_expenses': physical_details,
+                'physical_total': float(total_physical),
+                'overhead_expenses': overhead_details,
+                'overhead_total': float(overhead_share_period),
+                'total_cost': float(total_cost),
+                'cost_per_unit': float(cost_per_unit),
+            },
+            'pricing': {
+                'current_price': float(current_price),
+                'cost_per_unit': float(cost_per_unit),
+                'recommended_price': float(recommended_price),
+                'profit_per_unit': float(profit_per_unit),
+                'margin_percent': float(margin_percent),
+                'markup_percentage': float(product.markup_percentage or 0),
+            },
+            'recommendations': recommendations,
+        })
+
+
 # =============================================================================
 # PRODUCTION BATCH VIEWSET
 # =============================================================================

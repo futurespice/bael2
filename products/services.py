@@ -253,26 +253,16 @@ class ProductionCalculator:
         total_physical = sum(item.total_cost for item in physical_expenses)
 
         # =====================================================================
-        # 2. НАКЛАДНЫЕ РАСХОДЫ (умная наценка)
+        # 2. НАКЛАДНЫЕ РАСХОДЫ (умная наценка с детализацией)
         # =====================================================================
 
-        # Получаем долю накладных для этого товара
-        overhead_share = OverheadDistributor.get_overhead_for_product(
+        # ТЗ Бахрам акя: показываем КАЖДЫЙ накладной расход отдельно
+        overhead_expenses = OverheadDistributor.get_overhead_breakdown_for_product(
             product=product,
             quantity_produced=quantity
         )
 
-        # Добавляем в список (без детализации по каждому расходу)
-        overhead_expenses.append(ExpenseItem(
-            expense_id=0,
-            expense_name='Накладные расходы (общие)',
-            expense_type='overhead',
-            quantity=Decimal('0'),
-            unit_price=Decimal('0'),
-            total_cost=overhead_share
-        ))
-
-        total_overhead = overhead_share
+        total_overhead = sum(item.total_cost for item in overhead_expenses)
 
         # =====================================================================
         # 3. ИТОГО
@@ -325,18 +315,23 @@ class OverheadDistributor:
             cls,
             product: Product,
             quantity_produced: Decimal,
-            date_filter: Optional[date] = None
+            date_filter: Optional[date] = None,
+            period_days: int = 11  # 1.5 недели
     ) -> Decimal:
         """
-        Получить долю накладных расходов для товара.
+        Получить долю накладных расходов для товара на основе ПРОДАЖ.
+
+        ТЗ Бахрам акя: накладные распределяются пропорционально объёму продаж,
+        не производства. Товары которые продаются чаще — несут больше расходов.
 
         Args:
             product: Товар
-            quantity_produced: Количество производства
-            date_filter: Дата (опционально)
+            quantity_produced: Количество для расчёта (если товар новый)
+            date_filter: Конечная дата анализа
+            period_days: Период анализа (по умолчанию 11 дней = 1.5 недели)
 
         Returns:
-            Сумма накладных расходов
+            Сумма накладных расходов для данного товара
         """
         # Получаем все накладные расходы
         overhead_expenses = Expense.objects.filter(
@@ -347,26 +342,29 @@ class OverheadDistributor:
         if not overhead_expenses.exists():
             return Decimal('0')
 
-        # Считаем общую сумму накладных
+        # Считаем общую сумму накладных за день
         total_overhead = Decimal('0')
         for expense in overhead_expenses:
             total_overhead += expense.calculate_amount()
 
-        # Получаем объёмы производства всех товаров
-        all_products_volumes = cls._get_all_products_volumes(date_filter)
+        # Получаем объёмы ПРОДАЖ всех товаров за период
+        all_products_volumes = cls._get_all_products_volumes(
+            date_filter=date_filter,
+            period_days=period_days
+        )
 
         # Вычисляем долю текущего товара
         total_volume = sum(v['volume'] for v in all_products_volumes)
 
         if total_volume == 0:
-            # Если нет данных о производстве, делим поровну
+            # Если нет данных о продажах, делим поровну
             active_products_count = Product.objects.filter(is_active=True).count()
             if active_products_count > 0:
                 return (total_overhead / active_products_count).quantize(Decimal('0.01'))
             else:
                 return Decimal('0')
 
-        # Находим текущий товар в списке
+        # Находим текущий товар в списке продаж
         current_product_volume = next(
             (v for v in all_products_volumes if v['product_id'] == product.id),
             None
@@ -375,7 +373,7 @@ class OverheadDistributor:
         if current_product_volume:
             volume = current_product_volume['volume']
         else:
-            # Если товар ещё не производился, используем текущее количество
+            # Если товар ещё не продавался, используем введённое количество
             volume = quantity_produced
             total_volume += volume
 
@@ -388,40 +386,57 @@ class OverheadDistributor:
     @classmethod
     def _get_all_products_volumes(
             cls,
-            date_filter: Optional[date] = None
+            date_filter: Optional[date] = None,
+            period_days: int = 11  # 1.5 недели по умолчанию
     ) -> List[Dict]:
         """
-        Получить объёмы производства всех товаров.
+        Получить объёмы ПРОДАЖ всех товаров (не производства!).
+
+        ТЗ Бахрам акя: распределять накладные на основе реальных продаж,
+        а не производства. Товары которые продаются чаще — несут больше
+        накладных расходов.
 
         Args:
-            date_filter: Дата (если None, берём последний месяц)
+            date_filter: Конечная дата (если None, берём сегодня)
+            period_days: Период анализа в днях (по умолчанию 11 дней = 1.5 недели)
 
         Returns:
-            [{'product_id': 1, 'product_name': 'Пельмени', 'volume': 1000}, ...]
+            [{'product_id': 1, 'product_name': 'Пельмени', 'volume': 1000, 'revenue': 50000}, ...]
         """
         from datetime import timedelta
+        from orders.models import StoreOrderItem, StoreOrderStatus
 
-        # Если дата не указана, берём последний месяц
+        # Если дата не указана, берём сегодня
         if not date_filter:
             date_filter = date.today()
 
-        start_date = date_filter - timedelta(days=30)
+        start_date = date_filter - timedelta(days=period_days)
 
-        # Получаем производство за период
-        batches = ProductionBatch.objects.filter(
-            date__gte=start_date,
-            date__lte=date_filter
-        ).values('product__id', 'product__name').annotate(
-            total_volume=Sum('quantity_produced')
+        # Получаем ПРОДАЖИ за период (из заказов магазинов)
+        # Учитываем только доставленные заказы
+        sales = StoreOrderItem.objects.filter(
+            order__created_at__date__gte=start_date,
+            order__created_at__date__lte=date_filter,
+            order__status__in=[
+                StoreOrderStatus.ACCEPTED
+            ],
+            is_bonus=False  # Не учитываем бонусные товары
+        ).values(
+            'product__id',
+            'product__name'
+        ).annotate(
+            total_volume=Sum('quantity'),
+            total_revenue=Sum('total')
         )
 
         return [
             {
-                'product_id': batch['product__id'],
-                'product_name': batch['product__name'],
-                'volume': batch['total_volume']
+                'product_id': sale['product__id'],
+                'product_name': sale['product__name'],
+                'volume': sale['total_volume'] or Decimal('0'),
+                'revenue': sale['total_revenue'] or Decimal('0')
             }
-            for batch in batches
+            for sale in sales
         ]
 
     @classmethod
@@ -469,6 +484,83 @@ class OverheadDistributor:
             ))
 
         return results
+
+    @classmethod
+    def get_overhead_breakdown_for_product(
+            cls,
+            product: Product,
+            quantity_produced: Decimal,
+            date_filter: Optional[date] = None,
+            period_days: int = 11
+    ) -> List[ExpenseItem]:
+        """
+        Получить ДЕТАЛИЗАЦИЮ накладных расходов для товара.
+
+        ТЗ Бахрам акя: вместо одной строки "Накладные (общие)" показывать
+        каждый расход отдельно: аренда, зарплата, электричество и т.д.
+
+        Args:
+            product: Товар
+            quantity_produced: Количество для расчёта
+            date_filter: Конечная дата анализа
+            period_days: Период анализа (по умолчанию 11 дней)
+
+        Returns:
+            Список ExpenseItem с детализацией по каждому накладному расходу
+        """
+        # Получаем все накладные расходы
+        overhead_expenses = Expense.objects.filter(
+            expense_type=ExpenseType.OVERHEAD,
+            is_active=True
+        )
+
+        if not overhead_expenses.exists():
+            return []
+
+        # Получаем объёмы ПРОДАЖ всех товаров
+        all_products_volumes = cls._get_all_products_volumes(
+            date_filter=date_filter,
+            period_days=period_days
+        )
+
+        total_volume = sum(v['volume'] for v in all_products_volumes)
+
+        # Находим долю текущего товара
+        current_product_volume = next(
+            (v for v in all_products_volumes if v['product_id'] == product.id),
+            None
+        )
+
+        if current_product_volume:
+            volume = current_product_volume['volume']
+        else:
+            volume = quantity_produced
+            total_volume += volume
+
+        # Вычисляем долю товара
+        if total_volume > 0:
+            share = volume / total_volume
+        else:
+            # Если нет продаж, делим поровну
+            active_products_count = Product.objects.filter(is_active=True).count()
+            share = Decimal('1') / active_products_count if active_products_count > 0 else Decimal('0')
+
+        # Детализируем каждый накладной расход
+        breakdown = []
+        for expense in overhead_expenses:
+            expense_amount = expense.calculate_amount()
+            product_share = (expense_amount * share).quantize(Decimal('0.01'))
+
+            breakdown.append(ExpenseItem(
+                expense_id=expense.id,
+                expense_name=expense.name,
+                expense_type='overhead',
+                quantity=Decimal('0'),  # Не применимо для накладных
+                unit_price=expense_amount,  # Общая сумма расхода
+                total_cost=product_share  # Доля товара
+            ))
+
+        return breakdown
 
 
 # =============================================================================
