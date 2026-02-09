@@ -291,14 +291,23 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.ListSerializer(child=serializers.DictField()))
     def get_images(self, obj) -> List[Dict[str, Any]]:
-        return [
-            {
+        request = self.context.get('request')
+        images = []
+        for img in obj.images.all()[:3]:
+            if img.image:
+                # Формируем полный URL с доменом
+                if request:
+                    image_url = request.build_absolute_uri(img.image.url)
+                else:
+                    image_url = img.image.url
+            else:
+                image_url = None
+            images.append({
                 'id': img.id,
-                'image': img.image.url if img.image else None,
+                'image': image_url,
                 'order': img.order
-            }
-            for img in obj.images.all()[:3]
-        ]
+            })
+        return images
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
@@ -354,14 +363,22 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     @extend_schema_field(serializers.ListSerializer(child=serializers.DictField()))
     def get_images_read(self, obj) -> List[Dict[str, Any]]:
         """Возвращает список изображений для чтения."""
-        return [
-            {
+        request = self.context.get('request')
+        images = []
+        for img in obj.images.all():
+            if img.image:
+                if request:
+                    image_url = request.build_absolute_uri(img.image.url)
+                else:
+                    image_url = img.image.url
+            else:
+                image_url = None
+            images.append({
                 'id': img.id,
-                'image': img.image.url if img.image else None,
+                'image': image_url,
                 'order': img.order
-            }
-            for img in obj.images.all()
-        ]
+            })
+        return images
 
     def validate_images(self, value):
         """Валидация размера изображений (макс 5 МБ)."""
