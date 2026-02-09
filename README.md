@@ -21,6 +21,9 @@ pip install -r requirements.txt
 # Создать .env файл
 cp .env.example .env
 # Отредактировать .env
+
+# Если в локальной среде нет PostgreSQL/Redis, можно включить SQLite fallback
+# FORCE_SQLITE=True
 ```
 
 ### 2. Запуск баз данных через Docker

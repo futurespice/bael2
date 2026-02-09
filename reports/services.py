@@ -29,7 +29,7 @@ from django.db.models import Q, Sum, Count, F, QuerySet
 from django.utils import timezone
 
 from stores.models import Store, Region, City, StoreInventory
-from orders.models import StoreOrder, StoreOrderStatus, DebtPayment, DefectiveProduct, StoreOrderItem
+from orders.models import StoreOrder, StoreOrderStatus, DebtPayment, DefectiveProduct, StoreOrderItem, ReturnedItem
 from products.models import PartnerExpense
 from products.services import ExpenseService
 
@@ -674,6 +674,41 @@ class PartnerStatisticsService:
             })
         
         # =========================================================================
+        # 1.5. ВОЗВРАЩЕНО АДМИНУ (PartnerRequest.request_type='return')
+        # =========================================================================
+        returned_to_admin_items = PartnerRequestItem.objects.filter(
+            request__partner_id=partner_id,
+            request__request_type='return',
+            request__status=PartnerRequestStatus.APPROVED,
+            request__created_at__range=[date_from, date_to]
+        ).select_related('product')
+        
+        returned_to_admin_total = Decimal('0')
+        returned_to_admin_piece_count = 0
+        returned_to_admin_weight_total = Decimal('0')
+        returned_to_admin_list = []
+        
+        for item in returned_to_admin_items:
+            product = item.product
+            item_total = item.quantity * product.final_price
+            returned_to_admin_total += item_total
+            
+            if product.is_weight_based:
+                returned_to_admin_weight_total += item.quantity
+                unit = 'кг'
+            else:
+                returned_to_admin_piece_count += int(item.quantity)
+                unit = 'шт'
+            
+            returned_to_admin_list.append({
+                'name': product.name,
+                'quantity': float(item.quantity),
+                'unit': unit,
+                'price': str(product.final_price),
+                'total': str(item_total)
+            })
+        
+        # =========================================================================
         # 2. ПРОДАНО МАГАЗИНАМ (с детализацией)
         # =========================================================================
         sold_items = StoreOrderItem.objects.filter(
@@ -809,6 +844,40 @@ class PartnerStatisticsService:
             })
         
         # =========================================================================
+        # 6.5. ВОЗВРАТЫ (ReturnedItem)
+        # =========================================================================
+        returned_items = ReturnedItem.objects.filter(
+            returned_by_id=partner_id,
+            returned_at__range=[date_from, date_to]
+        ).select_related('product')
+        
+        returned_total = Decimal('0')
+        returned_piece_count = 0
+        returned_weight_total = Decimal('0')
+        returned_list = []
+        
+        for item in returned_items:
+            product = item.product
+            returned_total += item.total_amount
+            
+            if product.is_weight_based:
+                returned_weight_total += item.weight or Decimal('0')
+                unit = 'кг'
+            else:
+                returned_piece_count += int(item.quantity)
+                unit = 'шт'
+            
+            returned_list.append({
+                'name': product.name,
+                'quantity': float(item.quantity),
+                'weight': float(item.weight) if item.weight else None,
+                'unit': unit,
+                'price': str(item.price_at_return),
+                'total': str(item.total_amount),
+                'reason': item.reason,
+            })
+        
+        # =========================================================================
         # 7. ДОЛГИ
         # =========================================================================
         unpaid_debt = StoreOrder.objects.filter(
@@ -834,9 +903,9 @@ class PartnerStatisticsService:
         
         # =========================================================================
         # 9. ОБЩАЯ СУММА
-        # Формула: продажи - расходы - брак + погашенный долг - непогашенный долг
+        # Формула: продажи - расходы - брак - возвраты + погашенный долг - непогашенный долг
         # =========================================================================
-        grand_total = sold_total - expenses_total - defective_total + paid_debt - unpaid_debt
+        grand_total = sold_total - expenses_total - defective_total - returned_total + paid_debt - unpaid_debt
         
         # =========================================================================
         # ФОРМИРУЕМ ОТВЕТ
@@ -848,6 +917,14 @@ class PartnerStatisticsService:
                 'piece_count': requested_piece_count,
                 'weight_total': str(requested_weight_total),
                 'items': requested_list
+            },
+            
+            # Возвращено админу
+            'returned_to_admin': {
+                'total_amount': str(returned_to_admin_total),
+                'piece_count': returned_to_admin_piece_count,
+                'weight_total': str(returned_to_admin_weight_total),
+                'items': returned_to_admin_list
             },
             
             # Продано магазинам
@@ -883,6 +960,14 @@ class PartnerStatisticsService:
                 'total_amount': str(bonus_total),
                 'count': bonus_count,
                 'items': bonus_list
+            },
+            
+            # Возвраты
+            'returned': {
+                'total_amount': str(returned_total),
+                'piece_count': returned_piece_count,
+                'weight_total': str(returned_weight_total),
+                'items': returned_list
             },
             
             # Долги

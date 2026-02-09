@@ -97,6 +97,7 @@ from orders.models import (
     OrderHistory,
     OrderType,
     DefectiveProduct,  # ✅ Статус внутри: DefectiveProduct.DefectStatus
+    ReturnedItem,  # ✅ Для учёта возвращённых товаров
 )
 # =============================================================================
 # PAGINATION
@@ -944,6 +945,18 @@ class StoreViewSet(viewsets.ModelViewSet):
             ).select_related('product')
 
             for item in deleted_items:
+                # ✅ Создаём запись о возврате
+                ReturnedItem.objects.create(
+                    order=item.order,
+                    product=item.product,
+                    quantity=item.quantity,
+                    weight=item.weight if hasattr(item, 'weight') and item.weight else None,
+                    price_at_return=item.price,
+                    total_amount=item.total,
+                    reason='Удалено из корзины партнёром',
+                    returned_by=user,
+                )
+                
                 removed_info.append({
                     'product_id': product_id,
                     'product_name': item.product.name,
@@ -1006,6 +1019,18 @@ class StoreViewSet(viewsets.ModelViewSet):
                     removed_qty = item.quantity
                     remaining_to_remove -= removed_qty
 
+                    # ✅ Создаём запись о возврате
+                    ReturnedItem.objects.create(
+                        order=item.order,
+                        product=product,
+                        quantity=removed_qty,
+                        weight=item.weight if hasattr(item, 'weight') and item.weight else None,
+                        price_at_return=item.price,
+                        total_amount=removed_qty * item.price,
+                        reason='Частично удалено из корзины партнёром',
+                        returned_by=user,
+                    )
+
                     # Возвращаем на склад
                     product.stock_quantity += removed_qty
                     product.save(update_fields=['stock_quantity'])
@@ -1021,9 +1046,22 @@ class StoreViewSet(viewsets.ModelViewSet):
                 else:
                     # Уменьшаем позицию частично
                     old_qty = item.quantity
+                    removed_qty = remaining_to_remove
                     item.quantity -= remaining_to_remove
                     item.total = item.quantity * item.price
                     item.save(update_fields=['quantity', 'total'])
+
+                    # ✅ Создаём запись о возврате для удалённой части
+                    ReturnedItem.objects.create(
+                        order=item.order,
+                        product=product,
+                        quantity=removed_qty,
+                        weight=None,  # Частичное удаление, без веса
+                        price_at_return=item.price,
+                        total_amount=removed_qty * item.price,
+                        reason='Частично удалено из корзины партнёром',
+                        returned_by=user,
+                    )
 
                     # Возвращаем на склад
                     product.stock_quantity += remaining_to_remove
@@ -1033,7 +1071,7 @@ class StoreViewSet(viewsets.ModelViewSet):
                         'product_id': product_id,
                         'product_name': product.name,
                         'quantity_before': float(old_qty),
-                        'quantity_removed': float(remaining_to_remove),
+                        'quantity_removed': float(removed_qty),
                         'quantity_after': float(item.quantity),
                         'order_id': item.order_id,
                     })

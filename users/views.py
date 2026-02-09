@@ -350,6 +350,49 @@ class AdminUserViewSet(viewsets.ModelViewSet):
             'blocked_users': blocked
         })
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def store_users(self, request):
+        """
+        Список пользователей с role='store' для выбора при создании магазина.
+        
+        GET /api/auth/admin/users/store_users/
+        
+        Используется партнёрами при создании магазина:
+        - Партнёр ДОЛЖЕН указать owner_id при создании магазина
+        - Этот endpoint возвращает список доступных пользователей
+        
+        Ответ:
+        {
+            "count": 5,
+            "results": [
+                {"id": 1, "email": "store1@example.com", "phone": "+996...", "name": "..."},
+                ...
+            ]
+        }
+        """
+        # Фильтруем только активных пользователей с ролью store
+        store_users = User.objects.filter(
+            role='store',
+            is_active=True,
+            approval_status='approved'
+        ).order_by('name', 'second_name')
+        
+        results = []
+        for user in store_users:
+            results.append({
+                'id': user.id,
+                'email': user.email,
+                'phone': user.phone,
+                'name': user.name,
+                'second_name': user.second_name,
+                'full_name': user.full_name,
+            })
+        
+        return Response({
+            'count': len(results),
+            'results': results
+        })
+
 
 class PasswordResetRequestView(generics.CreateAPIView):
     """

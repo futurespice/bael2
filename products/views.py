@@ -619,6 +619,177 @@ class ProductViewSet(viewsets.ModelViewSet):
             'recommendations': recommendations,
         })
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsAdmin])
+    def cost_dashboard(self, request):
+        """
+        Сводная таблица себестоимости ВСЕХ товаров (ТЗ Бахрам акя).
+        
+        GET /api/products/products/cost_dashboard/
+        Query params:
+        - period_days: период анализа (по умолчанию 11 = 1.5 недели)
+        
+        Ответ:
+        {
+            "period_days": 11,
+            "date_from": "2026-01-29",
+            "date_to": "2026-02-09",
+            "total_overhead": "50000.00",
+            "products": [
+                {
+                    "id": 1,
+                    "name": "Пельмени зелёные",
+                    "quantity_sold": 1000,
+                    "revenue": "50000.00",
+                    "sales_share": "45.5",
+                    "physical_cost": "30000.00",
+                    "overhead_share": "22750.00",
+                    "total_cost": "52750.00",
+                    "cost_per_unit": "52.75",
+                    "current_price": "100.00",
+                    "profit_per_unit": "47.25",
+                    "margin_percent": "47.25"
+                }
+            ]
+        }
+        """
+        from decimal import Decimal
+        from datetime import date, timedelta
+        from django.db.models import Sum
+        from orders.models import StoreOrderItem, StoreOrderStatus
+        from .models import ProductRecipe, ExpenseStatus, ExpenseType, Expense
+        
+        # Параметры
+        period_days = int(request.query_params.get('period_days', 11))
+        today = date.today()
+        start_date = today - timedelta(days=period_days)
+        
+        # =====================================================================
+        # 1. ПОЛУЧАЕМ ВСЕ НАКЛАДНЫЕ РАСХОДЫ ЗА ПЕРИОД
+        # =====================================================================
+        total_overhead = Decimal('0')
+        overhead_expenses = Expense.objects.filter(
+            expense_type=ExpenseType.OVERHEAD,
+            is_active=True
+        )
+        
+        for expense in overhead_expenses:
+            daily_amount = expense.calculate_amount()
+            total_overhead += daily_amount * period_days
+        
+        # =====================================================================
+        # 2. ПОЛУЧАЕМ СТАТИСТИКУ ПРОДАЖ ПО ВСЕМ ТОВАРАМ
+        # =====================================================================
+        sales_data = StoreOrderItem.objects.filter(
+            order__created_at__date__gte=start_date,
+            order__created_at__date__lte=today,
+            order__status=StoreOrderStatus.ACCEPTED,
+            is_bonus=False
+        ).values('product_id', 'product__name').annotate(
+            quantity_sold=Sum('quantity'),
+            revenue=Sum('total')
+        )
+        
+        # Общие продажи для расчёта долей
+        total_sales_quantity = sum(
+            (item['quantity_sold'] or Decimal('0')) for item in sales_data
+        )
+        
+        # =====================================================================
+        # 3. АНАЛИЗИРУЕМ КАЖДЫЙ ТОВАР
+        # =====================================================================
+        products_data = []
+        
+        for item in sales_data:
+            product_id = item['product_id']
+            product_name = item['product__name']
+            quantity_sold = item['quantity_sold'] or Decimal('0')
+            revenue = item['revenue'] or Decimal('0')
+            
+            # Доля в продажах
+            if total_sales_quantity > 0:
+                sales_share = (quantity_sold / total_sales_quantity * 100).quantize(Decimal('0.01'))
+            else:
+                sales_share = Decimal('0')
+            
+            # Накладные для этого товара (пропорционально продажам)
+            overhead_share = (total_overhead * sales_share / 100).quantize(Decimal('0.01'))
+            
+            # Физические расходы
+            physical_cost = Decimal('0')
+            suzerain_recipe = ProductRecipe.objects.filter(
+                product_id=product_id,
+                expense__expense_status=ExpenseStatus.SUZERAIN
+            ).select_related('expense').first()
+            
+            if suzerain_recipe and quantity_sold > 0:
+                suzerain_volume = quantity_sold * suzerain_recipe.quantity_per_unit
+                suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
+                physical_cost += suzerain_cost
+                
+                # Остальные физические
+                other_recipes = ProductRecipe.objects.filter(
+                    product_id=product_id,
+                    expense__expense_type=ExpenseType.PHYSICAL
+                ).exclude(
+                    expense__expense_status=ExpenseStatus.SUZERAIN
+                ).select_related('expense')
+                
+                for recipe in other_recipes:
+                    if recipe.proportion:
+                        item_volume = suzerain_volume * recipe.proportion
+                        item_cost = item_volume * (recipe.expense.price_per_unit or Decimal('0'))
+                        physical_cost += item_cost
+            
+            # Общая себестоимость
+            total_cost = physical_cost + overhead_share
+            
+            # Себестоимость за единицу
+            if quantity_sold > 0:
+                cost_per_unit = (total_cost / quantity_sold).quantize(Decimal('0.01'))
+            else:
+                cost_per_unit = Decimal('0')
+            
+            # Текущая цена (из revenue)
+            if quantity_sold > 0:
+                current_price = (revenue / quantity_sold).quantize(Decimal('0.01'))
+            else:
+                current_price = Decimal('0')
+            
+            # Прибыль и маржа
+            profit_per_unit = current_price - cost_per_unit
+            if current_price > 0:
+                margin_percent = (profit_per_unit / current_price * 100).quantize(Decimal('0.01'))
+            else:
+                margin_percent = Decimal('0')
+            
+            products_data.append({
+                'id': product_id,
+                'name': product_name,
+                'quantity_sold': float(quantity_sold),
+                'revenue': str(revenue),
+                'sales_share': str(sales_share),
+                'physical_cost': str(physical_cost),
+                'overhead_share': str(overhead_share),
+                'total_cost': str(total_cost),
+                'cost_per_unit': str(cost_per_unit),
+                'current_price': str(current_price),
+                'profit_per_unit': str(profit_per_unit),
+                'margin_percent': str(margin_percent),
+            })
+        
+        # Сортируем по доле продаж (популярные сверху)
+        products_data.sort(key=lambda x: float(x['sales_share']), reverse=True)
+        
+        return Response({
+            'period_days': period_days,
+            'date_from': start_date.isoformat(),
+            'date_to': today.isoformat(),
+            'total_overhead': str(total_overhead),
+            'total_sales_quantity': float(total_sales_quantity),
+            'products_count': len(products_data),
+            'products': products_data,
+        })
+
 
 # =============================================================================
 # PRODUCTION BATCH VIEWSET
