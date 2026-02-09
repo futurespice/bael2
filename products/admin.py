@@ -184,13 +184,6 @@ class ProductImageInline(admin.TabularInline):
 
     image_preview.short_description = 'Превью'
 
-    def get_queryset(self, request):
-        """Возвращает пустой queryset для несохранённых объектов."""
-        qs = super().get_queryset(request)
-        if not hasattr(self, 'parent_model') or not self.parent_model:
-            return qs.none()
-        return qs
-
 
 class ProductRecipeInline(admin.TabularInline):
     """Инлайн для рецептов."""
@@ -198,13 +191,6 @@ class ProductRecipeInline(admin.TabularInline):
     extra = 1
     fields = ['expense', 'quantity_per_unit', 'proportion']
     autocomplete_fields = ['expense']
-
-    def get_queryset(self, request):
-        """Возвращает пустой queryset для несохранённых объектов."""
-        qs = super().get_queryset(request)
-        if not hasattr(self, 'parent_model') or not self.parent_model:
-            return qs.none()
-        return qs
 
 
 @admin.register(Product)
