@@ -359,8 +359,29 @@ class ReportService:
 
         # 7b. РАСХОДЫ ПРОИЗВОДСТВА (себестоимость)
         try:
-            # ExpenseService.calculate_total_expenses_with_hierarchy() возвращает Decimal
-            production_expenses = ExpenseService.calculate_total_expenses_with_hierarchy()
+            from products.models import ProductionBatch, Expense, ExpenseType
+
+            # 1. Затраты на сырье (из реальных партий за период)
+            raw_materials = ProductionBatch.objects.filter(
+                date__range=[start_date, end_date]
+            ).aggregate(total=Sum('total_physical_cost'))['total'] or Decimal('0')
+
+            # 2. Накладные расходы (аренда, з/п и т.д.) - считаем за каждый день периода
+            overhead_daily_sum = Decimal('0')
+            overhead_expenses = Expense.objects.filter(
+                is_active=True,
+                expense_type=ExpenseType.OVERHEAD
+            )
+            
+            for expense in overhead_expenses:
+                # calculate_amount() возвращает сумму за 1 день
+                overhead_daily_sum += expense.calculate_amount()
+
+            # Количество дней в периоде
+            days_count = (end_date - start_date).days + 1
+            total_overhead = overhead_daily_sum * days_count
+
+            production_expenses = raw_materials + total_overhead
 
         except Exception as e:
             import logging
@@ -655,7 +676,7 @@ class PartnerStatisticsService:
         
         for item in requested_items:
             product = item.product
-            item_total = item.quantity * product.final_price
+            item_total = item.total_amount  # ✅ Используем price_at_request + корректную формулу для весовых
             requested_total += item_total
             
             if product.is_weight_based:
@@ -669,7 +690,7 @@ class PartnerStatisticsService:
                 'name': product.name,
                 'quantity': float(item.quantity),
                 'unit': unit,
-                'price': str(product.final_price),
+                'price': str(item.price_at_request),  # ✅ Зафиксированная цена
                 'total': str(item_total)
             })
         
@@ -690,7 +711,7 @@ class PartnerStatisticsService:
         
         for item in returned_to_admin_items:
             product = item.product
-            item_total = item.quantity * product.final_price
+            item_total = item.total_amount  # ✅ Используем price_at_request + корректную формулу для весовых
             returned_to_admin_total += item_total
             
             if product.is_weight_based:
@@ -704,7 +725,7 @@ class PartnerStatisticsService:
                 'name': product.name,
                 'quantity': float(item.quantity),
                 'unit': unit,
-                'price': str(product.final_price),
+                'price': str(item.price_at_request),  # ✅ Зафиксированная цена
                 'total': str(item_total)
             })
         

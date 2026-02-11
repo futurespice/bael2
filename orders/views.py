@@ -1246,7 +1246,7 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
 
     permission_classes = [IsAuthenticated, IsPartner | IsAdmin]
     filterset_class = ReturnedItemFilter
-    ordering_fields = ['returned_at', 'price']
+    ordering_fields = ['returned_at', 'price_at_return']
     ordering = ['-returned_at']  # По умолчанию новые первые
 
     def get_queryset(self):
@@ -1387,11 +1387,8 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
         by_store = {}
 
         for item in queryset:
-            # Рассчитываем total
-            if item.product.is_weight_based and item.weight:
-                item_total = (item.price / 10) * (item.weight / Decimal('0.1'))
-            else:
-                item_total = item.price * item.quantity
+            # Используем уже рассчитанный total_amount из модели
+            item_total = item.total_amount
 
             total_amount += item_total
 

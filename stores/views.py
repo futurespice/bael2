@@ -952,7 +952,6 @@ class StoreViewSet(viewsets.ModelViewSet):
                     quantity=item.quantity,
                     weight=item.weight if hasattr(item, 'weight') and item.weight else None,
                     price_at_return=item.price,
-                    total_amount=item.total,
                     reason='Удалено из корзины партнёром',
                     returned_by=user,
                 )
@@ -1026,7 +1025,6 @@ class StoreViewSet(viewsets.ModelViewSet):
                         quantity=removed_qty,
                         weight=item.weight if hasattr(item, 'weight') and item.weight else None,
                         price_at_return=item.price,
-                        total_amount=removed_qty * item.price,
                         reason='Частично удалено из корзины партнёром',
                         returned_by=user,
                     )
@@ -1052,13 +1050,17 @@ class StoreViewSet(viewsets.ModelViewSet):
                     item.save(update_fields=['quantity', 'total'])
 
                     # ✅ Создаём запись о возврате для удалённой части
+                    # Для весовых товаров: пропорционально распределяем вес
+                    partial_weight = None
+                    if product.is_weight_based and item.weight:
+                        partial_weight = (removed_qty / old_qty) * item.weight
+
                     ReturnedItem.objects.create(
                         order=item.order,
                         product=product,
                         quantity=removed_qty,
-                        weight=None,  # Частичное удаление, без веса
+                        weight=partial_weight,
                         price_at_return=item.price,
-                        total_amount=removed_qty * item.price,
                         reason='Частично удалено из корзины партнёром',
                         returned_by=user,
                     )
@@ -1582,6 +1584,7 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         product_id = request.data.get('product_id')
         quantity = request.data.get('quantity')
+        weight = request.data.get('weight')
         reason = request.data.get('reason', '').strip()
 
         if not product_id:
@@ -1609,6 +1612,21 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Валидация weight (если передан)
+        if weight is not None:
+            try:
+                weight = Decimal(str(weight))
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'Некорректное значение weight'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if weight < Decimal('0.1'):
+                return Response(
+                    {'error': 'Минимальный вес: 0.1 кг'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         # Проверка наличия товара в инвентаре
         try:
             inventory_item = StoreInventory.objects.select_related('product').get(
@@ -1623,6 +1641,16 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         product = inventory_item.product
 
+        # Валидация weight для весовых товаров
+        if product.is_weight_based and not weight:
+            return Response(
+                {'error': 'Для весовых товаров обязательно указать weight (вес в кг)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not product.is_weight_based and weight:
+            weight = None  # Штучные товары не имеют веса
+
         if quantity > inventory_item.quantity:
             return Response(
                 {'error': f'Недостаточно товара. Доступно: {inventory_item.quantity}'},
@@ -1630,9 +1658,8 @@ class StoreViewSet(viewsets.ModelViewSet):
             )
 
         price = product.final_price
-        defect_amount = quantity * price
 
-        # Находим последний ACCEPTED заказ
+        # Находим последний ACCEPTED заказ для привязки брака (технически)
         last_order = StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.ACCEPTED
@@ -1644,18 +1671,21 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Создаём запись о браке
+        # Создаём запись о браке (сумма рассчитается в save автоматически)
         defect = DefectiveProduct.objects.create(
             order=last_order,
             product=product,
             quantity=quantity,
+            weight=weight,
             price=price,
-            total_amount=defect_amount,
             reason=reason,
             status=DefectiveProduct.DefectStatus.APPROVED,
-            reported_by=user,
+            reported_by=user,  # Может быть None если reported_by не используется в этой версии
             reviewed_by=user,
         )
+
+        # Берем рассчитанную сумму из модели
+        defect_amount = defect.total_amount
 
         # Уменьшаем инвентарь
         inventory_item.quantity -= quantity

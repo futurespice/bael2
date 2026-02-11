@@ -153,7 +153,7 @@ class PartnerRequest(models.Model):
         """Общая сумма запроса."""
         if hasattr(self, 'items') and self.items.exists():
             return sum(
-                item.quantity * item.price_at_request
+                item.total_amount  # ✅ Используем item.total_amount для единой логики
                 for item in self.items.all()
             )
         elif self.product and self.quantity:
@@ -948,8 +948,20 @@ class DefectiveProduct(models.Model):
         return f"Брак: {self.product.name} x {self.quantity} ({self.total_amount} сом)"
 
     def save(self, *args, **kwargs) -> None:
-        """Автоматический расчёт суммы."""
-        self.total_amount = (self.price or Decimal('0')) * (self.quantity or Decimal('0'))
+        """
+        Автоматический расчёт суммы.
+
+        Для весовых: (price / 10) × (weight / 0.1)
+        Для штучных: price × quantity
+        """
+        if self.product and self.product.is_weight_based and self.weight:
+            # Весовой товар: цена за 100г × количество 100г
+            price_per_100g = (self.price or Decimal('0')) / Decimal('10')
+            units_100g = self.weight / Decimal('0.1')
+            self.total_amount = price_per_100g * units_100g
+        else:
+            # Штучный товар
+            self.total_amount = (self.price or Decimal('0')) * (self.quantity or Decimal('0'))
         super().save(*args, **kwargs)
 
 
