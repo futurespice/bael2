@@ -57,9 +57,12 @@ class ReturnedItemFilter(django_filters.FilterSet):
 
     order = django_filters.NumberFilter(field_name='order__id')
     store = django_filters.NumberFilter(field_name='order__store__id')
+    store_id = django_filters.NumberFilter(field_name='order__store__id')  # Alias for frontend
     product = django_filters.NumberFilter(field_name='product__id')
     date_from = django_filters.DateFilter(field_name='returned_at', lookup_expr='gte')
+    start_date = django_filters.DateFilter(field_name='returned_at', lookup_expr='gte')  # Alias
     date_to = django_filters.DateFilter(field_name='returned_at', lookup_expr='lte')
+    end_date = django_filters.DateFilter(field_name='returned_at', lookup_expr='lte')  # Alias
 
     class Meta:
         model = ReturnedItem

@@ -1268,9 +1268,13 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
             'returned_by',
         )
 
-        # Партнёр и Магазин видят только возвраты, которые они сделали
-        if user.role in ['partner', 'store']:
+        # Партнёр видит только возвраты, которые он сделал
+        if user.role == 'partner':
             queryset = queryset.filter(returned_by=user)
+        
+        # Магазин видит все возвраты своих магазинов
+        elif user.role == 'store':
+            queryset = queryset.filter(order__store__owner=user)
 
         return queryset
 
