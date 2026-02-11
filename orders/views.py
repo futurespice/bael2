@@ -1222,43 +1222,40 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
     """
     ViewSet для просмотра возвращённых товаров.
 
-    Партнёр видит только возвращённые товары из своих заказов.
-    Админ видит все возвращённые товары.
+    ReturnedItem создаётся автоматически при basket/remove (партнёр убирает товар из корзины).
+
+    Роли:
+    - Магазин: видит возвраты текущего выбранного магазина
+    - Партнёр: видит возвраты, которые он сделал
+    - Админ: видит все возвраты (со стороны партнёров)
 
     **Endpoints:**
-    - GET /api/partners/returned-items/ - список возвращённых товаров
-    - GET /api/partners/returned-items/{id}/ - детали возвращённого товара
+    - GET /api/orders/returned-items/ - список возвращённых товаров
+    - GET /api/orders/returned-items/{id}/ - детали возвращённого товара
 
     **Фильтры:**
     - order: ID заказа
     - store: ID магазина
     - product: ID товара
-    - date_from: дата с (формат: YYYY-MM-DD)
-    - date_to: дата по (формат: YYYY-MM-DD)
-
-    **Примеры:**
-    ```
-    GET /api/partners/returned-items/?order=123
-    GET /api/partners/returned-items/?store=1&date_from=2026-01-01
-    GET /api/partners/returned-items/?product=5
-    ```
+    - returned_by: ID партнёра (кто вернул)
+    - date_from / date_to: период
     """
 
-    permission_classes = [IsAuthenticated, IsPartner | IsAdmin | IsStore]
+    permission_classes = [IsAuthenticated]
     filterset_class = ReturnedItemFilter
     ordering_fields = ['returned_at', 'price_at_return']
-    ordering = ['-returned_at']  # По умолчанию новые первые
+    ordering = ['-returned_at']
 
     def get_queryset(self):
         """
         Фильтрация по роли:
-        - Партнёр: только возвраты из своих заказов
+        - Магазин: возвраты текущего выбранного магазина
+        - Партнёр: только возвраты, которые он сделал
         - Админ: все возвраты
         """
-        # ✅ Защита от drf-spectacular schema generation
         if getattr(self, 'swagger_fake_view', False):
             return ReturnedItem.objects.none()
-        
+
         user = self.request.user
 
         queryset = ReturnedItem.objects.select_related(
@@ -1268,13 +1265,17 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
             'returned_by',
         )
 
-        # Партнёр видит только возвраты, которые он сделал
-        if user.role == 'partner':
+        if user.role == 'store':
+            store = StoreSelectionService.get_current_store(user)
+            if store:
+                queryset = queryset.filter(order__store=store)
+            else:
+                return ReturnedItem.objects.none()
+
+        elif user.role == 'partner':
             queryset = queryset.filter(returned_by=user)
-        
-        # Магазин видит все возвраты своих магазинов
-        elif user.role == 'store':
-            queryset = queryset.filter(order__store__owner=user)
+
+        # Админ видит всё — без дополнительной фильтрации
 
         return queryset
 
@@ -1302,6 +1303,11 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
                 name='product',
                 type=int,
                 description='Фильтр по ID товара'
+            ),
+            OpenApiParameter(
+                name='returned_by',
+                type=int,
+                description='Фильтр по ID партнёра, вернувшего товар'
             ),
             OpenApiParameter(
                 name='date_from',

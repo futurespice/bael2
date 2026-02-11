@@ -1337,6 +1337,7 @@ class ReturnedItemListSerializer(serializers.ModelSerializer):
     quantity_display = serializers.SerializerMethodField(
         help_text='Количество с единицей измерения'
     )
+    returned_by = serializers.SerializerMethodField()
 
     class Meta:
         model = ReturnedItem
@@ -1353,8 +1354,19 @@ class ReturnedItemListSerializer(serializers.ModelSerializer):
             'total_amount',
             'reason',
             'returned_at',
+            'returned_by',
         ]
         read_only_fields = fields
+
+    def get_returned_by(self, obj) -> dict:
+        """Кто вернул товар."""
+        if obj.returned_by:
+            return {
+                'id': obj.returned_by.id,
+                'name': f"{obj.returned_by.name} {obj.returned_by.second_name}",
+                'role': obj.returned_by.role,
+            }
+        return None
 
     def get_quantity_display(self, obj) -> str:
         """
@@ -1388,6 +1400,11 @@ class ReturnedItemCreateSerializer(serializers.Serializer):
     Валидирует данные в зависимости от типа товара.
     """
 
+    order = serializers.IntegerField(
+        min_value=1,
+        help_text="ID заказа"
+    )
+
     product = serializers.IntegerField(
         min_value=1,
         help_text="ID товара"
@@ -1417,8 +1434,17 @@ class ReturnedItemCreateSerializer(serializers.Serializer):
     )
 
     def validate(self, attrs):
-        """Валидация в зависимости от типа товара."""
+        """Валидация заказа и товара."""
         from products.models import Product
+        from .models import StoreOrder
+
+        try:
+            order = StoreOrder.objects.get(pk=attrs['order'])
+        except StoreOrder.DoesNotExist:
+            raise serializers.ValidationError({
+                'order': f"Заказ с ID {attrs['order']} не найден"
+            })
+        attrs['_order'] = order
 
         try:
             product = Product.objects.get(pk=attrs['product'])
@@ -1426,6 +1452,7 @@ class ReturnedItemCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 'product': f"Товар с ID {attrs['product']} не найден"
             })
+        attrs['_product'] = product
 
         if product.is_weight_based:
             # Весовой товар - обязателен weight
