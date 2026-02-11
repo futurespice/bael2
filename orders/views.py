@@ -1244,7 +1244,7 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
     ```
     """
 
-    permission_classes = [IsAuthenticated, IsPartner | IsAdmin]
+    permission_classes = [IsAuthenticated, IsPartner | IsAdmin | IsStore]
     filterset_class = ReturnedItemFilter
     ordering_fields = ['returned_at', 'price_at_return']
     ordering = ['-returned_at']  # По умолчанию новые первые
@@ -1268,8 +1268,8 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
             'returned_by',
         )
 
-        # Партнёр видит только возвраты, которые он сделал
-        if user.role == 'partner':
+        # Партнёр и Магазин видят только возвраты, которые они сделали
+        if user.role in ['partner', 'store']:
             queryset = queryset.filter(returned_by=user)
 
         return queryset
