@@ -14,6 +14,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
@@ -185,6 +186,7 @@ class ProductViewSet(viewsets.ModelViewSet):
 
     permission_classes = [IsAuthenticated]
     queryset = Product.objects.all().prefetch_related('images', 'recipe_items__expense')
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
     pagination_class = StandardPagination
 
     def get_serializer_class(self):

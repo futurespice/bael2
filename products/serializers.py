@@ -14,6 +14,33 @@ from decimal import Decimal
 from datetime import date
 from drf_spectacular.utils import extend_schema_field
 from typing import List, Dict, Any
+import re
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def parse_indexed_fields(data, field_name):
+    """
+    Парсинг индексированных полей типа recipe_items[0][expense] из QueryDict.
+    Возвращает список словарей.
+    """
+    items = {}
+    pattern = re.compile(rf'^{field_name}\[(\d+)\]\[(\w+)\]$')
+    
+    for key, value in data.items():
+        match = pattern.match(key)
+        if match:
+            index = int(match.group(1))
+            field = match.group(2)
+            if index not in items:
+                items[index] = {}
+            items[index][field] = value
+            
+    # Преобразуем в список, сортируя по индексу
+    return [items[i] for i in sorted(items.keys())]
+
 
 from .models import (
     Expense,
@@ -248,6 +275,33 @@ class ProductRecipeCreateSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class ProductRecipeNestedSerializer(serializers.ModelSerializer):
+    """Вложенный сериализатор для создания/обновления товара (без field 'product')."""
+
+    class Meta:
+        model = ProductRecipe
+        fields = ['expense', 'quantity_per_unit', 'proportion']
+
+    def validate(self, attrs):
+        """Валидация (дублирует логику ProductRecipeCreateSerializer)."""
+        expense = attrs.get('expense')
+
+        # Сюзерен должен иметь quantity_per_unit
+        if expense.expense_status == ExpenseStatus.SUZERAIN:
+            if not attrs.get('quantity_per_unit'):
+                raise serializers.ValidationError({
+                    'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
+                })
+        else:
+            # Остальные должны иметь proportion (кроме универсальных)
+            if expense.apply_type != 'universal' and not attrs.get('proportion'):
+                raise serializers.ValidationError({
+                    'proportion': 'Расход должен иметь пропорцию'
+                })
+
+        return attrs
+
+
 # =============================================================================
 # PRODUCT SERIALIZERS
 # =============================================================================
@@ -320,7 +374,8 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         required=False,
         write_only=True
     )
-    recipe_items = ProductRecipeSerializer(many=True, read_only=True)
+    recipe_items = ProductRecipeNestedSerializer(many=True, required=False, write_only=True)
+    recipe_items_read = ProductRecipeSerializer(source='recipe_items', many=True, read_only=True)
     unit_display = serializers.CharField(source='get_unit_display', read_only=True)
     profit = serializers.DecimalField(
         source='profit_per_unit',
@@ -352,6 +407,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'images',
             'images_read',
             'recipe_items',
+            'recipe_items_read',
             'created_at',
             'updated_at'
         ]
@@ -386,23 +442,62 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             validate_image_size(image)
         return value
 
+    def to_internal_value(self, data):
+        """Обработка indexed fields для recipe_items."""
+        # Преобразуем QueryDict в обычный dict для корректной работы с nested data
+        if hasattr(data, 'getlist'):
+            new_data = data.dict()  # Берет последние значения
+            
+            # Восстанавливаем списки для полей, где это нужно
+            if 'images' in data:
+                new_data['images'] = data.getlist('images')
+        else:
+            new_data = data.copy()
+        
+        # 1. Обработка "[]" (строка вместо пустого списка)
+        if new_data.get('recipe_items') == '[]':
+            new_data['recipe_items'] = []
+            
+        # 2. Обработка indexed fields: recipe_items[0][expense]
+        # Используем оригинальные данные для парсинга ключей
+        if 'recipe_items' not in new_data:
+            recipe_items = parse_indexed_fields(data, 'recipe_items')
+            if recipe_items:
+                new_data['recipe_items'] = recipe_items
+                
+        return super().to_internal_value(new_data)
+
     def update(self, instance, validated_data):
-        """Обновление товара с изображениями."""
+        """Обновление товара с изображениями и рецептами."""
         images_data = validated_data.pop('images', None)
+        recipe_items_data = validated_data.pop('recipe_items', None)
 
         # Обновляем поля товара
         instance = super().update(instance, validated_data)
 
-        # Если переданы изображения, заменяем старые
-        if images_data is not None:
-            # Удаляем старые изображения
-            instance.images.all().delete()
+        # 1. ИЗОБРАЖЕНИЯ (APPEND)
+        # Если переданы новые изображения, добавляем их к существующим
+        if images_data:
+            current_count = instance.images.count()
+            for i, image in enumerate(images_data):
+                if current_count + i < 3:  # Лимит 3 изображения
+                    ProductImage.objects.create(
+                        product=instance,
+                        image=image,
+                        order=current_count + i
+                    )
+
+        # 2. РЕЦЕПТЫ (REPLACE)
+        # Если переданы рецепты (даже пустой список), обновляем их
+        if recipe_items_data is not None:
+            # Удаляем старые
+            ProductRecipe.objects.filter(product=instance).delete()
+            
             # Создаём новые
-            for i, image in enumerate(images_data[:3]):
-                ProductImage.objects.create(
+            for item in recipe_items_data:
+                ProductRecipe.objects.create(
                     product=instance,
-                    image=image,
-                    order=i
+                    **item
                 )
 
         return instance
@@ -417,10 +512,12 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         required=False,
         write_only=True
     )
+    recipe_items = ProductRecipeNestedSerializer(many=True, required=False)
 
     class Meta:
         model = Product
         fields = [
+            'id',
             'name',
             'description',
             'unit',
@@ -430,7 +527,8 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             'manual_price',
             'stock_quantity',
             'popularity_weight',
-            'images'
+            'images',
+            'recipe_items'
         ]
 
     def validate_name(self, value):
@@ -446,6 +544,28 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         for image in value:
             validate_image_size(image)
         return value
+        
+    def to_internal_value(self, data):
+        """Обработка indexed fields для recipe_items."""
+        # Преобразуем QueryDict в обычный dict
+        if hasattr(data, 'getlist'):
+            new_data = data.dict()
+            if 'images' in data:
+                new_data['images'] = data.getlist('images')
+        else:
+            new_data = data.copy()
+        
+        # 1. Обработка "[]"
+        if new_data.get('recipe_items') == '[]':
+            new_data['recipe_items'] = []
+            
+        # 2. Обработка indexed fields
+        if 'recipe_items' not in new_data:
+            recipe_items = parse_indexed_fields(data, 'recipe_items')
+            if recipe_items:
+                new_data['recipe_items'] = recipe_items
+                
+        return super().to_internal_value(new_data)
 
     def validate(self, attrs):
         """Валидация."""
@@ -464,8 +584,9 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        """Создание товара с изображениями."""
+        """Создание товара с изображениями и рецептами."""
         images_data = validated_data.pop('images', [])
+        recipe_items_data = validated_data.pop('recipe_items', [])
 
         product = Product.objects.create(**validated_data)
 
@@ -475,6 +596,13 @@ class ProductCreateSerializer(serializers.ModelSerializer):
                 product=product,
                 image=image,
                 order=i
+            )
+            
+        # Создаём рецепты
+        for item in recipe_items_data:
+            ProductRecipe.objects.create(
+                product=product,
+                **item
             )
 
         return product
