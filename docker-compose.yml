@@ -55,8 +55,8 @@ services:
              python manage.py collectstatic --noinput &&
              gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --threads 2 --timeout 60"
     volumes:
-      - static_volume:/app/staticfiles
-      - media_volume:/app/media
+      - /home/myprojects/bael2/staticfiles:/app/staticfiles
+      - /home/myprojects/bael2/media:/app/media
       - logs_volume:/app/logs
     ports:
       - "8000:8000"

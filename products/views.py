@@ -15,7 +15,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-from django.db import transaction
+from django.db import models, transaction
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 
@@ -229,6 +229,17 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         return queryset
 
+    def destroy(self, request, *args, **kwargs):
+        """Удаление товара с обработкой PROTECT-зависимостей."""
+        instance = self.get_object()
+        try:
+            instance.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except models.ProtectedError:
+            return Response(
+                {'error': 'Невозможно удалить товар — он используется в заказах, возвратах или инвентаре.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin])
     def calculate_production(self, request, pk=None):
