@@ -1637,7 +1637,11 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         product = inventory_item.product
 
-        # Валидация weight для весовых товаров
+        # Для весовых товаров: если weight не передан, используем quantity как вес
+        if product.is_weight_based and not weight:
+            weight = quantity
+
+        # Валидация weight для весовых товаров (на всякий случай)
         if product.is_weight_based and not weight:
             return Response(
                 {'error': 'Для весовых товаров обязательно указать weight (вес в кг)'},
