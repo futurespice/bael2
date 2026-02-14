@@ -504,6 +504,20 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         else:
             new_data = data.copy()
 
+        # Убираем images если это не файлы (а URL строки из GET-ответа)
+        images = new_data.get('images')
+        if images:
+            if isinstance(images, list):
+                # Фильтруем: оставляем только реальные файлы
+                real_files = [img for img in images if hasattr(img, 'read')]
+                if real_files:
+                    new_data['images'] = real_files
+                else:
+                    new_data.pop('images', None)
+            elif isinstance(images, str):
+                # Одиночная строка URL — игнорируем
+                new_data.pop('images', None)
+
         # 1. Обработка "[]" (строка вместо пустого списка)
         if new_data.get('recipe_items') == '[]':
             new_data['recipe_items'] = []
