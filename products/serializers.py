@@ -348,17 +348,16 @@ class ProductListSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         images = []
         for img in obj.images.all()[:3]:
+            image_url = None
+            preview_url = None
             if img.image:
-                # Формируем полный URL с доменом
-                if request:
-                    image_url = request.build_absolute_uri(img.image.url)
-                else:
-                    image_url = img.image.url
-            else:
-                image_url = None
+                image_url = request.build_absolute_uri(img.image.url) if request else img.image.url
+            if img.preview:
+                preview_url = request.build_absolute_uri(img.preview.url) if request else img.preview.url
             images.append({
                 'id': img.id,
                 'image': image_url,
+                'preview': preview_url or image_url,
                 'order': img.order
             })
         return images
@@ -422,16 +421,16 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         images = []
         for img in obj.images.all():
+            image_url = None
+            preview_url = None
             if img.image:
-                if request:
-                    image_url = request.build_absolute_uri(img.image.url)
-                else:
-                    image_url = img.image.url
-            else:
-                image_url = None
+                image_url = request.build_absolute_uri(img.image.url) if request else img.image.url
+            if img.preview:
+                preview_url = request.build_absolute_uri(img.preview.url) if request else img.preview.url
             images.append({
                 'id': img.id,
                 'image': image_url,
+                'preview': preview_url or image_url,
                 'order': img.order
             })
         return images
@@ -618,16 +617,16 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         images = []
         for img in obj.images.all()[:3]:
+            image_url = None
+            preview_url = None
             if img.image:
-                image_url = (
-                    request.build_absolute_uri(img.image.url)
-                    if request else img.image.url
-                )
-            else:
-                image_url = None
+                image_url = request.build_absolute_uri(img.image.url) if request else img.image.url
+            if img.preview:
+                preview_url = request.build_absolute_uri(img.preview.url) if request else img.preview.url
             images.append({
                 'id': img.id,
                 'image': image_url,
+                'preview': preview_url or image_url,
                 'order': img.order
             })
         return images

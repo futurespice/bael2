@@ -674,6 +674,11 @@ class ProductionBatch(models.Model):
 class ProductImage(models.Model):
     """Изображения товара (до 3 штук)."""
 
+    MAX_DIMENSION = 1920  # Full HD
+    THUMBNAIL_DIMENSION = 300  # Превью
+    JPEG_QUALITY = 85
+    THUMBNAIL_QUALITY = 70
+
     product = models.ForeignKey(
         Product,
         on_delete=models.CASCADE,
@@ -681,6 +686,12 @@ class ProductImage(models.Model):
     )
 
     image = models.ImageField(upload_to='products/%Y/%m/')
+    preview = models.ImageField(
+        upload_to='products/previews/%Y/%m/',
+        blank=True,
+        null=True,
+        verbose_name='Превью'
+    )
     order = models.PositiveSmallIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -697,6 +708,69 @@ class ProductImage(models.Model):
             existing = ProductImage.objects.filter(product_id=self.product_id).count()
             if existing >= 3:
                 raise ValidationError('Максимум 3 изображения')
+
+    def save(self, *args, **kwargs):
+        if self.image and not self.preview:
+            self._process_image()
+        super().save(*args, **kwargs)
+
+    def _process_image(self):
+        """Сжать основное изображение и создать preview."""
+        from PIL import Image
+        from io import BytesIO
+        from django.core.files.uploadedfile import InMemoryUploadedFile
+        import os
+
+        try:
+            img = Image.open(self.image)
+        except Exception:
+            return
+
+        # Конвертируем в RGB
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Создаём preview (маленькое превью ~300px)
+        thumb = img.copy()
+        thumb.preview(
+            (self.THUMBNAIL_DIMENSION, self.THUMBNAIL_DIMENSION),
+            Image.LANCZOS
+        )
+        thumb_buffer = BytesIO()
+        thumb.save(thumb_buffer, format='JPEG', quality=self.THUMBNAIL_QUALITY, optimize=True)
+        thumb_buffer.seek(0)
+
+        thumb_name = 'thumb_' + os.path.splitext(
+            os.path.basename(self.image.name)
+        )[0] + '.jpg'
+
+        self.preview = InMemoryUploadedFile(
+            file=thumb_buffer,
+            field_name='preview',
+            name=thumb_name,
+            content_type='image/jpeg',
+            size=thumb_buffer.getbuffer().nbytes,
+            charset=None,
+        )
+
+        # Сжимаем основное изображение до Full HD
+        if img.width > self.MAX_DIMENSION or img.height > self.MAX_DIMENSION:
+            img.preview((self.MAX_DIMENSION, self.MAX_DIMENSION), Image.LANCZOS)
+
+        img_buffer = BytesIO()
+        img.save(img_buffer, format='JPEG', quality=self.JPEG_QUALITY, optimize=True)
+        img_buffer.seek(0)
+
+        img_name = os.path.splitext(self.image.name)[0] + '.jpg'
+
+        self.image = InMemoryUploadedFile(
+            file=img_buffer,
+            field_name='image',
+            name=img_name,
+            content_type='image/jpeg',
+            size=img_buffer.getbuffer().nbytes,
+            charset=None,
+        )
 
 
 # =============================================================================
