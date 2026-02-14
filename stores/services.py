@@ -697,23 +697,23 @@ class StoreInventoryService:
 
 class BonusCalculationService:
     """
-    Сервис для расчёта бонусов в инвентаре магазина (ТЗ v2.0).
+    Сервис для расчёта бонусов за один заказ.
 
     ЛОГИКА БОНУСОВ:
-    - Каждый 21-й товар бесплатно (20 платных + 1 бонусный)
+    - Бонус рассчитывается ЗА ОДИН ЗАКАЗ (не кумулятивно)
+    - Формула: bonus = (quantity * 2) // 25
     - Бонусы применяются ТОЛЬКО к штучным товарам с флагом is_bonus=True
     - Весовые товары НЕ могут быть бонусными
-    - Бонусы считаются по НАКОПЛЕННОМУ количеству в инвентаре
 
-    ПРИМЕР:
-    - Товар "Мороженое" (is_bonus=True)
-    - Заказ #1: 15 шт → Инвентарь: 15
-    - Заказ #2: 10 шт → Инвентарь: 25
-    - Бонусы = 25 // 21 = 1 бонусный
-    - Платных = 25 - 1 = 24 шт
+    ПРИМЕРЫ (заказанное количество → бонус):
+    - 20 шт → 1 бонус
+    - 50 шт → 4 бонуса
+    - 70 шт → 5 бонусов
+    - 100 шт → 8 бонусов
+    - 120 шт → 9 бонусов
+    - 150 шт → 12 бонусов
+    - 200 шт → 16 бонусов
     """
-
-    BONUS_THRESHOLD = 21  # Каждый 21-й товар бесплатно
 
     @classmethod
     def calculate_bonuses_for_product(
@@ -721,23 +721,23 @@ class BonusCalculationService:
             total_quantity: int
     ) -> Dict[str, int]:
         """
-        Рассчитать бонусы для товара по количеству.
+        Рассчитать бонусы для товара по количеству в одном заказе.
 
         Args:
-            total_quantity: Общее количество в инвентаре
+            total_quantity: Количество товара в заказе
 
         Returns:
             {
-                'total': 25,
+                'total': 21,
                 'bonus_count': 1,
-                'paid_count': 24
+                'paid_count': 20
             }
         """
-        bonus_count = total_quantity // cls.BONUS_THRESHOLD
-        paid_count = total_quantity - bonus_count
+        bonus_count = (total_quantity * 2) // 25
+        paid_count = total_quantity
 
         return {
-            'total': total_quantity,
+            'total': total_quantity + bonus_count,
             'bonus_count': bonus_count,
             'paid_count': paid_count
         }

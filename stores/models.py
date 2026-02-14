@@ -739,17 +739,12 @@ class StoreInventory(models.Model):
 
     @transaction.atomic
     def add_quantity(self, amount: Decimal) -> None:
-        """Добавить количество товара в инвентарь и пересчитать бонусы."""
+        """Добавить количество товара в инвентарь."""
         if amount <= Decimal('0'):
             raise ValidationError('Количество для добавления должно быть больше 0')
 
         self.quantity += amount
-        
-        # v3.0: Пересчитываем бонусы для штучных бонусных товаров
-        if self.product and self.product.is_bonus and not self.product.is_weight_based:
-            self.update_bonus_count()
-        else:
-            self.save(update_fields=['quantity', 'last_updated'])
+        self.save(update_fields=['quantity', 'last_updated'])
 
     @transaction.atomic
     def subtract_quantity(self, amount: Decimal) -> None:
@@ -772,20 +767,21 @@ class StoreInventory(models.Model):
     @transaction.atomic
     def update_bonus_count(self) -> None:
         """
-        Кумулятивный расчёт бонусов (ТЗ v3.0).
-        
-        Правило: каждый 21-й товар бесплатно.
-        Формула: bonus_count = total_quantity // 21
-        
-        ВАЖНО: Применяется только для штучных бонусных товаров!
+        Расчёт бонусов за один заказ.
+
+        Формула: bonus_count = (quantity * 2) // 25
+
+        ВАЖНО: Бонусы теперь рассчитываются за один заказ,
+        а не кумулятивно. Этот метод используется для ручного
+        пересчёта если нужно.
         """
         if not self.product or self.product.is_weight_based or not self.product.is_bonus:
             return
-        
+
         total_qty = int(self.quantity)
-        new_bonus_count = total_qty // 21
+        new_bonus_count = (total_qty * 2) // 25
         new_paid_count = total_qty - new_bonus_count
-        
+
         self.bonus_count = Decimal(str(new_bonus_count))
         self.paid_count = Decimal(str(new_paid_count))
         self.save(update_fields=['quantity', 'bonus_count', 'paid_count', 'last_updated'])

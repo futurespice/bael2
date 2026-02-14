@@ -122,11 +122,18 @@ class OrderWorkflowService:
             if product.is_weight_based:
                 cls._validate_weight_quantity(product, quantity)
 
-            # Проверка наличия на складе
-            if product.stock_quantity < quantity:
+            # Рассчитываем бонус для штучных бонусных товаров
+            bonus_quantity = Decimal('0')
+            if product.is_bonus and not product.is_weight_based:
+                bonus_count = (int(quantity) * 2) // 25
+                bonus_quantity = Decimal(str(bonus_count))
+
+            # Проверка наличия на складе (основное + бонусное количество)
+            total_needed = quantity + bonus_quantity
+            if product.stock_quantity < total_needed:
                 raise ValidationError(
                     f'Недостаточно товара "{product.name}" на складе. '
-                    f'Доступно: {product.stock_quantity}, запрошено: {quantity}'
+                    f'Доступно: {product.stock_quantity}, запрошено: {total_needed}'
                 )
 
             # Цена
@@ -138,8 +145,18 @@ class OrderWorkflowService:
                 'quantity': quantity,
                 'price': price,
                 'total': item_total,
-                'is_bonus': item_data.is_bonus,
+                'is_bonus': False,
             })
+
+            # Добавляем бонусные позиции
+            if bonus_quantity > 0:
+                items_to_create.append({
+                    'product': product,
+                    'quantity': bonus_quantity,
+                    'price': price,
+                    'total': Decimal('0'),
+                    'is_bonus': True,
+                })
 
             total_amount += item_total
 
@@ -1498,46 +1515,67 @@ class ManualOrderService:
                 product = Product.objects.get(pk=item_data.product_id)
             except Product.DoesNotExist:
                 raise ValidationError(f'Товар с ID {item_data.product_id} не найден')
-            
-            # Проверяем наличие в инвентаре партнёра
+
+            quantity = item_data.quantity
+
+            # Рассчитываем бонус для штучных бонусных товаров
+            bonus_quantity = Decimal('0')
+            if product.is_bonus and not product.is_weight_based:
+                bonus_count = (int(quantity) * 2) // 25
+                bonus_quantity = Decimal(str(bonus_count))
+
+            total_needed = quantity + bonus_quantity
+
+            # Проверяем наличие в инвентаре партнёра (основное + бонус)
             has_inventory = PartnerInventoryService.check_availability(
                 partner=partner,
                 product=product,
-                quantity=item_data.quantity
+                quantity=total_needed
             )
-            
+
             if not has_inventory:
                 raise ValidationError(
                     f'Недостаточно товара {product.name} в инвентаре партнёра'
                 )
-            
-            # Убираем из инвентаря партнёра
+
+            # Убираем из инвентаря партнёра (основное + бонус)
             PartnerInventoryService.remove_from_inventory(
                 partner=partner,
                 product=product,
-                quantity=item_data.quantity
+                quantity=total_needed
             )
-            
-            # Добавляем в инвентарь магазина
+
+            # Добавляем в инвентарь магазина (основное + бонус)
             StoreInventoryService.add_to_inventory(
                 store=store,
                 product=product,
-                quantity=item_data.quantity
+                quantity=total_needed
             )
-            
-            # Создаём позицию заказа
+
+            # Создаём позицию заказа (платная часть)
             price = item_data.price or product.final_price
-            item_total = price * item_data.quantity
-            
+            item_total = price * quantity
+
             StoreOrderItem.objects.create(
                 order=order,
                 product=product,
-                quantity=item_data.quantity,
+                quantity=quantity,
                 price=price,
                 total=item_total,
-                is_bonus=item_data.is_bonus
+                is_bonus=False
             )
-            
+
+            # Создаём бонусную позицию
+            if bonus_quantity > 0:
+                StoreOrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    quantity=bonus_quantity,
+                    price=price,
+                    total=Decimal('0'),
+                    is_bonus=True
+                )
+
             total_amount += item_total
         
         # Обновляем заказ (округляем до 2 знаков после запятой)

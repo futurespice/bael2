@@ -276,43 +276,31 @@ class ReportService:
         debt = debt_data['total'] or Decimal('0')
 
         # =========================================================================
-        # 5. ✅ БОНУСЫ - ИСПРАВЛЕНО v2.1
-        # Считаем из ИНВЕНТАРЯ магазинов, а не из заказов!
+        # 5. БОНУСЫ - считаем из заказов (бонус за один заказ)
         # =========================================================================
 
         bonus_count = 0
+        bonus_items_qs = StoreOrderItem.objects.filter(
+            is_bonus=True,
+            order__status=StoreOrderStatus.ACCEPTED,
+        )
 
-        # Определяем магазины для подсчёта
         if filters.store_id:
-            stores = Store.objects.filter(id=filters.store_id, is_active=True)
+            bonus_items_qs = bonus_items_qs.filter(order__store_id=filters.store_id)
         else:
-            stores = Store.objects.filter(is_active=True)
-
-            # Применяем дополнительные фильтры
+            bonus_items_qs = bonus_items_qs.filter(order__store__is_active=True)
             if filters.region_id:
-                stores = stores.filter(region_id=filters.region_id)
-
+                bonus_items_qs = bonus_items_qs.filter(order__store__region_id=filters.region_id)
             if filters.city_id:
-                stores = stores.filter(city_id=filters.city_id)
+                bonus_items_qs = bonus_items_qs.filter(order__store__city_id=filters.city_id)
 
-        # Считаем бонусы в инвентаре каждого магазина
-        BONUS_THRESHOLD = 21  # Каждый 21-й товар
+        if filters.date_from:
+            bonus_items_qs = bonus_items_qs.filter(order__created_at__date__gte=filters.date_from)
+        if filters.date_to:
+            bonus_items_qs = bonus_items_qs.filter(order__created_at__date__lte=filters.date_to)
 
-        for store in stores:
-            # Получаем инвентарь магазина
-            inventory = StoreInventory.objects.filter(
-                store=store
-            ).select_related('product')
-
-            for item in inventory:
-                product = item.product
-
-                # Бонусы только для штучных товаров с is_bonus=True
-                if product.is_bonus and not product.is_weight_based:
-                    quantity = int(item.quantity)
-                    # Каждый 21-й товар бесплатно
-                    item_bonus_count = quantity // BONUS_THRESHOLD
-                    bonus_count += item_bonus_count
+        bonus_data = bonus_items_qs.aggregate(total=Sum('quantity'))
+        bonus_count = int(bonus_data['total'] or 0)
 
         # =========================================================================
         # 6. ✅ БРАК - ИСПРАВЛЕНО v2.1
