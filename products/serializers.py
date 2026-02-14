@@ -848,7 +848,7 @@ class ProductionBatchCreateSerializer(serializers.Serializer):
         required=False,
         min_value=Decimal('0.01')
     )
-    date = serializers.DateField()
+    date = serializers.DateField(required=False, default=date.today)
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
