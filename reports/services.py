@@ -294,10 +294,10 @@ class ReportService:
             if filters.city_id:
                 bonus_items_qs = bonus_items_qs.filter(order__store__city_id=filters.city_id)
 
-        if filters.date_from:
-            bonus_items_qs = bonus_items_qs.filter(order__created_at__date__gte=filters.date_from)
-        if filters.date_to:
-            bonus_items_qs = bonus_items_qs.filter(order__created_at__date__lte=filters.date_to)
+        bonus_items_qs = bonus_items_qs.filter(
+            order__confirmed_at__date__gte=start_date,
+            order__confirmed_at__date__lte=end_date
+        )
 
         bonus_data = bonus_items_qs.aggregate(total=Sum('quantity'))
         bonus_count = int(bonus_data['total'] or 0)
