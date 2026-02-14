@@ -292,12 +292,8 @@ class StoreViewSet(viewsets.ModelViewSet):
             queryset = Store.objects.filter(owner=user)
 
         elif user.role == 'partner':
-            # Партнер видит магазины, с которыми работает (через заказы)
-            from orders.models import StoreOrder
-            store_ids = StoreOrder.objects.filter(
-                partner=user
-            ).values_list('store_id', flat=True).distinct()
-            queryset = Store.objects.filter(id__in=store_ids)
+            # Партнер видит все активные магазины
+            queryset = Store.objects.filter(is_active=True)
 
         else:
             queryset = Store.objects.none()
