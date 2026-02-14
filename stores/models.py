@@ -803,7 +803,7 @@ class PartnerInventory(models.Model):
     
     product = models.ForeignKey(
         'products.Product',
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name='partner_inventory'
     )
     

@@ -244,13 +244,26 @@ class ReportService:
             orders_qs = orders_qs.filter(store__city_id=filters.city_id)
 
         # =========================================================================
-        # 3. ДОХОД (сумма заказов + погашенные долги)
+        # 3. ДОХОД (сумма заказов)
         # =========================================================================
 
-        orders_data = orders_qs.aggregate(total=Sum('total_amount'))
+        orders_data = orders_qs.aggregate(
+            total=Sum('total_amount'),
+            total_prepayment=Sum('prepayment_amount'),
+            total_debt=Sum('debt_amount'),
+        )
         orders_income = orders_data['total'] or Decimal('0')
+        prepayment_total = orders_data['total_prepayment'] or Decimal('0')
+        original_debt = orders_data['total_debt'] or Decimal('0')
 
-        # Погашенные долги
+        # Доход = сумма заказов (стоимость проданных товаров)
+        income = orders_income
+
+        # =========================================================================
+        # 4. ПОГАШЕННЫЕ ДОЛГИ (предоплата + погашения через pay-debt)
+        # =========================================================================
+
+        # Погашения через DebtPayment (pay-debt)
         paid_debt_qs = DebtPayment.objects.filter(
             created_at__date__gte=start_date,
             created_at__date__lte=end_date
@@ -263,20 +276,22 @@ class ReportService:
             paid_debt_qs = paid_debt_qs.filter(received_by_id=filters.partner_id)
 
         paid_debt_data = paid_debt_qs.aggregate(total=Sum('amount'))
-        paid_debt = paid_debt_data['total'] or Decimal('0')
+        debt_payments_total = paid_debt_data['total'] or Decimal('0')
 
-        # Общий доход
-        income = orders_income + paid_debt
-
-        # =========================================================================
-        # 4. ДОЛГИ (непогашенные)
-        # =========================================================================
-
-        debt_data = orders_qs.aggregate(total=Sum('debt_amount'))
-        debt = debt_data['total'] or Decimal('0')
+        # Погашено = предоплата + погашения долга
+        paid_debt = prepayment_total + debt_payments_total
 
         # =========================================================================
-        # 5. БОНУСЫ - считаем из заказов (бонус за один заказ)
+        # 5. ДОЛГИ (оставшиеся непогашенные)
+        # =========================================================================
+
+        # Оставшийся долг = исходный долг - погашения через pay-debt
+        debt = original_debt - debt_payments_total
+        if debt < Decimal('0'):
+            debt = Decimal('0')
+
+        # =========================================================================
+        # 6. БОНУСЫ - считаем из заказов (бонус за один заказ)
         # =========================================================================
 
         bonus_count = 0
@@ -303,7 +318,7 @@ class ReportService:
         bonus_count = int(bonus_data['total'] or 0)
 
         # =========================================================================
-        # 6. ✅ БРАК - ИСПРАВЛЕНО v2.1
+        # 7. ✅ БРАК - ИСПРАВЛЕНО v2.1
         # Фильтруем по дате СОЗДАНИЯ брака, а не по заказам!
         # =========================================================================
 
@@ -330,10 +345,10 @@ class ReportService:
         defect_amount = defect_data['total'] or Decimal('0')
 
         # =========================================================================
-        # 7. РАСХОДЫ (разделённые)
+        # 8. РАСХОДЫ (разделённые)
         # =========================================================================
 
-        # 7a. РАСХОДЫ ПАРТНЁРОВ (ручной ввод)
+        # 8a. РАСХОДЫ ПАРТНЁРОВ (ручной ввод)
         partner_expenses_qs = PartnerExpense.objects.filter(
             date__gte=start_date,
             date__lte=end_date
@@ -345,7 +360,7 @@ class ReportService:
         partner_expenses_data = partner_expenses_qs.aggregate(total=Sum('amount'))
         partner_expenses = partner_expenses_data['total'] or Decimal('0')
 
-        # 7b. РАСХОДЫ ПРОИЗВОДСТВА (себестоимость)
+        # 8b. РАСХОДЫ ПРОИЗВОДСТВА (себестоимость)
         try:
             from products.models import ProductionBatch, Expense, ExpenseType
 
@@ -377,11 +392,11 @@ class ReportService:
             logger.warning(f"Не удалось рассчитать production_expenses: {e}")
             production_expenses = Decimal('0')
 
-        # 7c. ОБЩАЯ СУММА РАСХОДОВ
+        # 8c. ОБЩАЯ СУММА РАСХОДОВ
         total_expenses = partner_expenses + production_expenses
 
         # =========================================================================
-        # 8. КОЛИЧЕСТВЕННЫЕ ПОКАЗАТЕЛИ
+        # 9. КОЛИЧЕСТВЕННЫЕ ПОКАЗАТЕЛИ
         # =========================================================================
 
         orders_count = orders_qs.count()
@@ -392,7 +407,7 @@ class ReportService:
         products_count = int(products_count_data['total'] or 0)
 
         # =========================================================================
-        # 9. ВЫЧИСЛЯЕМЫЕ ПОКАЗАТЕЛИ
+        # 10. ВЫЧИСЛЯЕМЫЕ ПОКАЗАТЕЛИ
         # =========================================================================
 
         # Общий баланс = доход - брак - расходы - долг
@@ -402,7 +417,7 @@ class ReportService:
         profit = income - defect_amount - total_expenses
 
         # =========================================================================
-        # 10. ВОЗВРАЩАЕМ РЕЗУЛЬТАТ
+        # 11. ВОЗВРАЩАЕМ РЕЗУЛЬТАТ
         # =========================================================================
 
         return StatisticsData(
@@ -517,6 +532,9 @@ class ReportService:
                     'status_history': [],
                     'total_amount': 0.0,
                     'total_debt': 0.0,
+                    'total_prepayment': 0.0,
+                    'total_paid_debt': 0.0,
+                    'remaining_debt': 0.0,
                 }
                 history.append(day_data)
 
@@ -531,6 +549,7 @@ class ReportService:
 
             day_data['total_amount'] += float(order.total_amount)
             day_data['total_debt'] += float(order.debt_amount)
+            day_data['total_prepayment'] += float(order.prepayment_amount)
 
             # Товары заказа
             items = order.items.all().select_related('product')
@@ -563,7 +582,8 @@ class ReportService:
                 })
 
             # Погашения долга по этому заказу
-            debt_payments_list = []
+            debt_payments_list = day_data.get('debt_payments', [])
+            order_paid_debt = Decimal('0')
             for payment in order.debt_payments.all().order_by('created_at'):
                 debt_payments_list.append({
                     'payment_id': payment.id,
@@ -573,8 +593,10 @@ class ReportService:
                     'received_by': payment.received_by.get_full_name() if payment.received_by else None,
                     'comment': payment.comment or '',
                 })
+                order_paid_debt += payment.amount
 
             day_data['debt_payments'] = debt_payments_list
+            day_data['total_paid_debt'] += float(order_paid_debt)
 
             # История статусов заказа
             status_history_list = []
@@ -593,6 +615,11 @@ class ReportService:
                 })
 
             day_data['status_history'] = status_history_list
+
+        # Рассчитываем оставшийся долг для каждого дня
+        for day_data in history:
+            remaining = day_data['total_debt'] - day_data['total_paid_debt']
+            day_data['remaining_debt'] = max(remaining, 0.0)
 
         return history
 
@@ -889,26 +916,48 @@ class PartnerStatisticsService:
         # =========================================================================
         # 7. ДОЛГИ
         # =========================================================================
-        unpaid_debt = StoreOrder.objects.filter(
+        # Исходный долг по всем заказам партнёра
+        original_debt = StoreOrder.objects.filter(
             partner_id=partner_id,
             status=StoreOrderStatus.ACCEPTED
         ).aggregate(
-            total=Sum(F('debt_amount') - F('paid_amount'))
+            total=Sum('debt_amount')
         )['total'] or Decimal('0')
-        
-        # Только положительный долг
-        if unpaid_debt < 0:
+
+        # Все погашения долга по заказам партнёра
+        all_debt_payments = DebtPayment.objects.filter(
+            order__partner_id=partner_id,
+        ).aggregate(
+            total=Sum('amount')
+        )['total'] or Decimal('0')
+
+        # Оставшийся долг = исходный - погашения
+        unpaid_debt = original_debt - all_debt_payments
+        if unpaid_debt < Decimal('0'):
             unpaid_debt = Decimal('0')
-        
+
         # =========================================================================
-        # 8. ПОГАШЕННЫЙ ДОЛГ
+        # 8. ПОГАШЕННЫЙ ДОЛГ (предоплата + погашения через pay-debt за период)
         # =========================================================================
-        paid_debt = DebtPayment.objects.filter(
+        # Погашения через pay-debt за период
+        debt_payments_in_period = DebtPayment.objects.filter(
             order__partner_id=partner_id,
             created_at__range=[date_from, date_to]
         ).aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')
+
+        # Предоплата за период
+        prepayment_in_period = StoreOrder.objects.filter(
+            partner_id=partner_id,
+            status=StoreOrderStatus.ACCEPTED,
+            confirmed_at__range=[date_from, date_to]
+        ).aggregate(
+            total=Sum('prepayment_amount')
+        )['total'] or Decimal('0')
+
+        # Всего погашено = предоплата + погашения долга
+        paid_debt = prepayment_in_period + debt_payments_in_period
         
         # =========================================================================
         # 9. ОБЩАЯ СУММА

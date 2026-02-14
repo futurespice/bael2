@@ -74,7 +74,7 @@ class PartnerRequest(models.Model):
     # Оставлено для обратной совместимости (для запросов с одним товаром)
     product = models.ForeignKey(
         'products.Product',
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name='partner_requests',
         null=True,
         blank=True,
@@ -188,7 +188,7 @@ class PartnerRequestItem(models.Model):
 
     product = models.ForeignKey(
         'products.Product',
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name='partner_request_items',
         verbose_name='Товар'
     )
@@ -627,7 +627,7 @@ class StoreOrderItem(models.Model):
 
     product = models.ForeignKey(
         'products.Product',
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name='store_order_items',
         verbose_name='Товар'
     )
@@ -711,7 +711,7 @@ class ReturnedItem(models.Model):
 
     product = models.ForeignKey(
         'products.Product',
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name='returned_items',
         verbose_name='Товар'
     )
@@ -856,7 +856,7 @@ class DefectiveProduct(models.Model):
 
     product = models.ForeignKey(
         'products.Product',
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name='defects',
         verbose_name='Товар'
     )
