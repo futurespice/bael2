@@ -732,7 +732,7 @@ class ProductImage(models.Model):
 
         # Создаём preview (маленькое превью ~300px)
         thumb = img.copy()
-        thumb.preview(
+        thumb.thumbnail(
             (self.THUMBNAIL_DIMENSION, self.THUMBNAIL_DIMENSION),
             Image.LANCZOS
         )
@@ -755,7 +755,7 @@ class ProductImage(models.Model):
 
         # Сжимаем основное изображение до Full HD
         if img.width > self.MAX_DIMENSION or img.height > self.MAX_DIMENSION:
-            img.preview((self.MAX_DIMENSION, self.MAX_DIMENSION), Image.LANCZOS)
+            img.thumbnail((self.MAX_DIMENSION, self.MAX_DIMENSION), Image.LANCZOS)
 
         img_buffer = BytesIO()
         img.save(img_buffer, format='JPEG', quality=self.JPEG_QUALITY, optimize=True)
