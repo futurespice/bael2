@@ -20,6 +20,7 @@ router.register(r'regions', views.RegionViewSet, basename='region')
 router.register(r'cities', views.CityViewSet, basename='city')
 router.register(r'stores', views.StoreViewSet, basename='store')
 router.register(r'partner-inventory', views.PartnerInventoryViewSet, basename='partner-inventory')
+router.register(r'store-inventory', views.StoreInventoryViewSet, basename='store-inventory')
 
 # URL patterns
 urlpatterns = [

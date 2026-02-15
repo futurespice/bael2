@@ -52,7 +52,7 @@ from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiPara
 from drf_spectacular.types import OpenApiTypes
 
 from users.throttles import StoreSelectionThrottle
-from .permissions import IsPartner, IsStoreOwner, CanAccessStore
+from .permissions import IsPartner, IsStore, IsStoreOwner, CanAccessStore
 
 from .models import (
     Region,
@@ -2280,3 +2280,201 @@ class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @action(detail=False, methods=['get'], url_path='items')
+    def items(self, request: Request) -> Response:
+        """
+        Агрегированный список товаров в инвентаре партнёра.
+
+        GET /api/stores/partner-inventory/items/
+
+        Возвращает все товары с изображениями, количеством и итогами.
+        """
+        partner = request.user
+
+        inventory_qs = PartnerInventory.objects.filter(
+            partner=partner,
+            quantity__gt=0
+        ).select_related('product').prefetch_related('product__images')
+
+        if not inventory_qs.exists():
+            return Response({
+                'partner_id': partner.id,
+                'is_empty': True,
+                'items_count': 0,
+                'items': [],
+                'totals': {
+                    'piece_count': 0,
+                    'weight_total': '0',
+                    'total_amount': '0',
+                }
+            })
+
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
+
+        for inv in inventory_qs:
+            product = inv.product
+
+            main_image = None
+            if hasattr(product, 'images'):
+                first_image = product.images.first()
+                if first_image and first_image.image:
+                    main_image = first_image.image.url
+
+            price = product.final_price
+            total = inv.quantity * price
+
+            if product.is_weight_based:
+                qty = inv.quantity
+                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+                weight_total += inv.quantity
+            else:
+                quantity_display = f"{int(inv.quantity)} шт"
+                piece_count += int(inv.quantity)
+
+            total_amount += total
+
+            items.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'product_image': main_image,
+                'is_weight_based': product.is_weight_based,
+                'unit': product.unit,
+                'is_bonus': inv.is_bonus,
+                'quantity': str(inv.quantity),
+                'quantity_display': quantity_display,
+                'price': str(price),
+                'total': str(total),
+            })
+
+        return Response({
+            'partner_id': partner.id,
+            'is_empty': False,
+            'items_count': len(items),
+            'items': items,
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+                'total_amount': str(total_amount),
+            }
+        })
+
+
+class StoreInventoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для инвентаря магазина.
+
+    Permissions:
+    - Только пользователи с ролью store (IsStore)
+    - Магазин видит инвентарь только своего выбранного магазина
+    """
+
+    permission_classes = [IsAuthenticated, IsStore]
+    serializer_class = StoreInventoryListSerializer
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return StoreInventory.objects.none()
+
+        store = StoreSelectionService.get_current_store(self.request.user)
+        if not store:
+            return StoreInventory.objects.none()
+
+        return StoreInventory.objects.filter(
+            store=store,
+            quantity__gt=0
+        ).select_related('product').order_by('product__name')
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return StoreInventoryListSerializer
+        return StoreInventorySerializer
+
+    @action(detail=False, methods=['get'], url_path='items')
+    def items(self, request: Request) -> Response:
+        """
+        Агрегированный список товаров в инвентаре магазина.
+
+        GET /api/stores/store-inventory/items/
+
+        Возвращает все товары с изображениями, количеством и итогами.
+        """
+        store = StoreSelectionService.get_current_store(request.user)
+        if not store:
+            return Response(
+                {'error': 'Сначала выберите магазин'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        inventory_qs = StoreInventory.objects.filter(
+            store=store,
+            quantity__gt=0
+        ).select_related('product').prefetch_related('product__images')
+
+        if not inventory_qs.exists():
+            return Response({
+                'store_id': store.id,
+                'store_name': store.name,
+                'is_empty': True,
+                'items_count': 0,
+                'items': [],
+                'totals': {
+                    'piece_count': 0,
+                    'weight_total': '0',
+                    'total_amount': '0',
+                }
+            })
+
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
+
+        for inv in inventory_qs:
+            product = inv.product
+
+            main_image = None
+            if hasattr(product, 'images'):
+                first_image = product.images.first()
+                if first_image and first_image.image:
+                    main_image = first_image.image.url
+
+            price = product.final_price
+            total = inv.quantity * price
+
+            if product.is_weight_based:
+                qty = inv.quantity
+                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+                weight_total += inv.quantity
+            else:
+                quantity_display = f"{int(inv.quantity)} шт"
+                piece_count += int(inv.quantity)
+
+            total_amount += total
+
+            items.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'product_image': main_image,
+                'is_weight_based': product.is_weight_based,
+                'unit': product.unit,
+                'quantity': str(inv.quantity),
+                'quantity_display': quantity_display,
+                'price': str(price),
+                'total': str(total),
+            })
+
+        return Response({
+            'store_id': store.id,
+            'store_name': store.name,
+            'is_empty': False,
+            'items_count': len(items),
+            'items': items,
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+                'total_amount': str(total_amount),
+            }
+        })
