@@ -712,8 +712,8 @@ class StoreOrderCreateSerializer(serializers.Serializer):
 
             # Валидация весовых товаров
             if product.is_weight_based:
-                # Минимум 1 кг (или 0.1 кг если остаток < 1 кг)
-                min_qty = Decimal('1') if product.stock_quantity >= 1 else Decimal('0.1')
+                # Минимум 0.1 кг, шаг 0.1 кг
+                min_qty = Decimal('0.1')
                 if quantity < min_qty:
                     raise serializers.ValidationError(
                         f'Позиция {i + 1}: минимальное количество для "{product.name}" - {min_qty} кг'

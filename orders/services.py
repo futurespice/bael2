@@ -195,8 +195,8 @@ class OrderWorkflowService:
     @classmethod
     def _validate_weight_quantity(cls, product: Product, quantity: Decimal) -> None:
         """Валидация количества для весовых товаров."""
-        # Минимум 1 кг (или 0.1 кг если остаток < 1 кг)
-        min_qty = Decimal('1') if product.stock_quantity >= 1 else Decimal('0.1')
+        # Минимум 0.1 кг, шаг 0.1 кг
+        min_qty = Decimal('0.1')
         if quantity < min_qty:
             raise ValidationError(
                 f'Минимальное количество для "{product.name}" - {min_qty} кг'
