@@ -1111,6 +1111,7 @@ class PartnerInventorySerializer(serializers.ModelSerializer):
             'quantity',
             'reserved_quantity',
             'available_quantity',
+            'is_bonus',
             'created_at',
             'updated_at'
         ]
@@ -1149,6 +1150,7 @@ class PartnerInventoryListSerializer(serializers.ModelSerializer):
             'product_name',
             'product_price',
             'is_weight_based',
+            'is_bonus',
             'quantity',
             'reserved_quantity',
             'available_quantity',
