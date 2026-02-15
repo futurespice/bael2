@@ -926,6 +926,7 @@ class PartnerInventoryService:
         partner: 'User',
         product: 'Product',
         quantity: Decimal,
+        is_bonus: bool = False,
         source_request: Optional['PartnerRequest'] = None
     ) -> 'PartnerInventory':
         """
@@ -935,6 +936,7 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Количество
+            is_bonus: Признак бонусного товара
             source_request: Запрос партнёра (если есть)
             
         Returns:
@@ -956,6 +958,7 @@ class PartnerInventoryService:
         inventory, created = PartnerInventory.objects.get_or_create(
             partner=partner,
             product=product,
+            is_bonus=is_bonus,
             defaults={'quantity': Decimal('0')}
         )
         
@@ -963,9 +966,10 @@ class PartnerInventoryService:
         inventory.quantity += quantity
         inventory.save(update_fields=['quantity', 'updated_at'])
         
+        bonus_mark = " [БОНУС]" if is_bonus else ""
         logger.info(
             f"Добавлено в инвентарь партнёра {partner.id}: "
-            f"{product.name} x{quantity} (итого: {inventory.quantity})"
+            f"{product.name}{bonus_mark} x{quantity} (итого: {inventory.quantity})"
         )
         
         return inventory
@@ -977,7 +981,8 @@ class PartnerInventoryService:
         *,
         partner: 'User',
         product: 'Product',
-        quantity: Decimal
+        quantity: Decimal,
+        is_bonus: bool = False
     ) -> 'PartnerInventory':
         """
         Удалить товары из инвентаря партнёра.
@@ -986,6 +991,7 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Количество
+            is_bonus: Признак бонусного товара
             
         Returns:
             PartnerInventory запись
@@ -995,18 +1001,20 @@ class PartnerInventoryService:
         """
         from .models import PartnerInventory
         
+        bonus_mark = " [БОНУС]" if is_bonus else ""
         try:
             inventory = PartnerInventory.objects.get(
                 partner=partner,
-                product=product
+                product=product,
+                is_bonus=is_bonus
             )
         except PartnerInventory.DoesNotExist:
-            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+            raise ValidationError(f'Товар {product.name}{bonus_mark} не найден в инвентаре')
         
         # Проверка доступного количества
         if inventory.available_quantity < quantity:
             raise ValidationError(
-                f'Недостаточно товара {product.name}. '
+                f'Недостаточно товара {product.name}{bonus_mark}. '
                 f'Доступно: {inventory.available_quantity}, запрошено: {quantity}'
             )
         
@@ -1014,14 +1022,14 @@ class PartnerInventoryService:
         inventory.quantity -= quantity
         
         # Удалить запись если количество = 0
-        if inventory.quantity == Decimal('0'):
+        if inventory.quantity <= Decimal('0') and inventory.reserved_quantity <= Decimal('0'):
             inventory.delete()
-            logger.info(f"Удалена запись инвентаря: {product.name} у партнёра {partner.id}")
+            logger.info(f"Удалена запись инвентаря: {product.name}{bonus_mark} у партнёра {partner.id}")
         else:
             inventory.save(update_fields=['quantity', 'updated_at'])
             logger.info(
                 f"Удалено из инвентаря партнёра {partner.id}: "
-                f"{product.name} x{quantity} (осталось: {inventory.quantity})"
+                f"{product.name}{bonus_mark} x{quantity} (осталось: {inventory.quantity})"
             )
         
         return inventory
@@ -1034,6 +1042,7 @@ class PartnerInventoryService:
         partner: 'User',
         product: 'Product',
         quantity: Decimal,
+        is_bonus: bool = False,
         check_availability: bool = True
     ) -> 'PartnerInventory':
         """
@@ -1043,6 +1052,7 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Количество
+            is_bonus: Признак бонусного товара
             check_availability: Проверять доступность
             
         Returns:
@@ -1053,19 +1063,22 @@ class PartnerInventoryService:
         """
         from .models import PartnerInventory
         
+        bonus_mark = " [БОНУС]" if is_bonus else ""
         try:
             inventory = PartnerInventory.objects.select_for_update().get(
                 partner=partner,
-                product=product
+                product=product,
+                is_bonus=is_bonus
             )
         except PartnerInventory.DoesNotExist:
             if check_availability:
-                raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+                raise ValidationError(f'Товар {product.name}{bonus_mark} не найден в инвентаре')
             else:
                 # Если не проверяем наличие, создаём пустую запись для резерва
                 inventory = PartnerInventory.objects.create(
                     partner=partner,
                     product=product,
+                    is_bonus=is_bonus,
                     quantity=Decimal('0'),
                     reserved_quantity=Decimal('0')
                 )
@@ -1073,7 +1086,7 @@ class PartnerInventoryService:
         # Проверка доступного количества
         if check_availability and inventory.available_quantity < quantity:
             raise ValidationError(
-                f'Недостаточно товара {product.name}. '
+                f'Недостаточно товара {product.name}{bonus_mark}. '
                 f'Доступно: {inventory.available_quantity}, запрошено: {quantity}'
             )
         
@@ -1083,7 +1096,7 @@ class PartnerInventoryService:
         
         logger.info(
             f"Зарезервировано у партнёра {partner.id}: "
-            f"{product.name} x{quantity} (всего зарезервировано: {inventory.reserved_quantity})"
+            f"{product.name}{bonus_mark} x{quantity} (всего зарезервировано: {inventory.reserved_quantity})"
         )
         
         return inventory
@@ -1095,7 +1108,8 @@ class PartnerInventoryService:
         *,
         partner: 'User',
         product: 'Product',
-        quantity: Decimal
+        quantity: Decimal,
+        is_bonus: bool = False
     ) -> 'PartnerInventory':
         """
         Освободить зарезервированные товары.
@@ -1104,6 +1118,7 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Количество
+            is_bonus: Признак бонусного товара
             
         Returns:
             PartnerInventory запись
@@ -1113,13 +1128,15 @@ class PartnerInventoryService:
         """
         from .models import PartnerInventory
         
+        bonus_mark = " [БОНУС]" if is_bonus else ""
         try:
             inventory = PartnerInventory.objects.select_for_update().get(
                 partner=partner,
-                product=product
+                product=product,
+                is_bonus=is_bonus
             )
         except PartnerInventory.DoesNotExist:
-            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+            raise ValidationError(f'Товар {product.name}{bonus_mark} не найден в инвентаре')
         
         # Проверка
         if inventory.reserved_quantity < quantity:
@@ -1134,7 +1151,7 @@ class PartnerInventoryService:
         
         logger.info(
             f"Освобождено у партнёра {partner.id}: "
-            f"{product.name} x{quantity} (осталось зарезервировано: {inventory.reserved_quantity})"
+            f"{product.name}{bonus_mark} x{quantity} (осталось зарезервировано: {inventory.reserved_quantity})"
         )
         
         return inventory
@@ -1146,7 +1163,8 @@ class PartnerInventoryService:
         *,
         partner: 'User',
         product: 'Product',
-        quantity: Decimal
+        quantity: Decimal,
+        is_bonus: bool = False
     ) -> 'PartnerInventory':
         """
         Завершить резервацию - списать зарезервированные товары.
@@ -1158,6 +1176,7 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Количество
+            is_bonus: Признак бонусного товара
             
         Returns:
             PartnerInventory запись или None если удалена
@@ -1167,13 +1186,15 @@ class PartnerInventoryService:
         """
         from .models import PartnerInventory
         
+        bonus_mark = " [БОНУС]" if is_bonus else ""
         try:
             inventory = PartnerInventory.objects.select_for_update().get(
                 partner=partner,
-                product=product
+                product=product,
+                is_bonus=is_bonus
             )
         except PartnerInventory.DoesNotExist:
-            raise ValidationError(f'Товар {product.name} не найден в инвентаре')
+            raise ValidationError(f'Товар {product.name}{bonus_mark} не найден в инвентаре')
         
         # Проверка резерва
         if inventory.reserved_quantity < quantity:
@@ -1191,7 +1212,7 @@ class PartnerInventoryService:
             inventory.delete()
             logger.info(
                 f"Завершена резервация, удалена запись инвентаря: "
-                f"{product.name} у партнёра {partner.id}"
+                f"{product.name}{bonus_mark} у партнёра {partner.id}"
             )
             return None
         else:
@@ -1221,7 +1242,7 @@ class PartnerInventoryService:
         
         return PartnerInventory.objects.filter(
             partner=partner
-        ).select_related('product').order_by('product__name')
+        ).select_related('product').order_by('product__name', 'is_bonus')
     
     @classmethod
     def check_availability(
@@ -1229,7 +1250,8 @@ class PartnerInventoryService:
         *,
         partner: 'User',
         product: 'Product',
-        quantity: Decimal
+        quantity: Decimal,
+        is_bonus: bool = False
     ) -> bool:
         """
         Проверить доступность товара в инвентаре.
@@ -1238,6 +1260,7 @@ class PartnerInventoryService:
             partner: Партнёр
             product: Товар
             quantity: Требуемое количество
+            is_bonus: Признак бонусного товара
             
         Returns:
             True если товара достаточно, False иначе
@@ -1247,7 +1270,8 @@ class PartnerInventoryService:
         try:
             inventory = PartnerInventory.objects.get(
                 partner=partner,
-                product=product
+                product=product,
+                is_bonus=is_bonus
             )
             return inventory.available_quantity >= quantity
         except PartnerInventory.DoesNotExist:

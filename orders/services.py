@@ -270,6 +270,7 @@ class OrderWorkflowService:
                 partner=partner,
                 product=item.product,
                 quantity=item.quantity,
+                is_bonus=item.is_bonus,
                 check_availability=False
             )
 
@@ -720,7 +721,8 @@ class BasketService:
                 PartnerInventoryService.release_reserved(
                     partner=partner_user,
                     product=item.product,
-                    quantity=item.quantity
+                    quantity=item.quantity,
+                    is_bonus=item.is_bonus
                 )
 
             deleted_items.delete()
@@ -898,7 +900,8 @@ class BasketService:
                 PartnerInventoryService.complete_reservation(
                     partner=partner_user,
                     product=item.product,
-                    quantity=item.quantity
+                    quantity=item.quantity,
+                    is_bonus=item.is_bonus
                 )
                 # Добавляем в инвентарь магазина
                 StoreInventoryService.add_to_inventory(
@@ -1048,6 +1051,7 @@ class PartnerRequestService:
             product_id = item_data.get('product')
             quantity = Decimal(str(item_data.get('quantity', 0)))
             weight = item_data.get('weight')
+            is_bonus = item_data.get('is_bonus', False)
             
             try:
                 product = Product.objects.get(pk=product_id)
@@ -1082,7 +1086,8 @@ class PartnerRequestService:
                 has_inventory = PartnerInventoryService.check_availability(
                     partner=partner,
                     product=product,
-                    quantity=effective_quantity
+                    quantity=effective_quantity,
+                    is_bonus=is_bonus
                 )
                 if not has_inventory:
                     request.delete()
@@ -1094,7 +1099,8 @@ class PartnerRequestService:
                 PartnerInventoryService.reserve_quantity(
                     partner=partner,
                     product=product,
-                    quantity=effective_quantity
+                    quantity=effective_quantity,
+                    is_bonus=is_bonus
                 )
             
             # Создаём позицию
@@ -1104,7 +1110,8 @@ class PartnerRequestService:
                 product=product,
                 quantity=effective_quantity,
                 weight=weight if product.is_weight_based else None,
-                price_at_request=product.final_price
+                price_at_request=product.final_price,
+                is_bonus=is_bonus
             )
         
         logger.info(
@@ -1199,6 +1206,7 @@ class PartnerRequestService:
                     partner=partner,
                     product=product,
                     quantity=quantity,
+                    is_bonus=item.is_bonus,
                     source_request=request
                 )
                 
@@ -1217,7 +1225,8 @@ class PartnerRequestService:
                 PartnerInventoryService.remove_from_inventory(
                     partner=partner,
                     product=product,
-                    quantity=quantity
+                    quantity=quantity,
+                    is_bonus=item.is_bonus
                 )
                 
                 # Увеличиваем количество в каталоге
@@ -1291,7 +1300,8 @@ class PartnerRequestService:
                     PartnerInventoryService.release_reserved(
                         partner=request.partner,
                         product=item.product,
-                        quantity=item.quantity
+                        quantity=item.quantity,
+                        is_bonus=item.is_bonus
                     )
             elif request.product and request.quantity:
                 # Обратная совместимость
@@ -1364,7 +1374,8 @@ class PartnerRequestService:
                     PartnerInventoryService.release_reserved(
                         partner=request.partner,
                         product=item.product,
-                        quantity=item.quantity
+                        quantity=item.quantity,
+                        is_bonus=item.is_bonus
                     )
             elif request.product and request.quantity:
                 # Обратная совместимость
@@ -1517,66 +1528,133 @@ class ManualOrderService:
                 raise ValidationError(f'Товар с ID {item_data.product_id} не найден')
 
             quantity = item_data.quantity
-
-            # Рассчитываем бонус для штучных бонусных товаров
-            bonus_quantity = Decimal('0')
-            if product.is_bonus and not product.is_weight_based:
-                bonus_count = (int(quantity) * 2) // 25
-                bonus_quantity = Decimal(str(bonus_count))
-
-            total_needed = quantity + bonus_quantity
-
-            # Проверяем наличие в инвентаре партнёра (основное + бонус)
-            has_inventory = PartnerInventoryService.check_availability(
-                partner=partner,
-                product=product,
-                quantity=total_needed
-            )
-
-            if not has_inventory:
-                raise ValidationError(
-                    f'Недостаточно товара {product.name} в инвентаре партнёра'
+            is_bonus_provided = item_data.is_bonus
+            
+            # 1. Если это явный бонусный товар (выбран партнёром как бонус)
+            if is_bonus_provided:
+                # Проверяем наличие в бонусном инвентаре
+                has_inventory = PartnerInventoryService.check_availability(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity,
+                    is_bonus=True
                 )
-
-            # Убираем из инвентаря партнёра (основное + бонус)
-            PartnerInventoryService.remove_from_inventory(
-                partner=partner,
-                product=product,
-                quantity=total_needed
-            )
-
-            # Добавляем в инвентарь магазина (основное + бонус)
-            StoreInventoryService.add_to_inventory(
-                store=store,
-                product=product,
-                quantity=total_needed
-            )
-
-            # Создаём позицию заказа (платная часть)
-            price = item_data.price or product.final_price
-            item_total = price * quantity
-
-            StoreOrderItem.objects.create(
-                order=order,
-                product=product,
-                quantity=quantity,
-                price=price,
-                total=item_total,
-                is_bonus=False
-            )
-
-            # Создаём бонусную позицию
-            if bonus_quantity > 0:
+                if not has_inventory:
+                    raise ValidationError(
+                        f'Недостаточно бонусного товара {product.name} в инвентаре партнёра'
+                    )
+                
+                # Списываем из бонусного инвентарья
+                PartnerInventoryService.remove_from_inventory(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity,
+                    is_bonus=True
+                )
+                
+                # Добавляем в инвентарь магазина (как бонус?)
+                # StoreInventory считает бонусы автоматически, но мы передаём кол-во.
+                StoreInventoryService.add_to_inventory(
+                    store=store,
+                    product=product,
+                    quantity=quantity
+                )
+                
+                # Создаём позицию заказа (бонус)
                 StoreOrderItem.objects.create(
                     order=order,
                     product=product,
-                    quantity=bonus_quantity,
-                    price=price,
+                    quantity=quantity,
+                    price=item_data.price or product.final_price, # Цена справочная, total=0
                     total=Decimal('0'),
                     is_bonus=True
                 )
+                
+            else:
+                # 2. Если это обычный товар
+                
+                # Рассчитываем автоматический бонус (если применимо и если это не весовой товар)
+                # Товар должен быть помечен как бонусный в каталоге
+                bonus_quantity = Decimal('0')
+                if product.is_bonus and not product.is_weight_based:
+                    bonus_count = (int(quantity) * 2) // 25
+                    bonus_quantity = Decimal(str(bonus_count))
 
-            total_amount += item_total
+                # Проверяем наличие основного товара (Paid)
+                has_inventory = PartnerInventoryService.check_availability(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity,
+                    is_bonus=False
+                )
+                if not has_inventory:
+                    raise ValidationError(
+                        f'Недостаточно товара {product.name} в инвентаре партнёра'
+                    )
+                
+                # Проверяем наличие бонусного товара (Bonus) если он начислен автоматически
+                if bonus_quantity > 0:
+                    has_bonus_inventory = PartnerInventoryService.check_availability(
+                        partner=partner,
+                        product=product,
+                        quantity=bonus_quantity,
+                        is_bonus=True
+                    )
+                    # Если у партнёра нет бонусного товара для выдачи бонуса магазину,
+                    # мы можем либо запретить, либо списать с платного, либо не выдавать бонус.
+                    # Решение: Не выдавать автоматический бонус, если нет бонусного инвентаря.
+                    if not has_bonus_inventory:
+                        bonus_quantity = Decimal('0') 
+                
+                # Списываем основной товар
+                PartnerInventoryService.remove_from_inventory(
+                    partner=partner,
+                    product=product,
+                    quantity=quantity,
+                    is_bonus=False
+                )
+                
+                # Списываем бонусный товар (если есть)
+                if bonus_quantity > 0:
+                    PartnerInventoryService.remove_from_inventory(
+                        partner=partner,
+                        product=product,
+                        quantity=bonus_quantity,
+                        is_bonus=True
+                    )
+
+                # Добавляем в инвентарь магазина
+                StoreInventoryService.add_to_inventory(
+                    store=store,
+                    product=product,
+                    quantity=quantity + bonus_quantity
+                )
+
+                # Создаём позицию заказа (платная часть)
+                price = item_data.price or product.final_price
+                item_total = price * quantity
+
+                StoreOrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    quantity=quantity,
+                    price=price,
+                    total=item_total,
+                    is_bonus=False
+                )
+
+                # Создаём бонусную позицию
+                if bonus_quantity > 0:
+                    StoreOrderItem.objects.create(
+                        order=order,
+                        product=product,
+                        quantity=bonus_quantity,
+                        price=price,
+                        total=Decimal('0'),
+                        is_bonus=True
+                    )
+
+                total_amount += item_total
         
         # Обновляем заказ (округляем до 2 знаков после запятой)
         total_amount = total_amount.quantize(Decimal('0.01'))

@@ -219,25 +219,36 @@ class PartnerRequestItem(models.Model):
         help_text='За 1 шт или за 1 кг для весовых'
     )
 
+    is_bonus = models.BooleanField(
+        default=False,
+        verbose_name='Бонусный запрос',
+        help_text='Запрос на получение бонусного товара'
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'partner_request_items'
         verbose_name = 'Позиция запроса партнёра'
         verbose_name_plural = 'Позиции запросов партнёров'
-        unique_together = [['request', 'product']]
+        unique_together = [['request', 'product', 'is_bonus']]
         indexes = [
             models.Index(fields=['request', 'product']),
+            models.Index(fields=['is_bonus']),
         ]
 
     def __str__(self):
+        bonus_mark = " [БОНУС]" if self.is_bonus else ""
         if self.weight:
-            return f"{self.product.name}: {self.weight} кг"
-        return f"{self.product.name}: {self.quantity} шт"
+            return f"{self.product.name}{bonus_mark}: {self.weight} кг"
+        return f"{self.product.name}{bonus_mark}: {self.quantity} шт"
 
     @property
     def total_amount(self) -> Decimal:
         """Общая сумма позиции."""
+        if self.is_bonus:
+            return Decimal('0')
+            
         if self.product.is_weight_based and self.weight:
             # Весовой: цена за 100г × кол-во 100г
             price_per_100g = self.price_at_request / Decimal('10')

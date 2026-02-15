@@ -832,18 +832,27 @@ class PartnerInventory(models.Model):
         help_text='Запрос, через который товары попали в инвентарь'
     )
     
+    # v3.1: Бонусный товар (отдельный учёт)
+    is_bonus = models.BooleanField(
+        default=False,
+        verbose_name='Бонусный товар',
+        help_text='Товар получен как бонус (бесплатно)'
+    )
+    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'partner_inventory'
-        unique_together = [['partner', 'product']]
+        unique_together = [['partner', 'product', 'is_bonus']]
         indexes = [
             models.Index(fields=['partner', 'product']),
+            models.Index(fields=['is_bonus']),
         ]
     
     def __str__(self):
-        return f"{self.partner.get_full_name()} - {self.product.name}: {self.quantity}"
+        bonus_mark = " [БОНУС]" if self.is_bonus else ""
+        return f"{self.partner.get_full_name()} - {self.product.name}{bonus_mark}: {self.quantity}"
     
     @property
     def available_quantity(self):

@@ -914,6 +914,11 @@ class PartnerRequestItemSerializer(serializers.Serializer):
         allow_null=True,
         help_text="Вес (только для весовых товаров)"
     )
+    is_bonus = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Бонусный запрос"
+    )
 
 
 class PartnerRequestItemReadSerializer(serializers.Serializer):
@@ -924,10 +929,14 @@ class PartnerRequestItemReadSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=12, decimal_places=3)
     weight = serializers.DecimalField(max_digits=12, decimal_places=3, allow_null=True)
     price_at_request = serializers.DecimalField(max_digits=12, decimal_places=2)
+    is_bonus = serializers.BooleanField()
     total_price = serializers.SerializerMethodField()
 
     def get_total_price(self, obj) -> str:
         """Рассчитать общую стоимость."""
+        if getattr(obj, 'is_bonus', False):
+            return "0.00"
+            
         if hasattr(obj, 'quantity') and hasattr(obj, 'price_at_request'):
             return str(obj.quantity * obj.price_at_request)
         return "0.00"
