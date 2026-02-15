@@ -2122,12 +2122,14 @@ def get_users_in_store(request: Request, pk: int) -> Response:
         }
     )
 )
-class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
+class PartnerInventoryViewSet(viewsets.ModelViewSet):
     """
     ViewSet для управления инвентарём партнёра (v3.0).
 
+    GET /api/stores/partner-inventory/ — список товаров в формате корзины (items + totals)
+
     Функциональность:
-    - Просмотр инвентаря (список и детали)
+    - Просмотр инвентаря (формат корзины)
     - Резервирование товаров для заказов
     - Освобождение резерва при отмене
 
@@ -2137,55 +2139,99 @@ class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     permission_classes = [IsAuthenticated, IsPartner]
+    http_method_names = ['get', 'post', 'head', 'options']
 
     def get_queryset(self):
-        """
-        Получить инвентарь ТОЛЬКО текущего партнёра.
-
-        Фильтры:
-        - product: ID товара
-        - has_stock: true/false (есть ли товар в наличии)
-        - min_quantity: минимальное количество
-        """
-        # ✅ Защита от drf-spectacular schema generation
+        """Получить инвентарь ТОЛЬКО текущего партнёра."""
         if getattr(self, 'swagger_fake_view', False):
             return PartnerInventory.objects.none()
-        
-        queryset = PartnerInventory.objects.filter(
+
+        return PartnerInventory.objects.filter(
             partner=self.request.user
-        ).select_related('product').order_by('product__name')
-
-        # Фильтр по товару
-        product_id = self.request.query_params.get('product')
-        if product_id:
-            queryset = queryset.filter(product_id=product_id)
-
-        # Фильтр: есть ли товар в наличии
-        has_stock = self.request.query_params.get('has_stock')
-        if has_stock == 'true':
-            queryset = queryset.filter(quantity__gt=Decimal('0'))
-        elif has_stock == 'false':
-            queryset = queryset.filter(quantity=Decimal('0'))
-
-        # Фильтр: минимальное количество
-        min_quantity = self.request.query_params.get('min_quantity')
-        if min_quantity:
-            try:
-                queryset = queryset.filter(quantity__gte=Decimal(min_quantity))
-            except (ValueError, TypeError):
-                pass
-
-        return queryset
+        ).select_related('product').prefetch_related('product__images').order_by('product__name')
 
     def get_serializer_class(self):
         """Выбрать сериализатор в зависимости от действия."""
-        if self.action == 'list':
-            return PartnerInventoryListSerializer
-        elif self.action == 'reserve':
+        if self.action == 'reserve':
             return ReserveQuantitySerializer
         elif self.action == 'release':
             return ReleaseQuantitySerializer
         return PartnerInventorySerializer
+
+    def list(self, request: Request) -> Response:
+        """Список товаров инвентаря партнёра в формате корзины."""
+        partner = request.user
+
+        inventory_qs = PartnerInventory.objects.filter(
+            partner=partner,
+            quantity__gt=0
+        ).select_related('product').prefetch_related('product__images')
+
+        if not inventory_qs.exists():
+            return Response({
+                'partner_id': partner.id,
+                'is_empty': True,
+                'items_count': 0,
+                'items': [],
+                'totals': {
+                    'piece_count': 0,
+                    'weight_total': '0',
+                    'total_amount': '0',
+                }
+            })
+
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
+
+        for inv in inventory_qs:
+            product = inv.product
+
+            main_image = None
+            if hasattr(product, 'images'):
+                first_image = product.images.first()
+                if first_image and first_image.image:
+                    main_image = first_image.image.url
+
+            price = product.final_price
+            total = inv.quantity * price
+
+            if product.is_weight_based:
+                qty = inv.quantity
+                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+                weight_total += inv.quantity
+            else:
+                quantity_display = f"{int(inv.quantity)} шт"
+                piece_count += int(inv.quantity)
+
+            total_amount += total
+
+            items.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'product_image': main_image,
+                'is_weight_based': product.is_weight_based,
+                'is_bonus_product': product.is_bonus,
+                'unit': product.unit,
+                'is_bonus': inv.is_bonus,
+                'quantity': str(inv.quantity),
+                'quantity_display': quantity_display,
+                'price': str(price),
+                'total': str(total),
+            })
+
+        return Response({
+            'partner_id': partner.id,
+            'is_empty': False,
+            'items_count': len(items),
+            'items': items,
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+                'total_amount': str(total_amount),
+            }
+        })
 
     @action(detail=True, methods=['post'], url_path='reserve')
     def reserve(self, request: Request, pk=None) -> Response:
@@ -2280,91 +2326,11 @@ class PartnerInventoryViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    @action(detail=False, methods=['get'], url_path='items')
-    def items(self, request: Request) -> Response:
-        """
-        Агрегированный список товаров в инвентаре партнёра.
-
-        GET /api/stores/partner-inventory/items/
-
-        Возвращает все товары с изображениями, количеством и итогами.
-        """
-        partner = request.user
-
-        inventory_qs = PartnerInventory.objects.filter(
-            partner=partner,
-            quantity__gt=0
-        ).select_related('product').prefetch_related('product__images')
-
-        if not inventory_qs.exists():
-            return Response({
-                'partner_id': partner.id,
-                'is_empty': True,
-                'items_count': 0,
-                'items': [],
-                'totals': {
-                    'piece_count': 0,
-                    'weight_total': '0',
-                    'total_amount': '0',
-                }
-            })
-
-        items = []
-        piece_count = 0
-        weight_total = Decimal('0')
-        total_amount = Decimal('0')
-
-        for inv in inventory_qs:
-            product = inv.product
-
-            main_image = None
-            if hasattr(product, 'images'):
-                first_image = product.images.first()
-                if first_image and first_image.image:
-                    main_image = first_image.image.url
-
-            price = product.final_price
-            total = inv.quantity * price
-
-            if product.is_weight_based:
-                qty = inv.quantity
-                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
-                weight_total += inv.quantity
-            else:
-                quantity_display = f"{int(inv.quantity)} шт"
-                piece_count += int(inv.quantity)
-
-            total_amount += total
-
-            items.append({
-                'product_id': product.id,
-                'product_name': product.name,
-                'product_image': main_image,
-                'is_weight_based': product.is_weight_based,
-                'unit': product.unit,
-                'is_bonus': inv.is_bonus,
-                'quantity': str(inv.quantity),
-                'quantity_display': quantity_display,
-                'price': str(price),
-                'total': str(total),
-            })
-
-        return Response({
-            'partner_id': partner.id,
-            'is_empty': False,
-            'items_count': len(items),
-            'items': items,
-            'totals': {
-                'piece_count': piece_count,
-                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
-                'total_amount': str(total_amount),
-            }
-        })
-
-
-class StoreInventoryViewSet(viewsets.ReadOnlyModelViewSet):
+class StoreInventoryViewSet(viewsets.ViewSet):
     """
     ViewSet для инвентаря магазина.
+
+    GET /api/stores/store-inventory/ — список товаров в формате корзины (items + totals)
 
     Permissions:
     - Только пользователи с ролью store (IsStore)
@@ -2372,35 +2338,9 @@ class StoreInventoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     permission_classes = [IsAuthenticated, IsStore]
-    serializer_class = StoreInventoryListSerializer
 
-    def get_queryset(self):
-        if getattr(self, 'swagger_fake_view', False):
-            return StoreInventory.objects.none()
-
-        store = StoreSelectionService.get_current_store(self.request.user)
-        if not store:
-            return StoreInventory.objects.none()
-
-        return StoreInventory.objects.filter(
-            store=store,
-            quantity__gt=0
-        ).select_related('product').order_by('product__name')
-
-    def get_serializer_class(self):
-        if self.action == 'list':
-            return StoreInventoryListSerializer
-        return StoreInventorySerializer
-
-    @action(detail=False, methods=['get'], url_path='items')
-    def items(self, request: Request) -> Response:
-        """
-        Агрегированный список товаров в инвентаре магазина.
-
-        GET /api/stores/store-inventory/items/
-
-        Возвращает все товары с изображениями, количеством и итогами.
-        """
+    def list(self, request: Request) -> Response:
+        """Список товаров инвентаря магазина в формате корзины."""
         store = StoreSelectionService.get_current_store(request.user)
         if not store:
             return Response(
@@ -2459,6 +2399,7 @@ class StoreInventoryViewSet(viewsets.ReadOnlyModelViewSet):
                 'product_name': product.name,
                 'product_image': main_image,
                 'is_weight_based': product.is_weight_based,
+                'is_bonus_product': product.is_bonus,
                 'unit': product.unit,
                 'quantity': str(inv.quantity),
                 'quantity_display': quantity_display,

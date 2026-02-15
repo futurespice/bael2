@@ -449,7 +449,7 @@ class StoreInventorySerializer(serializers.ModelSerializer):
 
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_unit = serializers.CharField(source='product.unit', read_only=True)
-    unit = serializers.CharField(source='product.unit', read_only=True)  # ✅ Для мобилки
+    unit = serializers.CharField(source='product.unit', read_only=True)
     product_price = serializers.DecimalField(
         source='product.final_price',
         max_digits=10,

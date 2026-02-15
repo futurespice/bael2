@@ -669,7 +669,7 @@ class StoreInventoryService:
         """
         return StoreInventory.objects.filter(
             store=store
-        ).select_related('product').order_by('-last_updated')
+        ).select_related('product').prefetch_related('product__images').order_by('-last_updated')
 
     @classmethod
     def get_inventory_total_value(cls, store: Store) -> Decimal:
