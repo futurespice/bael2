@@ -121,14 +121,27 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         return queryset
 
+    def _validate_regular_overhead(self, expense):
+        """Validate that expense is overhead with apply_type=regular."""
+        if expense.expense_type != 'overhead':
+            return Response({
+                'error': 'This endpoint works only for overhead expenses',
+                'expense_type': expense.expense_type,
+                'hint': 'Physical expenses are linked via ProductRecipe',
+            }, status=status.HTTP_400_BAD_REQUEST)
+        if expense.apply_type != 'regular':
+            return Response({
+                'error': 'This endpoint works only for regular expenses',
+                'apply_type': expense.apply_type,
+                'hint': 'Universal expenses are auto-applied to all products',
+            }, status=status.HTTP_400_BAD_REQUEST)
+        return None
+
     @extend_schema(
-        summary="Get available products for regular overhead expense",
+        summary="Products without this expense",
         description=(
-            "Returns products that DON'T have this expense applied to them.\n\n"
-            "Works ONLY for overhead expenses with apply_type='regular'.\n"
-            "- Physical expenses: linked via ProductRecipe\n"
-            "- Universal overhead: auto-applied to all products\n"
-            "- Regular overhead: manually selected products (THIS ENDPOINT)"
+            "Returns active products NOT linked to this expense via ProductRecipe.\n"
+            "Works ONLY for overhead expenses with apply_type='regular'."
         ),
         parameters=[
             OpenApiParameter(
@@ -148,26 +161,14 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             404: {'description': 'Expense not found'},
         },
     )
-    @action(detail=True, methods=['get'], url_path='available-products')
-    def available_products(self, request, pk=None):
+    @action(detail=True, methods=['get'], url_path='products-without')
+    def products_without(self, request, pk=None):
         """Get products WITHOUT this expense applied."""
-        # Use base queryset to avoid parent's is_active filter on Expense
         expense = get_object_or_404(Expense, pk=pk)
 
-        # Validate: only for regular overhead expenses
-        if expense.expense_type != 'overhead':
-            return Response({
-                'error': 'This endpoint works only for overhead expenses',
-                'expense_type': expense.expense_type,
-                'hint': 'Physical expenses are linked via ProductRecipe',
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        if expense.apply_type != 'regular':
-            return Response({
-                'error': 'This endpoint works only for regular expenses',
-                'apply_type': expense.apply_type,
-                'hint': 'Universal expenses are auto-applied to all products',
-            }, status=status.HTTP_400_BAD_REQUEST)
+        error = self._validate_regular_overhead(expense)
+        if error:
+            return error
 
         # Get product IDs that already have this expense
         products_with_expense = ProductRecipe.objects.filter(
@@ -201,6 +202,61 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         serializer = ProductListSerializer(queryset, many=True)
         return Response(serializer.data)
+
+    @extend_schema(
+        summary="Add products to regular overhead expense",
+        description=(
+            "Links products to this expense by creating ProductRecipe records.\n"
+            "Uses get_or_create to prevent duplicates.\n"
+            "Works ONLY for overhead expenses with apply_type='regular'."
+        ),
+        request={'type': 'object', 'properties': {
+            'product_ids': {'type': 'array', 'items': {'type': 'integer'}},
+        }},
+        responses={
+            200: {'description': 'Products added successfully'},
+            400: {'description': 'Wrong expense type, apply type, or invalid product_ids'},
+            404: {'description': 'Expense not found'},
+        },
+    )
+    @action(detail=True, methods=['post'], url_path='add-products')
+    def add_products(self, request, pk=None):
+        """Add products to this expense via ProductRecipe."""
+        expense = get_object_or_404(Expense, pk=pk)
+
+        error = self._validate_regular_overhead(expense)
+        if error:
+            return error
+
+        product_ids = request.data.get('product_ids', [])
+        if not isinstance(product_ids, list) or not product_ids:
+            return Response({
+                'error': 'product_ids must be a non-empty list of integers',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate that all product IDs exist
+        existing_products = Product.objects.filter(id__in=product_ids)
+        existing_ids = set(existing_products.values_list('id', flat=True))
+        invalid_ids = [pid for pid in product_ids if pid not in existing_ids]
+        if invalid_ids:
+            return Response({
+                'error': f'Products not found: {invalid_ids}',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        created_count = 0
+        for product in existing_products:
+            _, created = ProductRecipe.objects.get_or_create(
+                product=product,
+                expense=expense,
+            )
+            if created:
+                created_count += 1
+
+        return Response({
+            'message': f'Added {created_count} product(s)',
+            'created': created_count,
+            'skipped': len(product_ids) - created_count,
+        })
 
 
 # =============================================================================

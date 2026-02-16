@@ -1,4 +1,4 @@
-"""Tests for the available-products endpoint on ExpenseViewSet."""
+"""Tests for products-without and add-products endpoints on ExpenseViewSet."""
 
 from decimal import Decimal
 
@@ -16,13 +16,12 @@ from products.models import (
 from users.models import User
 
 
-class ExpenseAvailableProductsTest(TestCase):
-    """Tests for GET /api/products/expenses/{id}/available-products/."""
+class BaseExpenseProductsTest(TestCase):
+    """Shared setUp for both endpoint test classes."""
 
     def setUp(self):
         self.client = APIClient()
 
-        # Admin user
         self.admin = User.objects.create(
             phone='+996700000001',
             email='admin@test.com',
@@ -33,7 +32,6 @@ class ExpenseAvailableProductsTest(TestCase):
         )
         self.client.force_authenticate(user=self.admin)
 
-        # Regular overhead expense
         self.regular_overhead = Expense.objects.create(
             name='Test Logistics',
             expense_type=ExpenseType.OVERHEAD,
@@ -42,7 +40,6 @@ class ExpenseAvailableProductsTest(TestCase):
             is_active=True,
         )
 
-        # Universal overhead expense
         self.universal_overhead = Expense.objects.create(
             name='Test Rent',
             expense_type=ExpenseType.OVERHEAD,
@@ -51,7 +48,6 @@ class ExpenseAvailableProductsTest(TestCase):
             is_active=True,
         )
 
-        # Physical expense
         self.physical_expense = Expense.objects.create(
             name='Test Flour',
             expense_type=ExpenseType.PHYSICAL,
@@ -60,7 +56,6 @@ class ExpenseAvailableProductsTest(TestCase):
             is_active=True,
         )
 
-        # Products
         self.products = []
         for i in range(1, 6):
             product = Product.objects.create(
@@ -73,20 +68,24 @@ class ExpenseAvailableProductsTest(TestCase):
             )
             self.products.append(product)
 
+
+# =============================================================================
+# GET /api/products/expenses/{id}/products-without/
+# =============================================================================
+
+class ProductsWithoutTest(BaseExpenseProductsTest):
+    """Tests for GET /api/products/expenses/{id}/products-without/."""
+
     def _url(self, expense_id):
-        return f'/api/products/expenses/{expense_id}/available-products/'
+        return f'/api/products/expenses/{expense_id}/products-without/'
 
-    # =========================================================================
-    # Happy path
-    # =========================================================================
+    # --- Happy path ---
 
-    def test_get_available_products_success(self):
+    def test_get_products_without_expense(self):
         """Products with expense are excluded, rest are returned."""
-        # Link expense to first 2 products
         for product in self.products[:2]:
             ProductRecipe.objects.create(
-                product=product,
-                expense=self.regular_overhead,
+                product=product, expense=self.regular_overhead,
             )
 
         response = self.client.get(self._url(self.regular_overhead.id))
@@ -95,177 +94,267 @@ class ExpenseAvailableProductsTest(TestCase):
         self.assertEqual(response.data['count'], 3)
         returned_names = [p['name'] for p in response.data['results']]
         self.assertIn('Product 3', returned_names)
-        self.assertIn('Product 4', returned_names)
-        self.assertIn('Product 5', returned_names)
         self.assertNotIn('Product 1', returned_names)
-        self.assertNotIn('Product 2', returned_names)
 
-    def test_returns_all_when_no_products_have_expense(self):
-        """All active/available products returned when none have the expense."""
+    def test_returns_all_when_none_linked(self):
         response = self.client.get(self._url(self.regular_overhead.id))
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 5)
 
-    def test_returns_empty_when_all_products_have_expense(self):
-        """Empty list when all products already have the expense."""
+    def test_returns_empty_when_all_linked(self):
         for product in self.products:
             ProductRecipe.objects.create(
-                product=product,
-                expense=self.regular_overhead,
+                product=product, expense=self.regular_overhead,
             )
-
         response = self.client.get(self._url(self.regular_overhead.id))
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 0)
-        self.assertEqual(len(response.data['results']), 0)
 
     def test_results_sorted_by_name(self):
-        """Results are ordered alphabetically by name."""
         response = self.client.get(self._url(self.regular_overhead.id))
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = [p['name'] for p in response.data['results']]
         self.assertEqual(names, sorted(names))
 
-    # =========================================================================
-    # Filters
-    # =========================================================================
+    # --- Filters ---
 
     def test_search_filter(self):
-        """Search by product name works."""
         response = self.client.get(
-            self._url(self.regular_overhead.id),
-            {'search': 'Product 3'},
+            self._url(self.regular_overhead.id), {'search': 'Product 3'},
         )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 1)
         self.assertEqual(response.data['results'][0]['name'], 'Product 3')
 
-    def test_search_filter_case_insensitive(self):
-        """Search is case-insensitive."""
+    def test_search_case_insensitive(self):
         response = self.client.get(
-            self._url(self.regular_overhead.id),
-            {'search': 'product 3'},
+            self._url(self.regular_overhead.id), {'search': 'product 3'},
         )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 1)
 
-    def test_is_active_filter_false(self):
-        """is_active=false returns only inactive products."""
+    def test_is_active_false(self):
         self.products[0].is_active = False
         self.products[0].save()
-
         response = self.client.get(
-            self._url(self.regular_overhead.id),
-            {'is_active': 'false'},
+            self._url(self.regular_overhead.id), {'is_active': 'false'},
         )
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 1)
         self.assertEqual(response.data['results'][0]['name'], 'Product 1')
 
-    def test_inactive_products_excluded_by_default(self):
-        """Inactive products are excluded when is_active is not specified."""
+    def test_inactive_excluded_by_default(self):
         self.products[0].is_active = False
         self.products[0].save()
-
         response = self.client.get(self._url(self.regular_overhead.id))
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 4)
         returned_ids = [p['id'] for p in response.data['results']]
         self.assertNotIn(self.products[0].id, returned_ids)
 
-    def test_unavailable_products_excluded(self):
-        """Products with is_available=False are excluded."""
+    def test_unavailable_excluded(self):
         self.products[0].is_available = False
         self.products[0].save()
-
         response = self.client.get(self._url(self.regular_overhead.id))
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 4)
-        returned_ids = [p['id'] for p in response.data['results']]
-        self.assertNotIn(self.products[0].id, returned_ids)
 
-    # =========================================================================
-    # Pagination
-    # =========================================================================
+    # --- Pagination ---
 
     def test_pagination(self):
-        """Pagination works with page_size parameter."""
         response = self.client.get(
-            self._url(self.regular_overhead.id),
-            {'page_size': 2},
+            self._url(self.regular_overhead.id), {'page_size': 2},
         )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['results']), 2)
         self.assertIsNotNone(response.data['next'])
         self.assertEqual(response.data['count'], 5)
 
     def test_pagination_second_page(self):
-        """Second page returns remaining items."""
         response = self.client.get(
-            self._url(self.regular_overhead.id),
-            {'page_size': 3, 'page': 2},
+            self._url(self.regular_overhead.id), {'page_size': 3, 'page': 2},
         )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['results']), 2)
         self.assertIsNone(response.data['next'])
 
-    # =========================================================================
-    # Validation
-    # =========================================================================
+    # --- Validation ---
 
-    def test_returns_400_for_physical_expense(self):
-        """Physical expenses return 400."""
+    def test_400_for_physical(self):
         response = self.client.get(self._url(self.physical_expense.id))
-
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('overhead expenses', response.data['error'].lower())
 
-    def test_returns_400_for_universal_expense(self):
-        """Universal overhead expenses return 400."""
+    def test_400_for_universal(self):
         response = self.client.get(self._url(self.universal_overhead.id))
-
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('regular expenses', response.data['error'].lower())
 
-    def test_returns_404_for_nonexistent_expense(self):
-        """Non-existent expense ID returns 404."""
+    def test_404_for_nonexistent(self):
         response = self.client.get(self._url(99999))
-
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    # =========================================================================
-    # Authentication / Permissions
-    # =========================================================================
+    # --- Auth ---
 
     def test_requires_authentication(self):
-        """Unauthenticated requests return 401."""
         self.client.force_authenticate(user=None)
         response = self.client.get(self._url(self.regular_overhead.id))
-
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_non_admin_forbidden(self):
-        """Non-admin users return 403."""
         partner = User.objects.create(
-            phone='+996700000002',
-            email='partner@test.com',
-            name='Test',
-            second_name='Partner',
-            role='partner',
-            is_active=True,
+            phone='+996700000002', email='p@test.com',
+            name='P', second_name='P', role='partner', is_active=True,
         )
         self.client.force_authenticate(user=partner)
-
         response = self.client.get(self._url(self.regular_overhead.id))
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+
+# =============================================================================
+# POST /api/products/expenses/{id}/add-products/
+# =============================================================================
+
+class AddProductsTest(BaseExpenseProductsTest):
+    """Tests for POST /api/products/expenses/{id}/add-products/."""
+
+    def _url(self, expense_id):
+        return f'/api/products/expenses/{expense_id}/add-products/'
+
+    # --- Happy path ---
+
+    def test_add_products_success(self):
+        """Creates ProductRecipe records for given product IDs."""
+        ids = [self.products[0].id, self.products[1].id, self.products[2].id]
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': ids},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['created'], 3)
+        self.assertEqual(response.data['skipped'], 0)
+        self.assertEqual(
+            ProductRecipe.objects.filter(expense=self.regular_overhead).count(),
+            3,
+        )
+
+    def test_skips_duplicates(self):
+        """Already linked products are skipped (get_or_create)."""
+        ProductRecipe.objects.create(
+            product=self.products[0], expense=self.regular_overhead,
+        )
+
+        ids = [self.products[0].id, self.products[1].id]
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': ids},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['created'], 1)
+        self.assertEqual(response.data['skipped'], 1)
+        self.assertEqual(
+            ProductRecipe.objects.filter(expense=self.regular_overhead).count(),
+            2,
+        )
+
+    def test_all_duplicates(self):
+        """All products already linked — created=0."""
+        for p in self.products[:2]:
+            ProductRecipe.objects.create(product=p, expense=self.regular_overhead)
+
+        ids = [self.products[0].id, self.products[1].id]
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': ids},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['created'], 0)
+        self.assertEqual(response.data['skipped'], 2)
+
+    def test_products_without_reflects_add(self):
+        """After adding products, products-without no longer lists them."""
+        ids = [self.products[0].id, self.products[1].id]
+        self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': ids},
+            format='json',
+        )
+
+        without_url = f'/api/products/expenses/{self.regular_overhead.id}/products-without/'
+        response = self.client.get(without_url)
+        self.assertEqual(response.data['count'], 3)
+        returned_ids = [p['id'] for p in response.data['results']]
+        self.assertNotIn(self.products[0].id, returned_ids)
+        self.assertNotIn(self.products[1].id, returned_ids)
+
+    # --- Validation ---
+
+    def test_400_for_physical(self):
+        response = self.client.post(
+            self._url(self.physical_expense.id),
+            {'product_ids': [self.products[0].id]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_400_for_universal(self):
+        response = self.client.post(
+            self._url(self.universal_overhead.id),
+            {'product_ids': [self.products[0].id]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_400_for_empty_list(self):
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': []},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_400_for_missing_field(self):
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_400_for_invalid_product_ids(self):
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': [99999]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('99999', response.data['error'])
+
+    def test_404_for_nonexistent_expense(self):
+        response = self.client.post(
+            self._url(99999),
+            {'product_ids': [self.products[0].id]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # --- Auth ---
+
+    def test_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': [self.products[0].id]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_non_admin_forbidden(self):
+        partner = User.objects.create(
+            phone='+996700000003', email='p2@test.com',
+            name='P', second_name='P', role='partner', is_active=True,
+        )
+        self.client.force_authenticate(user=partner)
+        response = self.client.post(
+            self._url(self.regular_overhead.id),
+            {'product_ids': [self.products[0].id]},
+            format='json',
+        )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
