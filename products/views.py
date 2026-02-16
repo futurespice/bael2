@@ -16,8 +16,11 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import models, transaction
+from django.shortcuts import get_object_or_404
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.types import OpenApiTypes
 
 from .models import (
     Expense,
@@ -117,6 +120,87 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(is_active=is_active_bool)
 
         return queryset
+
+    @extend_schema(
+        summary="Get available products for regular overhead expense",
+        description=(
+            "Returns products that DON'T have this expense applied to them.\n\n"
+            "Works ONLY for overhead expenses with apply_type='regular'.\n"
+            "- Physical expenses: linked via ProductRecipe\n"
+            "- Universal overhead: auto-applied to all products\n"
+            "- Regular overhead: manually selected products (THIS ENDPOINT)"
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='search',
+                type=OpenApiTypes.STR,
+                description='Search by product name',
+            ),
+            OpenApiParameter(
+                name='is_active',
+                type=OpenApiTypes.BOOL,
+                description='Filter by product active status',
+            ),
+        ],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: {'description': 'Wrong expense type or apply type'},
+            404: {'description': 'Expense not found'},
+        },
+    )
+    @action(detail=True, methods=['get'], url_path='available-products')
+    def available_products(self, request, pk=None):
+        """Get products WITHOUT this expense applied."""
+        # Use base queryset to avoid parent's is_active filter on Expense
+        expense = get_object_or_404(Expense, pk=pk)
+
+        # Validate: only for regular overhead expenses
+        if expense.expense_type != 'overhead':
+            return Response({
+                'error': 'This endpoint works only for overhead expenses',
+                'expense_type': expense.expense_type,
+                'hint': 'Physical expenses are linked via ProductRecipe',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if expense.apply_type != 'regular':
+            return Response({
+                'error': 'This endpoint works only for regular expenses',
+                'apply_type': expense.apply_type,
+                'hint': 'Universal expenses are auto-applied to all products',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get product IDs that already have this expense
+        products_with_expense = ProductRecipe.objects.filter(
+            expense=expense,
+        ).values_list('product_id', flat=True)
+
+        # Get products WITHOUT this expense
+        queryset = Product.objects.exclude(
+            id__in=products_with_expense,
+        ).filter(is_available=True)
+
+        # is_active filter (defaults to True)
+        is_active = request.query_params.get('is_active')
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+        else:
+            queryset = queryset.filter(is_active=True)
+
+        # Search filter
+        search = request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(name__icontains=search)
+
+        queryset = queryset.order_by('name')
+
+        # Pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = ProductListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = ProductListSerializer(queryset, many=True)
+        return Response(serializer.data)
 
 
 # =============================================================================
