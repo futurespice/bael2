@@ -1502,6 +1502,8 @@ class StoreViewSet(viewsets.ModelViewSet):
         Инвентарь магазина (товары из ACCEPTED заказов).
 
         GET /api/stores/stores/{id}/inventory/
+
+        Возвращает товары в формате корзины с items и totals.
         """
         store = self.get_object()
         user = request.user
@@ -1522,15 +1524,77 @@ class StoreViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_403_FORBIDDEN
                 )
 
-        inventory = StoreInventoryService.get_inventory(store)
+        inventory_qs = StoreInventory.objects.filter(
+            store=store,
+            quantity__gt=0
+        ).select_related('product').prefetch_related('product__images')
 
-        page = self.paginate_queryset(inventory)
-        if page is not None:
-            serializer = StoreInventoryListSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+        if not inventory_qs.exists():
+            return Response({
+                'store_id': store.id,
+                'store_name': store.name,
+                'is_empty': True,
+                'items_count': 0,
+                'items': [],
+                'totals': {
+                    'piece_count': 0,
+                    'weight_total': '0',
+                    'total_amount': '0',
+                }
+            })
 
-        serializer = StoreInventoryListSerializer(inventory, many=True)
-        return Response(serializer.data)
+        items = []
+        piece_count = 0
+        weight_total = Decimal('0')
+        total_amount = Decimal('0')
+
+        for inv in inventory_qs:
+            product = inv.product
+
+            main_image = None
+            if hasattr(product, 'images'):
+                first_image = product.images.first()
+                if first_image and first_image.image:
+                    main_image = first_image.image.url
+
+            price = product.final_price
+            total = inv.quantity * price
+
+            if product.is_weight_based:
+                qty = inv.quantity
+                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+                weight_total += inv.quantity
+            else:
+                quantity_display = f"{int(inv.quantity)} шт"
+                piece_count += int(inv.quantity)
+
+            total_amount += total
+
+            items.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'product_image': main_image,
+                'is_weight_based': product.is_weight_based,
+                'is_bonus_product': product.is_bonus,
+                'unit': product.unit,
+                'quantity': str(inv.quantity),
+                'quantity_display': quantity_display,
+                'price': str(price),
+                'total': str(total),
+            })
+
+        return Response({
+            'store_id': store.id,
+            'store_name': store.name,
+            'is_empty': False,
+            'items_count': len(items),
+            'items': items,
+            'totals': {
+                'piece_count': piece_count,
+                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+                'total_amount': str(total_amount),
+            }
+        })
 
     # =========================================================================
     # ОТМЕТКА БРАКА ИЗ ИНВЕНТАРЯ
