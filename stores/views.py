@@ -110,6 +110,89 @@ class StandardPagination(PageNumberPagination):
     max_page_size = 100
 
 
+def _build_inventory_items(inventory_qs):
+    """
+    Построить список items и totals из queryset инвентаря.
+
+    Используется в basket, partner-inventory, store-inventory.
+    Queryset должен иметь select_related('product') и prefetch_related('product__images').
+    """
+    items = []
+    piece_count = 0
+    weight_total = Decimal('0')
+    total_amount = Decimal('0')
+
+    for inv in inventory_qs:
+        product = inv.product
+
+        main_image = None
+        if hasattr(product, 'images'):
+            first_image = product.images.first()
+            if first_image and first_image.image:
+                main_image = first_image.image.url
+
+        price = product.final_price
+        total = inv.quantity * price
+
+        if product.is_weight_based:
+            qty = inv.quantity
+            quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
+            weight_total += inv.quantity
+        else:
+            quantity_display = f"{int(inv.quantity)} шт"
+            piece_count += int(inv.quantity)
+
+        total_amount += total
+
+        item = {
+            'product_id': product.id,
+            'product_name': product.name,
+            'product_image': main_image,
+            'is_weight_based': product.is_weight_based,
+            'is_bonus_product': product.is_bonus,
+            'unit': product.unit,
+            'quantity': str(inv.quantity),
+            'quantity_display': quantity_display,
+            'price': str(price),
+            'total': str(total),
+        }
+
+        # Дополнительные поля для PartnerInventory
+        if hasattr(inv, 'is_bonus'):
+            item['is_bonus'] = inv.is_bonus
+
+        items.append(item)
+
+    totals = {
+        'piece_count': piece_count,
+        'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
+        'total_amount': str(total_amount),
+    }
+
+    return items, totals
+
+
+def _paginate_items(items, request, page_size=20):
+    """Пагинировать список items вручную."""
+    page = int(request.query_params.get('page', 1))
+    page_size = int(request.query_params.get('page_size', page_size))
+    page_size = min(page_size, 100)
+
+    total_count = len(items)
+    start = (page - 1) * page_size
+    end = start + page_size
+    paginated_items = items[start:end]
+
+    total_pages = (total_count + page_size - 1) // page_size if page_size > 0 else 1
+
+    return paginated_items, {
+        'count': total_count,
+        'page': page,
+        'page_size': page_size,
+        'total_pages': total_pages,
+    }
+
+
 # =============================================================================
 # ГЕОГРАФИЯ (РЕГИОНЫ И ГОРОДА)
 # =============================================================================
@@ -705,6 +788,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 'order_ids': data['order_ids'],
             })
 
+        paginated_items, pagination = _paginate_items(items, request)
+
         return Response({
             'store_id': store.id,
             'store_name': store.name,
@@ -713,7 +798,8 @@ class StoreViewSet(viewsets.ModelViewSet):
             'is_empty': False,
             'orders_count': orders.count(),
             'order_ids': list(orders.values_list('id', flat=True)),
-            'items': items,
+            'items': paginated_items,
+            'pagination': pagination,
             'totals': {
                 'piece_count': piece_count,
                 'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
@@ -1155,6 +1241,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 'order_ids': data['order_ids'],
             })
 
+        paginated_items, pagination = _paginate_items(items, request)
+
         return Response({
             'success': True,
             'message': f'Корзина обновлена. Полностью удалено позиций: {len(removed_info)}, частично изменено: {len(modified_info)}',
@@ -1168,7 +1256,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 'is_empty': len(items) == 0,
                 'orders_count': orders.count(),
                 'order_ids': list(orders.values_list('id', flat=True)),
-                'items': items,
+                'items': paginated_items,
+                'pagination': pagination,
                 'totals': {
                     'piece_count': piece_count,
                     'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
@@ -1543,57 +1632,17 @@ class StoreViewSet(viewsets.ModelViewSet):
                 }
             })
 
-        items = []
-        piece_count = 0
-        weight_total = Decimal('0')
-        total_amount = Decimal('0')
-
-        for inv in inventory_qs:
-            product = inv.product
-
-            main_image = None
-            if hasattr(product, 'images'):
-                first_image = product.images.first()
-                if first_image and first_image.image:
-                    main_image = first_image.image.url
-
-            price = product.final_price
-            total = inv.quantity * price
-
-            if product.is_weight_based:
-                qty = inv.quantity
-                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
-                weight_total += inv.quantity
-            else:
-                quantity_display = f"{int(inv.quantity)} шт"
-                piece_count += int(inv.quantity)
-
-            total_amount += total
-
-            items.append({
-                'product_id': product.id,
-                'product_name': product.name,
-                'product_image': main_image,
-                'is_weight_based': product.is_weight_based,
-                'is_bonus_product': product.is_bonus,
-                'unit': product.unit,
-                'quantity': str(inv.quantity),
-                'quantity_display': quantity_display,
-                'price': str(price),
-                'total': str(total),
-            })
+        items, totals = _build_inventory_items(inventory_qs)
+        paginated_items, pagination = _paginate_items(items, request)
 
         return Response({
             'store_id': store.id,
             'store_name': store.name,
             'is_empty': False,
             'items_count': len(items),
-            'items': items,
-            'totals': {
-                'piece_count': piece_count,
-                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
-                'total_amount': str(total_amount),
-            }
+            'items': paginated_items,
+            'pagination': pagination,
+            'totals': totals,
         })
 
     # =========================================================================
@@ -2244,57 +2293,16 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
                 }
             })
 
-        items = []
-        piece_count = 0
-        weight_total = Decimal('0')
-        total_amount = Decimal('0')
-
-        for inv in inventory_qs:
-            product = inv.product
-
-            main_image = None
-            if hasattr(product, 'images'):
-                first_image = product.images.first()
-                if first_image and first_image.image:
-                    main_image = first_image.image.url
-
-            price = product.final_price
-            total = inv.quantity * price
-
-            if product.is_weight_based:
-                qty = inv.quantity
-                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
-                weight_total += inv.quantity
-            else:
-                quantity_display = f"{int(inv.quantity)} шт"
-                piece_count += int(inv.quantity)
-
-            total_amount += total
-
-            items.append({
-                'product_id': product.id,
-                'product_name': product.name,
-                'product_image': main_image,
-                'is_weight_based': product.is_weight_based,
-                'is_bonus_product': product.is_bonus,
-                'unit': product.unit,
-                'is_bonus': inv.is_bonus,
-                'quantity': str(inv.quantity),
-                'quantity_display': quantity_display,
-                'price': str(price),
-                'total': str(total),
-            })
+        items, totals = _build_inventory_items(inventory_qs)
+        paginated_items, pagination = _paginate_items(items, request)
 
         return Response({
             'partner_id': partner.id,
             'is_empty': False,
             'items_count': len(items),
-            'items': items,
-            'totals': {
-                'piece_count': piece_count,
-                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
-                'total_amount': str(total_amount),
-            }
+            'items': paginated_items,
+            'pagination': pagination,
+            'totals': totals,
         })
 
     @action(detail=True, methods=['post'], url_path='reserve')
@@ -2431,55 +2439,15 @@ class StoreInventoryViewSet(viewsets.ViewSet):
                 }
             })
 
-        items = []
-        piece_count = 0
-        weight_total = Decimal('0')
-        total_amount = Decimal('0')
-
-        for inv in inventory_qs:
-            product = inv.product
-
-            main_image = None
-            if hasattr(product, 'images'):
-                first_image = product.images.first()
-                if first_image and first_image.image:
-                    main_image = first_image.image.url
-
-            price = product.final_price
-            total = inv.quantity * price
-
-            if product.is_weight_based:
-                qty = inv.quantity
-                quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
-                weight_total += inv.quantity
-            else:
-                quantity_display = f"{int(inv.quantity)} шт"
-                piece_count += int(inv.quantity)
-
-            total_amount += total
-
-            items.append({
-                'product_id': product.id,
-                'product_name': product.name,
-                'product_image': main_image,
-                'is_weight_based': product.is_weight_based,
-                'is_bonus_product': product.is_bonus,
-                'unit': product.unit,
-                'quantity': str(inv.quantity),
-                'quantity_display': quantity_display,
-                'price': str(price),
-                'total': str(total),
-            })
+        items, totals = _build_inventory_items(inventory_qs)
+        paginated_items, pagination = _paginate_items(items, request)
 
         return Response({
             'store_id': store.id,
             'store_name': store.name,
             'is_empty': False,
             'items_count': len(items),
-            'items': items,
-            'totals': {
-                'piece_count': piece_count,
-                'weight_total': str(int(weight_total) if weight_total == int(weight_total) else weight_total),
-                'total_amount': str(total_amount),
-            }
+            'items': paginated_items,
+            'pagination': pagination,
+            'totals': totals,
         })
