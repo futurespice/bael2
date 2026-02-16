@@ -76,7 +76,7 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Пароль обязателен')
 
         # Убираем маркер для проверки длины
-        clean_password = value.replace('p!8Rt', '')
+        clean_password = value.replace('partbay', '')
 
         # Простая проверка длины без Django валидаторов
         if len(clean_password) < 6:

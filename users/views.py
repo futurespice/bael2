@@ -52,7 +52,7 @@ class UserRegistrationView(generics.CreateAPIView):
         "password": "mypassword123"
     }
     
-    Если в пароле есть маркер партнёра (p!8Rt), роль = partner.
+    Если в пароле есть маркер партнёра (partbay), роль = partner.
     Иначе роль = store.
     
     ВАЖНО: Все пользователи автоматически одобряются (approval_status='approved').

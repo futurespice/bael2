@@ -11,7 +11,7 @@ from django.contrib.auth.models import BaseUserManager
 from django.conf import settings
 
 # Маркер партнёра из настроек
-PARTNER_MARKER = getattr(settings, 'PARTNER_MARKER', 'p!8Rt')
+PARTNER_MARKER = getattr(settings, 'PARTNER_MARKER', 'partbay')
 
 
 class UserManager(BaseUserManager):

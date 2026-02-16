@@ -31,7 +31,7 @@ POST /api/auth/register/
   "second_name": "Мурзаев",
   "email": "azat@example.com",
   "phone": "+996555123456",
-  "password": "p!8Rt123456"
+  "password": "partbay123456"
 }
 ```
 
@@ -59,7 +59,7 @@ POST /api/auth/register/
 - `phone`: формат `+996XXXXXXXXX` (13 символов)
 - `email`: до 50 символов, уникальный
 - `name`, `second_name`: 2-24 символа
-- `password`: минимум 6 символов (+ маркер `p!8Rt` для партнёров)
+- `password`: минимум 6 символов (+ маркер `partbay` для партнёров)
 
 ---
 
@@ -72,7 +72,7 @@ POST /api/auth/login/
 ```json
 {
   "phone": "+996555123456",
-  "password": "p!8Rt123456",
+  "password": "partbay123456",
   "remember_me": true
 }
 ```
@@ -96,7 +96,7 @@ POST /api/auth/login/
 
 **Роли:**
 - `store` - Магазин (обычный пользователь)
-- `partner` - Партнёр (регистрация с маркером `p!8Rt` в пароле)
+- `partner` - Партнёр (регистрация с маркером `partbay` в пароле)
 - `admin` - Администратор
 
 ---

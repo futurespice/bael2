@@ -519,7 +519,7 @@ LOGGING = {
 # BUSINESS SETTINGS
 # =============================================================================
 
-PARTNER_MARKER = os.environ.get('PARTNER_MARKER', 'p!8Rt')
+PARTNER_MARKER = os.environ.get('PARTNER_MARKER', 'partbay')
 BONUS_EVERY_NTH_ITEM = 21
 DEFAULT_DEBT_PAYMENT_DAYS = 30
 
