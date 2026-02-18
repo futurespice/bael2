@@ -195,6 +195,7 @@ class ExpenseListSerializer(serializers.ModelSerializer):
 
     expense_type_display = serializers.CharField(source='get_expense_type_display', read_only=True)
     expense_status_display = serializers.CharField(source='get_expense_status_display', read_only=True)
+    unit_type_display = serializers.CharField(source='get_unit_type_display', read_only=True)
 
     class Meta:
         model = Expense
@@ -205,6 +206,8 @@ class ExpenseListSerializer(serializers.ModelSerializer):
             'expense_type_display',
             'expense_status',
             'expense_status_display',
+            'unit_type',
+            'unit_type_display',
             'price_per_unit',
             'monthly_amount',
             'daily_amount',
