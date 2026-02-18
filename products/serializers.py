@@ -254,38 +254,25 @@ class ProductRecipeSerializer(serializers.ModelSerializer):
 
 
 class ProductRecipeCreateSerializer(serializers.ModelSerializer):
-    """Создание рецепта (с поддержкой absolute_quantity)."""
+    """Создание рецепта."""
 
     class Meta:
         model = ProductRecipe
-        fields = ['product', 'expense', 'quantity_per_unit', 'proportion',
-                  'absolute_quantity', 'product_quantity']
+        fields = ['product', 'expense', 'quantity_per_unit', 'proportion']
 
     def validate(self, attrs):
-        """Валидация с поддержкой абсолютных количеств."""
+        """Валидация."""
         expense = attrs.get('expense')
 
-        # Если есть absolute_quantity — proportion/quantity_per_unit рассчитаются в save()
-        if attrs.get('absolute_quantity'):
-            if expense.expense_status == ExpenseStatus.SUZERAIN:
-                if not attrs.get('product_quantity'):
-                    raise serializers.ValidationError({
-                        'product_quantity': 'Для Сюзерена обязателен product_quantity при вводе absolute_quantity'
-                    })
-            return attrs
-
-        # Для универсальных и накладных — поля необязательны
-        if expense.apply_type == 'universal' or expense.expense_type == 'overhead':
-            return attrs
-
-        # Fallback: ручной ввод (обратная совместимость)
+        # Сюзерен должен иметь quantity_per_unit
         if expense.expense_status == ExpenseStatus.SUZERAIN:
             if not attrs.get('quantity_per_unit'):
                 raise serializers.ValidationError({
                     'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
                 })
         else:
-            if not attrs.get('proportion'):
+            # Остальные должны иметь proportion (кроме универсальных)
+            if expense.apply_type != 'universal' and not attrs.get('proportion'):
                 raise serializers.ValidationError({
                     'proportion': 'Расход должен иметь пропорцию'
                 })
@@ -294,21 +281,54 @@ class ProductRecipeCreateSerializer(serializers.ModelSerializer):
 
 
 class ProductRecipeNestedSerializer(serializers.ModelSerializer):
-    """Вложенный сериализатор для создания/обновления товара (без field 'product')."""
+    """Вложенный сериализатор для создания/обновления товара (без field 'product').
+
+    Поддерживает ДВА формата ввода:
+    1. Прямой (мобильный клиент): quantity_per_unit + proportion
+    2. Абсолютный: absolute_quantity + product_quantity → авторасчёт
+
+    ПРАВИЛА:
+    - Сюзерен: обязателен quantity_per_unit (или absolute_quantity + product_quantity)
+    - Civilian (физический): обязателен proportion (или absolute_quantity)
+    - Overhead / Universal: поля необязательны (только связь)
+    """
+
+    # Все поля writable, пустые строки конвертируем в None
+    quantity_per_unit = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False, allow_null=True
+    )
+    proportion = serializers.DecimalField(
+        max_digits=10, decimal_places=3, required=False, allow_null=True
+    )
 
     class Meta:
         model = ProductRecipe
         fields = ['expense', 'absolute_quantity', 'product_quantity',
                   'quantity_per_unit', 'proportion']
-        read_only_fields = ['quantity_per_unit', 'proportion']
+
+    def to_internal_value(self, data):
+        """Конвертация пустых строк в None для decimal полей."""
+        cleaned = {}
+        for key, value in data.items():
+            if key in ('quantity_per_unit', 'proportion', 'absolute_quantity', 'product_quantity'):
+                if value == '' or value is None:
+                    cleaned[key] = None
+                else:
+                    cleaned[key] = value
+            else:
+                cleaned[key] = value
+        return super().to_internal_value(cleaned)
 
     def validate(self, attrs):
-        """Валидация с поддержкой абсолютных количеств."""
+        """Валидация с поддержкой обоих форматов ввода."""
         expense = attrs.get('expense')
 
-        # Если есть absolute_quantity — proportion/quantity_per_unit рассчитаются в save()
-        if attrs.get('absolute_quantity'):
-            # Для Сюзерена: обязателен product_quantity
+        has_absolute = bool(attrs.get('absolute_quantity'))
+        has_direct_qpu = bool(attrs.get('quantity_per_unit'))
+        has_direct_prop = bool(attrs.get('proportion'))
+
+        # === Формат 1: absolute_quantity (авторасчёт в model.save()) ===
+        if has_absolute:
             if expense.expense_status == ExpenseStatus.SUZERAIN:
                 if not attrs.get('product_quantity'):
                     raise serializers.ValidationError({
@@ -316,9 +336,26 @@ class ProductRecipeNestedSerializer(serializers.ModelSerializer):
                     })
             return attrs
 
-        # Для универсальных и накладных — поля необязательны
-        if expense.apply_type == 'universal' or expense.expense_type == 'overhead':
+        # === Формат 2: прямой ввод quantity_per_unit / proportion ===
+
+        # Overhead и Universal — поля необязательны (только привязка)
+        if expense.expense_type == 'overhead' or expense.apply_type == 'universal':
             return attrs
+
+        # Сюзерен — обязателен quantity_per_unit
+        if expense.expense_status == ExpenseStatus.SUZERAIN:
+            if not has_direct_qpu:
+                raise serializers.ValidationError({
+                    'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
+                })
+            return attrs
+
+        # Civilian (физический, не-сюзерен) — обязателен proportion
+        if expense.expense_type == 'physical':
+            if not has_direct_prop:
+                raise serializers.ValidationError({
+                    'proportion': 'Физический расход (Civilian) должен иметь пропорцию'
+                })
 
         return attrs
 
