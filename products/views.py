@@ -980,98 +980,211 @@ class ProductViewSet(viewsets.ModelViewSet):
         """
         GET /api/products/products/accounting-table/
         Таблица учёта данных: по каждому товару себестоимость, расходы, доход.
+
+        Query params:
+        - period_days: период в днях (по умолчанию 11)
+        - date_from: начало периода YYYY-MM-DD (перекрывает period_days)
+        - date_to: конец периода YYYY-MM-DD (по умолчанию сегодня)
         """
         from decimal import Decimal
         from datetime import date as dt_date, timedelta
-        from django.db.models import Sum
+        from django.db.models import Sum, Prefetch
         from orders.models import StoreOrderItem, StoreOrderStatus
-        from .models import ProductRecipe, ExpenseStatus, ExpenseType as ET, Expense as ExpModel
+        from .models import ProductRecipe, ExpenseStatus, ExpenseType as ET, Expense as ExpModel, ApplyType
 
         period_days = int(request.query_params.get('period_days', 11))
+        date_to_param = request.query_params.get('date_to')
+        date_from_param = request.query_params.get('date_from')
+
         today = dt_date.today()
-        start_date = today - timedelta(days=period_days)
-
-        products = Product.objects.filter(is_active=True).order_by('name')
-        products_result = []
-
-        for product in products:
-            # Продажи
-            sales = StoreOrderItem.objects.filter(
-                product=product,
-                order__created_at__date__gte=start_date,
-                order__created_at__date__lte=today,
-                order__status=StoreOrderStatus.ACCEPTED,
-                is_bonus=False
-            ).aggregate(
-                qty=Sum('quantity'),
-                rev=Sum('total')
+        try:
+            end_date = dt_date.fromisoformat(date_to_param) if date_to_param else today
+            start_date = dt_date.fromisoformat(date_from_param) if date_from_param else end_date - timedelta(days=period_days)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Неверный формат даты. Используйте YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
             )
-            qty_sold = sales['qty'] or Decimal('0')
-            revenue = sales['rev'] or Decimal('0')
 
-            # Физические расходы (детализация)
+        actual_days = max((end_date - start_date).days, 1)
+
+        # =====================================================================
+        # 1. Загружаем товары с prefetch рецептов (1 запрос)
+        # =====================================================================
+        products = list(Product.objects.filter(is_active=True).prefetch_related(
+            Prefetch(
+                'recipe_items',
+                queryset=ProductRecipe.objects.select_related('expense').order_by('id'),
+            )
+        ).order_by('name'))
+
+        # =====================================================================
+        # 2. Bulk-запрос продаж по всем товарам (1 запрос)
+        # =====================================================================
+        all_sales = StoreOrderItem.objects.filter(
+            order__created_at__date__gte=start_date,
+            order__created_at__date__lte=end_date,
+            order__status=StoreOrderStatus.ACCEPTED,
+            is_bonus=False
+        ).values('product_id').annotate(
+            qty=Sum('quantity'),
+            rev=Sum('total')
+        )
+        sales_by_product = {s['product_id']: s for s in all_sales}
+
+        # =====================================================================
+        # 3. Накладные расходы (1 запрос), разделяем universal vs regular
+        # =====================================================================
+        overhead_expenses = list(ExpModel.objects.filter(
+            expense_type=ET.OVERHEAD,
+            is_active=True
+        ))
+        universal_overhead = [e for e in overhead_expenses if e.apply_type == ApplyType.UNIVERSAL]
+        regular_overhead = [e for e in overhead_expenses if e.apply_type == ApplyType.REGULAR]
+
+        # Для regular: загружаем id товаров, привязанных к каждому расходу (1 запрос)
+        regular_linked_ids: dict = {}
+        if regular_overhead:
+            regular_expense_ids = [e.id for e in regular_overhead]
+            for rec in ProductRecipe.objects.filter(
+                expense_id__in=regular_expense_ids
+            ).values('expense_id', 'product_id'):
+                regular_linked_ids.setdefault(rec['expense_id'], set()).add(rec['product_id'])
+
+        # =====================================================================
+        # 4. Объёмы продаж для распределения накладных
+        # =====================================================================
+        volume_by_product = {
+            pid: (s['qty'] or Decimal('0'))
+            for pid, s in sales_by_product.items()
+        }
+        total_volume_all = sum(volume_by_product.values()) or Decimal('0')
+        num_active_products = len(products) or 1
+
+        # Суммарные объёмы привязанных товаров для каждого regular-расхода
+        regular_linked_volumes: dict = {}
+        for exp in regular_overhead:
+            linked = regular_linked_ids.get(exp.id, set())
+            total_linked = sum(volume_by_product.get(pid, Decimal('0')) for pid in linked)
+            regular_linked_volumes[exp.id] = (total_linked, linked)
+
+        # =====================================================================
+        # 5. Обрабатываем каждый товар (без дополнительных запросов к БД)
+        # =====================================================================
+        products_result = []
+        for product in products:
+            sale = sales_by_product.get(product.id, {})
+            qty_sold = sale.get('qty') or Decimal('0')
+            revenue = sale.get('rev') or Decimal('0')
+            product_volume = volume_by_product.get(product.id, Decimal('0'))
+
+            all_recipes = list(product.recipe_items.all())
+            suzerain_recipe = next(
+                (r for r in all_recipes if r.expense.expense_status == ExpenseStatus.SUZERAIN),
+                None
+            )
+
+            # --- Физические расходы ---
             physical_items = []
             total_physical = Decimal('0')
-            suzerain_recipe = ProductRecipe.objects.filter(
-                product=product,
-                expense__expense_status=ExpenseStatus.SUZERAIN
-            ).select_related('expense').first()
+            sz_vol = Decimal('0')
 
             if suzerain_recipe and qty_sold > 0:
                 sz_vol = qty_sold * (suzerain_recipe.quantity_per_unit or Decimal('0'))
-                sz_cost = sz_vol * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
+                sz_price = suzerain_recipe.expense.price_per_unit or Decimal('0')
+                sz_cost = (sz_vol * sz_price).quantize(Decimal('0.01'))
                 total_physical += sz_cost
                 physical_items.append({
                     'id': suzerain_recipe.expense.id,
                     'name': suzerain_recipe.expense.name,
-                    'quantity': float(sz_vol),
+                    'is_suzerain': True,
+                    'quantity': float(sz_vol.quantize(Decimal('0.01'))),
+                    'unit_price': float(sz_price),
                     'unit': suzerain_recipe.expense.unit_type or '',
-                    'total': float(sz_cost.quantize(Decimal('0.01')))
+                    'total': float(sz_cost),
                 })
 
-                other_recipes = ProductRecipe.objects.filter(
-                    product=product,
-                    expense__expense_type='physical'
-                ).exclude(
-                    expense__expense_status=ExpenseStatus.SUZERAIN
-                ).select_related('expense')
-
-                for recipe in other_recipes:
+                for recipe in all_recipes:
+                    if recipe.expense.expense_status == ExpenseStatus.SUZERAIN:
+                        continue
+                    if recipe.expense.expense_type != 'physical':
+                        continue
+                    unit_price = recipe.expense.price_per_unit or Decimal('0')
                     if recipe.proportion:
-                        vol = sz_vol * recipe.proportion
-                        cost = vol * (recipe.expense.price_per_unit or Decimal('0'))
-                        total_physical += cost
-                        physical_items.append({
-                            'id': recipe.expense.id,
-                            'name': recipe.expense.name,
-                            'quantity': float(vol),
-                            'unit': recipe.expense.unit_type or '',
-                            'total': float(cost.quantize(Decimal('0.01')))
-                        })
+                        vol = (sz_vol * recipe.proportion).quantize(Decimal('0.01'))
+                        cost = (vol * unit_price).quantize(Decimal('0.01'))
                     elif recipe.quantity_per_unit:
-                        vol = qty_sold * recipe.quantity_per_unit
-                        cost = vol * (recipe.expense.price_per_unit or Decimal('0'))
-                        total_physical += cost
-                        physical_items.append({
-                            'id': recipe.expense.id,
-                            'name': recipe.expense.name,
-                            'quantity': float(vol),
-                            'unit': recipe.expense.unit_type or '',
-                            'total': float(cost.quantize(Decimal('0.01')))
-                        })
+                        vol = (qty_sold * recipe.quantity_per_unit).quantize(Decimal('0.01'))
+                        cost = (vol * unit_price).quantize(Decimal('0.01'))
+                    else:
+                        continue
+                    total_physical += cost
+                    physical_items.append({
+                        'id': recipe.expense.id,
+                        'name': recipe.expense.name,
+                        'is_suzerain': False,
+                        'quantity': float(vol),
+                        'unit_price': float(unit_price),
+                        'unit': recipe.expense.unit_type or '',
+                        'total': float(cost),
+                    })
 
-            # Накладные (детализация)
-            overhead_breakdown = OverheadDistributor.get_overhead_breakdown_for_product(
-                product=product,
-                quantity_produced=qty_sold if qty_sold > 0 else Decimal('1'),
-                period_days=period_days
-            )
-            overhead_items = [{
-                'id': item.expense_id,
-                'name': item.expense_name,
-                'total': float((item.total_cost * period_days).quantize(Decimal('0.01')))
-            } for item in overhead_breakdown]
-            total_overhead = sum(item.total_cost for item in overhead_breakdown) * period_days
+            # --- Рецепты (для UI котлован) ---
+            recipe_items_data = [
+                {
+                    'id': r.id,
+                    'expense_id': r.expense.id,
+                    'expense_name': r.expense.name,
+                    'is_suzerain': r.expense.expense_status == ExpenseStatus.SUZERAIN,
+                    'quantity_per_unit': float(r.quantity_per_unit) if r.quantity_per_unit else None,
+                    'proportion': float(r.proportion) if r.proportion else None,
+                    'absolute_quantity': float(r.absolute_quantity) if r.absolute_quantity else None,
+                    'product_quantity': float(r.product_quantity) if r.product_quantity else None,
+                    'unit': r.expense.unit_type or '',
+                    'unit_price': float(r.expense.price_per_unit or 0),
+                }
+                for r in all_recipes
+                if r.expense.expense_type == 'physical'
+            ]
+
+            # --- Накладные расходы ---
+            overhead_items = []
+            total_overhead = Decimal('0')
+
+            # Universal: распределяем по доле среди ВСЕХ товаров
+            for exp in universal_overhead:
+                exp_period_total = exp.calculate_amount() * actual_days
+                if total_volume_all > 0:
+                    share = product_volume / total_volume_all
+                else:
+                    share = Decimal('1') / num_active_products
+                product_share = (exp_period_total * share).quantize(Decimal('0.01'))
+                total_overhead += product_share
+                overhead_items.append({
+                    'id': exp.id,
+                    'name': exp.name,
+                    'apply_type': 'universal',
+                    'total': float(product_share),
+                })
+
+            # Regular: только если товар привязан к расходу (галочка)
+            for exp in regular_overhead:
+                total_linked_vol, linked_ids = regular_linked_volumes[exp.id]
+                if product.id not in linked_ids:
+                    continue
+                exp_period_total = exp.calculate_amount() * actual_days
+                if total_linked_vol > 0:
+                    share = product_volume / total_linked_vol
+                else:
+                    share = Decimal('1') / len(linked_ids)
+                product_share = (exp_period_total * share).quantize(Decimal('0.01'))
+                total_overhead += product_share
+                overhead_items.append({
+                    'id': exp.id,
+                    'name': exp.name,
+                    'apply_type': 'regular',
+                    'total': float(product_share),
+                })
 
             total_expense = total_physical + total_overhead
             profit = revenue - total_expense
@@ -1080,12 +1193,15 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'id': product.id,
                 'name': product.name,
                 'markup_percentage': float(product.markup_percentage),
+                'final_price': float(product.final_price),
+                'quantity_sold': float(qty_sold),
                 'cost_per_unit': float(product.average_cost_price),
                 'total_expense': float(total_expense.quantize(Decimal('0.01'))),
                 'revenue': float(revenue),
                 'profit': float(profit.quantize(Decimal('0.01'))),
                 'physical_expenses': physical_items,
                 'overhead_expenses': overhead_items,
+                'recipe_items': recipe_items_data,
             })
 
         # Итого
@@ -1096,7 +1212,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response({
             'period_days': period_days,
             'date_from': start_date.isoformat(),
-            'date_to': today.isoformat(),
+            'date_to': end_date.isoformat(),
             'products': products_result,
             'totals': {
                 'total_expense': round(grand_expense, 2),

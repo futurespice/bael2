@@ -730,15 +730,30 @@ class AccountingService:
     def save_accounting_data(cls, mechanical_expenses_data, recipe_items_data, production_batches_data):
         results = {'mechanical_updated': 0, 'recipes_saved': 0, 'batches_created': 0}
 
-        # 1. Обновить daily_amount для механических расходов
+        # 1. Валидация и обновление daily_amount для механических расходов
         for item in mechanical_expenses_data:
-            updated = Expense.objects.filter(id=item['expense_id']).update(
-                daily_amount=item['amount']
-            )
-            results['mechanical_updated'] += updated
+            try:
+                expense = Expense.objects.get(id=item['expense_id'])
+            except Expense.DoesNotExist:
+                raise ValueError(f"Расход с id={item['expense_id']} не найден")
+
+            if expense.expense_state != 'mechanical':
+                raise ValueError(
+                    f"Расход '{expense.name}' (id={expense.id}) не является механическим "
+                    f"(состояние: {expense.expense_state})"
+                )
+
+            expense.daily_amount = item['amount']
+            expense.save(update_fields=['daily_amount'])
+            results['mechanical_updated'] += 1
 
         # 2. Котлованская часть — создать/обновить рецепты товаров
         for item in recipe_items_data:
+            if not Product.objects.filter(id=item['product_id']).exists():
+                raise ValueError(f"Товар с id={item['product_id']} не найден")
+            if not Expense.objects.filter(id=item['expense_id']).exists():
+                raise ValueError(f"Расход с id={item['expense_id']} не найден")
+
             defaults = {}
             if item.get('absolute_quantity') is not None:
                 defaults['absolute_quantity'] = item['absolute_quantity']
