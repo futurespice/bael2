@@ -47,12 +47,14 @@ from .serializers import (
     PartnerExpenseCreateSerializer,
     PartnerExpenseListSerializer,
     ProductExpenseRelationSerializer,
+    AccountingDataSaveSerializer,
 )
 from .permissions import IsAdmin, IsPartner, IsAdminOrPartner
 from .services import (
     ProductionCalculator,
     ProductionService,
     OverheadDistributor,
+    AccountingService,
 )
 
 
@@ -202,6 +204,30 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         serializer = ProductListSerializer(queryset, many=True)
         return Response(serializer.data)
+
+    @extend_schema(
+        summary="Mechanical expenses for accounting",
+        description="Returns all expenses with expense_state=mechanical for the accounting screen.",
+        responses={200: {'description': 'List of mechanical expenses'}},
+    )
+    @action(detail=False, methods=['get'], url_path='mechanical-accounting')
+    def mechanical_accounting(self, request):
+        """GET /api/products/expenses/mechanical-accounting/"""
+        mechanical_expenses = Expense.objects.filter(
+            expense_state='mechanical',
+            is_active=True
+        ).order_by('name')
+
+        data = []
+        for exp in mechanical_expenses:
+            data.append({
+                'id': exp.id,
+                'name': exp.name,
+                'expense_status': exp.expense_status,
+                'daily_amount': str(exp.daily_amount),
+            })
+
+        return Response({'mechanical_expenses': data})
 
     @extend_schema(
         summary="Add products to regular overhead expense",
@@ -942,6 +968,160 @@ class ProductViewSet(viewsets.ModelViewSet):
             'products_count': len(products_data),
             'products': products_data,
         })
+
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsAdmin],
+            url_path='accounting-table')
+    def accounting_table(self, request):
+        """
+        GET /api/products/products/accounting-table/
+        Таблица учёта данных: по каждому товару себестоимость, расходы, доход.
+        """
+        from decimal import Decimal
+        from datetime import date as dt_date, timedelta
+        from django.db.models import Sum
+        from orders.models import StoreOrderItem, StoreOrderStatus
+        from .models import ProductRecipe, ExpenseStatus, ExpenseType as ET, Expense as ExpModel
+
+        period_days = int(request.query_params.get('period_days', 11))
+        today = dt_date.today()
+        start_date = today - timedelta(days=period_days)
+
+        products = Product.objects.filter(is_active=True).order_by('name')
+        products_result = []
+
+        for product in products:
+            # Продажи
+            sales = StoreOrderItem.objects.filter(
+                product=product,
+                order__created_at__date__gte=start_date,
+                order__created_at__date__lte=today,
+                order__status=StoreOrderStatus.ACCEPTED,
+                is_bonus=False
+            ).aggregate(
+                qty=Sum('quantity'),
+                rev=Sum('total')
+            )
+            qty_sold = sales['qty'] or Decimal('0')
+            revenue = sales['rev'] or Decimal('0')
+
+            # Физические расходы (детализация)
+            physical_items = []
+            total_physical = Decimal('0')
+            suzerain_recipe = ProductRecipe.objects.filter(
+                product=product,
+                expense__expense_status=ExpenseStatus.SUZERAIN
+            ).select_related('expense').first()
+
+            if suzerain_recipe and qty_sold > 0:
+                sz_vol = qty_sold * (suzerain_recipe.quantity_per_unit or Decimal('0'))
+                sz_cost = sz_vol * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
+                total_physical += sz_cost
+                physical_items.append({
+                    'id': suzerain_recipe.expense.id,
+                    'name': suzerain_recipe.expense.name,
+                    'quantity': float(sz_vol),
+                    'unit': suzerain_recipe.expense.unit_type or '',
+                    'total': float(sz_cost.quantize(Decimal('0.01')))
+                })
+
+                other_recipes = ProductRecipe.objects.filter(
+                    product=product,
+                    expense__expense_type='physical'
+                ).exclude(
+                    expense__expense_status=ExpenseStatus.SUZERAIN
+                ).select_related('expense')
+
+                for recipe in other_recipes:
+                    if recipe.proportion:
+                        vol = sz_vol * recipe.proportion
+                        cost = vol * (recipe.expense.price_per_unit or Decimal('0'))
+                        total_physical += cost
+                        physical_items.append({
+                            'id': recipe.expense.id,
+                            'name': recipe.expense.name,
+                            'quantity': float(vol),
+                            'unit': recipe.expense.unit_type or '',
+                            'total': float(cost.quantize(Decimal('0.01')))
+                        })
+                    elif recipe.quantity_per_unit:
+                        vol = qty_sold * recipe.quantity_per_unit
+                        cost = vol * (recipe.expense.price_per_unit or Decimal('0'))
+                        total_physical += cost
+                        physical_items.append({
+                            'id': recipe.expense.id,
+                            'name': recipe.expense.name,
+                            'quantity': float(vol),
+                            'unit': recipe.expense.unit_type or '',
+                            'total': float(cost.quantize(Decimal('0.01')))
+                        })
+
+            # Накладные (детализация)
+            overhead_breakdown = OverheadDistributor.get_overhead_breakdown_for_product(
+                product=product,
+                quantity_produced=qty_sold if qty_sold > 0 else Decimal('1'),
+                period_days=period_days
+            )
+            overhead_items = [{
+                'id': item.expense_id,
+                'name': item.expense_name,
+                'total': float((item.total_cost * period_days).quantize(Decimal('0.01')))
+            } for item in overhead_breakdown]
+            total_overhead = sum(item.total_cost for item in overhead_breakdown) * period_days
+
+            total_expense = total_physical + total_overhead
+            profit = revenue - total_expense
+
+            products_result.append({
+                'id': product.id,
+                'name': product.name,
+                'markup_percentage': float(product.markup_percentage),
+                'cost_per_unit': float(product.average_cost_price),
+                'total_expense': float(total_expense.quantize(Decimal('0.01'))),
+                'revenue': float(revenue),
+                'profit': float(profit.quantize(Decimal('0.01'))),
+                'physical_expenses': physical_items,
+                'overhead_expenses': overhead_items,
+            })
+
+        # Итого
+        grand_expense = sum(p['total_expense'] for p in products_result)
+        grand_revenue = sum(p['revenue'] for p in products_result)
+        grand_profit = grand_revenue - grand_expense
+
+        return Response({
+            'period_days': period_days,
+            'date_from': start_date.isoformat(),
+            'date_to': today.isoformat(),
+            'products': products_result,
+            'totals': {
+                'total_expense': round(grand_expense, 2),
+                'total_revenue': round(grand_revenue, 2),
+                'net_profit': round(grand_profit, 2),
+            }
+        })
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsAdmin],
+            url_path='save-accounting')
+    def save_accounting(self, request):
+        """
+        POST /api/products/products/save-accounting/
+        Сохранить данные учёта (механические расходы + партии).
+        """
+        serializer = AccountingDataSaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            results = AccountingService.save_accounting_data(
+                mechanical_expenses_data=serializer.validated_data.get('mechanical_expenses', []),
+                production_batches_data=serializer.validated_data.get('production_batches', [])
+            )
+            return Response(results)
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 
 # =============================================================================

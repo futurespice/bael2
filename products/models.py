@@ -83,9 +83,11 @@ class ExpenseUnitType(models.TextChoices):
 
     - PER_PIECE: По штукам
     - PER_WEIGHT: По весу (кг)
+    - PER_VOLUME: По объёму (литр)
     """
     PER_PIECE = 'per_piece', 'По штукам'
     PER_WEIGHT = 'per_weight', 'По весу (кг)'
+    PER_VOLUME = 'per_volume', 'По объёму (литр)'
 
 
 # =============================================================================
@@ -197,6 +199,15 @@ class Expense(models.Model):
         help_text='Пропорция от Сюзерена (например, 0.5 = 50%)'
     )
 
+    default_quantity_per_unit = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name='Норма на единицу по умолчанию',
+        help_text='Для универсальных физических: кол-во на 1 единицу товара'
+    )
+
     # Суммы (для накладных расходов)
     monthly_amount = models.DecimalField(
         max_digits=14,
@@ -249,12 +260,11 @@ class Expense(models.Model):
             if not self.price_per_unit or self.price_per_unit <= 0:
                 raise ValidationError('Физический расход должен иметь цену за единицу')
 
-        # Вассал должен зависеть от Сюзерена
-        if self.expense_status == ExpenseStatus.VASSAL:
-            if not self.depends_on_suzerain:
-                raise ValidationError('Вассал должен зависеть от Сюзерена')
-            if not self.dependency_ratio:
-                raise ValidationError('Вассал должен иметь коэффициент зависимости')
+        # Автоопределение Вассала: overhead + mechanical + universal → vassal
+        if (self.expense_type == ExpenseType.OVERHEAD
+                and self.expense_state == ExpenseState.MECHANICAL
+                and self.apply_type == ApplyType.UNIVERSAL):
+            self.expense_status = ExpenseStatus.VASSAL
 
     def calculate_amount(self, quantity: Decimal = None) -> Decimal:
         """
@@ -526,6 +536,24 @@ class ProductRecipe(models.Model):
         help_text='Пропорция от Сюзерена (например, 0.5 = 50%)'
     )
 
+    absolute_quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        verbose_name='Абсолютное количество',
+        help_text='Что вводит пользователь (например 40 кг лука)'
+    )
+
+    product_quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name='Количество единиц товара',
+        help_text='Для Сюзерена: на сколько единиц рассчитано (например 40 пачек)'
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -545,15 +573,43 @@ class ProductRecipe(models.Model):
         else:
             return f"{self.product.name}: {self.expense.name}"
 
+    def save(self, *args, **kwargs):
+        """Автоматический расчёт quantity_per_unit и proportion из absolute_quantity."""
+        if self.absolute_quantity:
+            if self.expense.expense_status == ExpenseStatus.SUZERAIN and self.product_quantity:
+                # quantity_per_unit = 80 кг / 40 пачек = 2 кг/пачка
+                self.quantity_per_unit = (self.absolute_quantity / self.product_quantity)
+            elif self.expense.expense_status != ExpenseStatus.SUZERAIN:
+                # Найти Сюзерена этого товара
+                suzerain_recipe = ProductRecipe.objects.filter(
+                    product=self.product,
+                    expense__expense_status=ExpenseStatus.SUZERAIN
+                ).first()
+                if suzerain_recipe and suzerain_recipe.absolute_quantity:
+                    # proportion = 40 кг лука / 80 кг фарша = 0.5
+                    self.proportion = (self.absolute_quantity / suzerain_recipe.absolute_quantity)
+        super().save(*args, **kwargs)
+
     def clean(self):
         """Валидация."""
+        # Если есть absolute_quantity — не требовать proportion/quantity_per_unit напрямую
+        if self.absolute_quantity:
+            return
+
+        # Для универсальных расходов — не требовать ничего
+        if self.expense.apply_type == ApplyType.UNIVERSAL:
+            return
+
+        # Для накладных обычных — не требовать пропорций (только связь)
+        if self.expense.expense_type == ExpenseType.OVERHEAD:
+            return
+
         # Сюзерен должен иметь quantity_per_unit
         if self.expense.expense_status == ExpenseStatus.SUZERAIN:
             if not self.quantity_per_unit:
                 raise ValidationError('Сюзерен должен иметь quantity_per_unit')
         else:
-            # Остальные должны иметь proportion (кроме универсальных)
-            if self.expense.apply_type != ApplyType.UNIVERSAL and not self.proportion:
+            if not self.proportion:
                 raise ValidationError('Расход должен иметь пропорцию')
 
 

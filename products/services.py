@@ -716,3 +716,46 @@ class ProductionService:
         product.save(update_fields=['stock_quantity'])
 
         return batch
+
+
+# =============================================================================
+# ACCOUNTING SERVICE (Экран "Учёт данных")
+# =============================================================================
+
+class AccountingService:
+    """Сервис для сохранения данных учёта (механические расходы + партии)."""
+
+    @classmethod
+    @transaction.atomic
+    def save_accounting_data(cls, mechanical_expenses_data, production_batches_data):
+        results = {'mechanical_updated': 0, 'batches_created': 0}
+
+        # 1. Обновить daily_amount для механических расходов
+        for item in mechanical_expenses_data:
+            updated = Expense.objects.filter(id=item['expense_id']).update(
+                daily_amount=item['amount']
+            )
+            results['mechanical_updated'] += updated
+
+        # 2. Создать производственные партии (ДОБАВЛЯЮТСЯ к существующим)
+        for item in production_batches_data:
+            batch_date = item.get('date', date.today())
+            notes = item.get('notes', '')
+
+            if item['input_type'] == 'quantity':
+                ProductionService.create_batch_from_quantity(
+                    product_id=item['product_id'],
+                    quantity=item['quantity'],
+                    date=batch_date,
+                    notes=notes
+                )
+            else:
+                ProductionService.create_batch_from_suzerain(
+                    product_id=item['product_id'],
+                    suzerain_quantity=item['suzerain_quantity'],
+                    date=batch_date,
+                    notes=notes
+                )
+            results['batches_created'] += 1
+
+        return results

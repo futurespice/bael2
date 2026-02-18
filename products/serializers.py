@@ -130,6 +130,7 @@ class ExpenseSerializer(serializers.ModelSerializer):
             'dependency_ratio',
             'monthly_amount',
             'daily_amount',
+            'default_quantity_per_unit',
             'description',
             'is_active',
             'created_at',
@@ -155,6 +156,7 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
             'dependency_ratio',
             'monthly_amount',
             'daily_amount',
+            'default_quantity_per_unit',
             'description'
         ]
 
@@ -173,16 +175,17 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
                     'price_per_unit': 'Физический расход должен иметь цену за единицу'
                 })
 
-        # Вассал должен зависеть от Сюзерена
+        # Запрет прямого выбора статуса vassal — доступны только suzerain и civilian
         if attrs.get('expense_status') == ExpenseStatus.VASSAL:
-            if not attrs.get('depends_on_suzerain'):
-                raise serializers.ValidationError({
-                    'depends_on_suzerain': 'Вассал должен зависеть от Сюзерена'
-                })
-            if not attrs.get('dependency_ratio'):
-                raise serializers.ValidationError({
-                    'dependency_ratio': 'Вассал должен иметь коэффициент зависимости'
-                })
+            raise serializers.ValidationError({
+                'expense_status': 'Статус Вассал устанавливается автоматически. Выберите Сюзерен или Обыватель.'
+            })
+
+        # Автоопределение Вассала: overhead + mechanical + universal → vassal
+        if (attrs.get('expense_type') == 'overhead'
+                and attrs.get('expense_state') == 'mechanical'
+                and attrs.get('apply_type') == 'universal'):
+            attrs['expense_status'] = ExpenseStatus.VASSAL
 
         return attrs
 
@@ -243,6 +246,8 @@ class ProductRecipeSerializer(serializers.ModelSerializer):
             'expense_status',
             'quantity_per_unit',
             'proportion',
+            'absolute_quantity',
+            'product_quantity',
             'created_at'
         ]
         read_only_fields = ['id', 'created_at']
@@ -280,24 +285,27 @@ class ProductRecipeNestedSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductRecipe
-        fields = ['expense', 'quantity_per_unit', 'proportion']
+        fields = ['expense', 'absolute_quantity', 'product_quantity',
+                  'quantity_per_unit', 'proportion']
+        read_only_fields = ['quantity_per_unit', 'proportion']
 
     def validate(self, attrs):
-        """Валидация (дублирует логику ProductRecipeCreateSerializer)."""
+        """Валидация с поддержкой абсолютных количеств."""
         expense = attrs.get('expense')
 
-        # Сюзерен должен иметь quantity_per_unit
-        if expense.expense_status == ExpenseStatus.SUZERAIN:
-            if not attrs.get('quantity_per_unit'):
-                raise serializers.ValidationError({
-                    'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
-                })
-        else:
-            # Остальные должны иметь proportion (кроме универсальных)
-            if expense.apply_type != 'universal' and not attrs.get('proportion'):
-                raise serializers.ValidationError({
-                    'proportion': 'Расход должен иметь пропорцию'
-                })
+        # Если есть absolute_quantity — proportion/quantity_per_unit рассчитаются в save()
+        if attrs.get('absolute_quantity'):
+            # Для Сюзерена: обязателен product_quantity
+            if expense.expense_status == ExpenseStatus.SUZERAIN:
+                if not attrs.get('product_quantity'):
+                    raise serializers.ValidationError({
+                        'product_quantity': 'Для Сюзерена обязателен product_quantity при вводе absolute_quantity'
+                    })
+            return attrs
+
+        # Для универсальных и накладных — поля необязательны
+        if expense.apply_type == 'universal' or expense.expense_type == 'overhead':
+            return attrs
 
         return attrs
 
@@ -531,7 +539,8 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         return super().to_internal_value(new_data)
 
     def update(self, instance, validated_data):
-        """Обновление товара с изображениями и рецептами."""
+        """Обновление товара с изображениями, рецептами и авто-подтягиванием универсальных."""
+        from .models import ApplyType, ExpenseType as ET
         images_data = validated_data.pop('images', None)
         recipe_items_data = validated_data.pop('recipe_items', None)
 
@@ -564,6 +573,23 @@ class ProductDetailSerializer(serializers.ModelSerializer):
                 ProductRecipe.objects.create(
                     product=instance,
                     **item
+                )
+
+            # Автоматически подтягиваем универсальные физические расходы
+            existing_expense_ids = set(
+                ProductRecipe.objects.filter(product=instance).values_list('expense_id', flat=True)
+            )
+            universal_physical = Expense.objects.filter(
+                apply_type=ApplyType.UNIVERSAL,
+                expense_type=ET.PHYSICAL,
+                is_active=True
+            ).exclude(id__in=existing_expense_ids)
+
+            for expense in universal_physical:
+                ProductRecipe.objects.create(
+                    product=instance,
+                    expense=expense,
+                    quantity_per_unit=expense.default_quantity_per_unit
                 )
 
         # Refresh для корректного ответа
@@ -704,7 +730,8 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        """Создание товара с изображениями и рецептами."""
+        """Создание товара с изображениями, рецептами и авто-подтягиванием универсальных."""
+        from .models import ApplyType, ExpenseType as ET
         images_data = validated_data.pop('images', [])
         recipe_items_data = validated_data.pop('recipe_items', [])
 
@@ -723,6 +750,23 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             ProductRecipe.objects.create(
                 product=product,
                 **item
+            )
+
+        # Автоматически подтягиваем универсальные физические расходы
+        existing_expense_ids = set(
+            ProductRecipe.objects.filter(product=product).values_list('expense_id', flat=True)
+        )
+        universal_physical = Expense.objects.filter(
+            apply_type=ApplyType.UNIVERSAL,
+            expense_type=ET.PHYSICAL,
+            is_active=True
+        ).exclude(id__in=existing_expense_ids)
+
+        for expense in universal_physical:
+            ProductRecipe.objects.create(
+                product=product,
+                expense=expense,
+                quantity_per_unit=expense.default_quantity_per_unit
             )
 
         # Prefetch для корректного ответа
@@ -892,6 +936,44 @@ class PartnerExpenseListSerializer(serializers.ModelSerializer):
         model = PartnerExpense
         fields = ['id', 'amount', 'description', 'date', 'created_at']
         read_only_fields = fields
+
+
+# =============================================================================
+# ACCOUNTING DATA SERIALIZERS (Экран "Учёт данных")
+# =============================================================================
+
+class MechanicalExpenseItemSerializer(serializers.Serializer):
+    """Элемент механического расхода для учёта."""
+    expense_id = serializers.IntegerField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal('0'))
+
+
+class ProductionBatchItemSerializer(serializers.Serializer):
+    """Элемент производственной партии для учёта."""
+    product_id = serializers.IntegerField()
+    input_type = serializers.ChoiceField(choices=['quantity', 'suzerain'])
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal('0.01')
+    )
+    suzerain_quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=Decimal('0.01')
+    )
+    date = serializers.DateField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        input_type = attrs.get('input_type')
+        if input_type == 'quantity' and not attrs.get('quantity'):
+            raise serializers.ValidationError({'quantity': 'Обязательно для input_type=quantity'})
+        if input_type == 'suzerain' and not attrs.get('suzerain_quantity'):
+            raise serializers.ValidationError({'suzerain_quantity': 'Обязательно для input_type=suzerain'})
+        return attrs
+
+
+class AccountingDataSaveSerializer(serializers.Serializer):
+    """Сериализатор для сохранения данных учёта."""
+    mechanical_expenses = MechanicalExpenseItemSerializer(many=True, required=False, default=[])
+    production_batches = ProductionBatchItemSerializer(many=True, required=False, default=[])
 
 
 # =============================================================================
