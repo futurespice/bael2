@@ -723,12 +723,12 @@ class ProductionService:
 # =============================================================================
 
 class AccountingService:
-    """Сервис для сохранения данных учёта (механические расходы + партии)."""
+    """Сервис для сохранения данных учёта (механика + котлован + партии)."""
 
     @classmethod
     @transaction.atomic
-    def save_accounting_data(cls, mechanical_expenses_data, production_batches_data):
-        results = {'mechanical_updated': 0, 'batches_created': 0}
+    def save_accounting_data(cls, mechanical_expenses_data, recipe_items_data, production_batches_data):
+        results = {'mechanical_updated': 0, 'recipes_saved': 0, 'batches_created': 0}
 
         # 1. Обновить daily_amount для механических расходов
         for item in mechanical_expenses_data:
@@ -737,7 +737,28 @@ class AccountingService:
             )
             results['mechanical_updated'] += updated
 
-        # 2. Создать производственные партии (ДОБАВЛЯЮТСЯ к существующим)
+        # 2. Котлованская часть — создать/обновить рецепты товаров
+        for item in recipe_items_data:
+            defaults = {}
+            if item.get('absolute_quantity') is not None:
+                defaults['absolute_quantity'] = item['absolute_quantity']
+            if item.get('product_quantity') is not None:
+                defaults['product_quantity'] = item['product_quantity']
+            if item.get('quantity_per_unit') is not None:
+                defaults['quantity_per_unit'] = item['quantity_per_unit']
+            if item.get('proportion') is not None:
+                defaults['proportion'] = item['proportion']
+
+            recipe, created = ProductRecipe.objects.update_or_create(
+                product_id=item['product_id'],
+                expense_id=item['expense_id'],
+                defaults=defaults
+            )
+            # Пересохраним для автоматического расчёта proportion/quantity_per_unit
+            recipe.save()
+            results['recipes_saved'] += 1
+
+        # 3. Создать производственные партии (ДОБАВЛЯЮТСЯ к существующим)
         for item in production_batches_data:
             batch_date = item.get('date', date.today())
             notes = item.get('notes', '')

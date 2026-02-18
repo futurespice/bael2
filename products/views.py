@@ -223,7 +223,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             data.append({
                 'id': exp.id,
                 'name': exp.name,
+                'expense_type': exp.expense_type,
                 'expense_status': exp.expense_status,
+                'expense_state': exp.expense_state,
+                'apply_type': exp.apply_type,
+                'monthly_amount': str(exp.monthly_amount),
                 'daily_amount': str(exp.daily_amount),
             })
 
@@ -1106,7 +1110,17 @@ class ProductViewSet(viewsets.ModelViewSet):
     def save_accounting(self, request):
         """
         POST /api/products/products/save-accounting/
-        Сохранить данные учёта (механические расходы + партии).
+        Сохранить данные учёта (механика + котлован + партии).
+
+        Body:
+        {
+            "mechanical_expenses": [{"expense_id": 1, "amount": "700"}],
+            "recipe_items": [
+                {"product_id": 1, "expense_id": 2, "absolute_quantity": "80", "product_quantity": "40"},
+                {"product_id": 1, "expense_id": 3, "absolute_quantity": "40"}
+            ],
+            "production_batches": [{"product_id": 1, "input_type": "quantity", "quantity": "200"}]
+        }
         """
         serializer = AccountingDataSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1114,6 +1128,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         try:
             results = AccountingService.save_accounting_data(
                 mechanical_expenses_data=serializer.validated_data.get('mechanical_expenses', []),
+                recipe_items_data=serializer.validated_data.get('recipe_items', []),
                 production_batches_data=serializer.validated_data.get('production_batches', [])
             )
             return Response(results)

@@ -254,25 +254,38 @@ class ProductRecipeSerializer(serializers.ModelSerializer):
 
 
 class ProductRecipeCreateSerializer(serializers.ModelSerializer):
-    """Создание рецепта."""
+    """Создание рецепта (с поддержкой absolute_quantity)."""
 
     class Meta:
         model = ProductRecipe
-        fields = ['product', 'expense', 'quantity_per_unit', 'proportion']
+        fields = ['product', 'expense', 'quantity_per_unit', 'proportion',
+                  'absolute_quantity', 'product_quantity']
 
     def validate(self, attrs):
-        """Валидация."""
+        """Валидация с поддержкой абсолютных количеств."""
         expense = attrs.get('expense')
 
-        # Сюзерен должен иметь quantity_per_unit
+        # Если есть absolute_quantity — proportion/quantity_per_unit рассчитаются в save()
+        if attrs.get('absolute_quantity'):
+            if expense.expense_status == ExpenseStatus.SUZERAIN:
+                if not attrs.get('product_quantity'):
+                    raise serializers.ValidationError({
+                        'product_quantity': 'Для Сюзерена обязателен product_quantity при вводе absolute_quantity'
+                    })
+            return attrs
+
+        # Для универсальных и накладных — поля необязательны
+        if expense.apply_type == 'universal' or expense.expense_type == 'overhead':
+            return attrs
+
+        # Fallback: ручной ввод (обратная совместимость)
         if expense.expense_status == ExpenseStatus.SUZERAIN:
             if not attrs.get('quantity_per_unit'):
                 raise serializers.ValidationError({
                     'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
                 })
         else:
-            # Остальные должны иметь proportion (кроме универсальных)
-            if expense.apply_type != 'universal' and not attrs.get('proportion'):
+            if not attrs.get('proportion'):
                 raise serializers.ValidationError({
                     'proportion': 'Расход должен иметь пропорцию'
                 })
@@ -970,9 +983,28 @@ class ProductionBatchItemSerializer(serializers.Serializer):
         return attrs
 
 
+class RecipeItemSerializer(serializers.Serializer):
+    """Элемент котлованской части — рецепт (связь товар-расход)."""
+    product_id = serializers.IntegerField()
+    expense_id = serializers.IntegerField()
+    absolute_quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False, allow_null=True
+    )
+    product_quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True
+    )
+    quantity_per_unit = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False, allow_null=True
+    )
+    proportion = serializers.DecimalField(
+        max_digits=10, decimal_places=3, required=False, allow_null=True
+    )
+
+
 class AccountingDataSaveSerializer(serializers.Serializer):
-    """Сериализатор для сохранения данных учёта."""
+    """Сериализатор для сохранения данных учёта (механика + котлован + партии)."""
     mechanical_expenses = MechanicalExpenseItemSerializer(many=True, required=False, default=[])
+    recipe_items = RecipeItemSerializer(many=True, required=False, default=[])
     production_batches = ProductionBatchItemSerializer(many=True, required=False, default=[])
 
 
