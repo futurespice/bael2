@@ -985,6 +985,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         - period_days: период в днях (по умолчанию 11)
         - date_from: начало периода YYYY-MM-DD (перекрывает period_days)
         - date_to: конец периода YYYY-MM-DD (по умолчанию сегодня)
+        - sort_by: поле сортировки: name (по умолчанию) | date (по дате создания)
+        - sort_order: порядок: asc (по умолчанию) | desc
         """
         from decimal import Decimal
         from datetime import date as dt_date, timedelta
@@ -995,6 +997,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         period_days = int(request.query_params.get('period_days', 11))
         date_to_param = request.query_params.get('date_to')
         date_from_param = request.query_params.get('date_from')
+        sort_by = request.query_params.get('sort_by', 'name')
+        sort_order = request.query_params.get('sort_order', 'asc')
 
         today = dt_date.today()
         try:
@@ -1008,6 +1012,14 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         actual_days = max((end_date - start_date).days, 1)
 
+        # Сортировка на уровне БД (для полей модели)
+        db_sort_fields = {'name': 'name', 'date': 'created_at'}
+        db_order_field = db_sort_fields.get(sort_by)
+        if db_order_field and sort_order == 'desc':
+            db_order_field = f'-{db_order_field}'
+        elif not db_order_field:
+            db_order_field = 'name'
+
         # =====================================================================
         # 1. Загружаем товары с prefetch рецептов (1 запрос)
         # =====================================================================
@@ -1016,7 +1028,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'recipe_items',
                 queryset=ProductRecipe.objects.select_related('expense').order_by('id'),
             )
-        ).order_by('name'))
+        ).order_by(db_order_field))
 
         # =====================================================================
         # 2. Bulk-запрос продаж по всем товарам (1 запрос)
@@ -1192,6 +1204,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             products_result.append({
                 'id': product.id,
                 'name': product.name,
+                'created_at': product.created_at.date().isoformat(),
                 'markup_percentage': float(product.markup_percentage),
                 'final_price': float(product.final_price),
                 'quantity_sold': float(qty_sold),
