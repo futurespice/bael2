@@ -29,6 +29,19 @@ class ChatListCreateView(APIView):
             .prefetch_related('participants', 'messages')
             .order_by('-updated_at')
         )
+
+        # Фильтр по роли собеседника: ?role=store | partner | admin
+        # Доступен только для admin и partner (store видит всего два типа, фильтр им не нужен)
+        role_filter = request.query_params.get('role')
+        if role_filter and request.user.role in ('admin', 'partner'):
+            valid_roles = {'store', 'partner', 'admin'}
+            if role_filter in valid_roles:
+                chats = chats.filter(participants__role=role_filter).exclude(
+                    participants=request.user
+                )
+                # После filter/exclude могут появиться дубли — убираем
+                chats = chats.distinct()
+
         serializer = ChatSerializer(chats, many=True, context={'request': request})
         return Response(serializer.data)
 
