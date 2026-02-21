@@ -117,68 +117,17 @@ class BaseV3Test(TestCase):
 
 
 # =============================================================================
-# ProductRecipeCreateSerializer — absolute_quantity
+# ProductRecipeCreateSerializer — original (quantity_per_unit / proportion)
 # =============================================================================
 
 class ProductRecipeCreateSerializerTest(BaseV3Test):
-    """Tests for ProductRecipeCreateSerializer with absolute_quantity."""
+    """Tests for ProductRecipeCreateSerializer (original behavior)."""
 
     def _url(self):
         return '/api/products/product-recipes/'
 
-    def test_suzerain_with_absolute_quantity(self):
-        """Сюзерен: absolute_quantity=80, product_quantity=40 → quantity_per_unit=2."""
-        response = self.client.post(self._url(), {
-            'product': self.product.id,
-            'expense': self.farsh.id,
-            'absolute_quantity': '80.0000',
-            'product_quantity': '40.00',
-        }, format='json')
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        recipe = ProductRecipe.objects.get(
-            product=self.product, expense=self.farsh
-        )
-        self.assertEqual(recipe.absolute_quantity, Decimal('80.0000'))
-        self.assertEqual(recipe.product_quantity, Decimal('40.00'))
-        # quantity_per_unit = 80 / 40 = 2
-        self.assertEqual(recipe.quantity_per_unit, Decimal('2'))
-
-    def test_obyvatel_with_absolute_quantity(self):
-        """Обыватель: proportion рассчитывается от Сюзерена."""
-        # Сначала создаём рецепт Сюзерена
-        ProductRecipe.objects.create(
-            product=self.product,
-            expense=self.farsh,
-            absolute_quantity=Decimal('80'),
-            product_quantity=Decimal('40'),
-        )
-
-        response = self.client.post(self._url(), {
-            'product': self.product.id,
-            'expense': self.luk.id,
-            'absolute_quantity': '40.0000',
-        }, format='json')
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        recipe = ProductRecipe.objects.get(
-            product=self.product, expense=self.luk
-        )
-        # proportion = 40 / 80 = 0.5
-        self.assertEqual(recipe.proportion, Decimal('0.5'))
-
-    def test_suzerain_requires_product_quantity(self):
-        """Сюзерен с absolute_quantity но без product_quantity → ошибка."""
-        response = self.client.post(self._url(), {
-            'product': self.product.id,
-            'expense': self.farsh.id,
-            'absolute_quantity': '80.0000',
-        }, format='json')
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_backward_compat_suzerain_quantity_per_unit(self):
-        """Обратная совместимость: прямой ввод quantity_per_unit."""
+    def test_suzerain_with_quantity_per_unit(self):
+        """Сюзерен: прямой ввод quantity_per_unit."""
         response = self.client.post(self._url(), {
             'product': self.product.id,
             'expense': self.farsh.id,
@@ -191,8 +140,17 @@ class ProductRecipeCreateSerializerTest(BaseV3Test):
         )
         self.assertEqual(recipe.quantity_per_unit, Decimal('2.0000'))
 
-    def test_backward_compat_obyvatel_proportion(self):
-        """Обратная совместимость: прямой ввод proportion."""
+    def test_suzerain_without_quantity_per_unit_fails(self):
+        """Сюзерен без quantity_per_unit → ошибка."""
+        response = self.client.post(self._url(), {
+            'product': self.product.id,
+            'expense': self.farsh.id,
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_obyvatel_with_proportion(self):
+        """Обыватель: прямой ввод proportion."""
         response = self.client.post(self._url(), {
             'product': self.product.id,
             'expense': self.luk.id,
@@ -205,42 +163,20 @@ class ProductRecipeCreateSerializerTest(BaseV3Test):
         )
         self.assertEqual(recipe.proportion, Decimal('0.500'))
 
-    def test_per_volume_obyvatel_with_absolute_quantity(self):
-        """Обыватель per_volume (вода): proportion рассчитывается от Сюзерена."""
-        ProductRecipe.objects.create(
-            product=self.product,
-            expense=self.farsh,
-            absolute_quantity=Decimal('80'),
-            product_quantity=Decimal('40'),
-        )
-
+    def test_obyvatel_without_proportion_fails(self):
+        """Обыватель без proportion → ошибка."""
         response = self.client.post(self._url(), {
             'product': self.product.id,
-            'expense': self.voda.id,
-            'absolute_quantity': '8.0000',
+            'expense': self.luk.id,
         }, format='json')
 
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        recipe = ProductRecipe.objects.get(
-            product=self.product, expense=self.voda
-        )
-        # proportion = 8 / 80 = 0.1
-        self.assertEqual(recipe.proportion, Decimal('0.1'))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_overhead_no_fields_required(self):
-        """Накладной расход — не требует ни proportion, ни quantity_per_unit."""
-        overhead = Expense.objects.create(
-            name='Аренда Тест',
-            expense_type=ExpenseType.OVERHEAD,
-            expense_status=ExpenseStatus.CIVILIAN,
-            expense_state=ExpenseState.AUTOMATIC,
-            apply_type=ApplyType.REGULAR,
-            monthly_amount=Decimal('30000'),
-            is_active=True,
-        )
+    def test_universal_no_fields_required(self):
+        """Универсальный расход — не требует proportion."""
         response = self.client.post(self._url(), {
             'product': self.product.id,
-            'expense': overhead.id,
+            'expense': self.solyarka.id,
         }, format='json')
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)

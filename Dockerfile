@@ -30,5 +30,5 @@ RUN mkdir -p /app/staticfiles /app/media /app/logs && \
 # Expose port
 EXPOSE 8000
 
-# Default command (run as root to avoid permission issues)
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4"]
+# Default command — Daphne (ASGI: HTTP + WebSocket)
+CMD ["daphne", "-b", "0.0.0.0", "-p", "8000", "config.asgi:application"]

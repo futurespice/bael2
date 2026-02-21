@@ -255,7 +255,7 @@ class Store(models.Model):
         max_length=20,
         choices=ApprovalStatus.choices,
         default=ApprovalStatus.APPROVED,  # ✅ Автоматическое одобрение
-        verbose_name='Статус одобрения',
+        verbose_name='Статус     одобрения',
         db_index=True,
         help_text='Магазины автоматически одобряются при создании'
     )

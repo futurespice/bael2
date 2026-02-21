@@ -91,6 +91,7 @@ urlpatterns = [
     path('api/stores/', include('stores.urls')),
     path('api/orders/', include('orders.urls')),
     path('api/reports/', include('reports.urls')),
+    path('api/chats/', include('chats.urls')),
     # path('api/notifications/', include('notifications.urls')),
 
     # Редирект с корня на API документацию
