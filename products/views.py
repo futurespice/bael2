@@ -212,15 +212,29 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['get'], url_path='mechanical-accounting')
     def mechanical_accounting(self, request):
-        """GET /api/products/expenses/mechanical-accounting/"""
-        mechanical_expenses = Expense.objects.filter(
+        """
+        GET /api/products/expenses/mechanical-accounting/
+
+        Возвращает ТОЛЬКО накладные расходы с expense_state=mechanical.
+        Физические расходы (мука, фарш, лук) здесь НЕ отображаются —
+        они управляются через рецепты товаров (ProductRecipe).
+
+        Query params:
+        - apply_type: universal | regular (опционально, без фильтра — все)
+        """
+        queryset = Expense.objects.filter(
+            expense_type='overhead',   # ← ТОЛЬКО накладные (BUG FIX)
             expense_state='mechanical',
-            is_active=True
+            is_active=True,
         ).order_by('name')
 
-        data = []
-        for exp in mechanical_expenses:
-            data.append({
+        # Опциональный фильтр по apply_type
+        apply_type_filter = self.request.query_params.get('apply_type')
+        if apply_type_filter in ('universal', 'regular'):
+            queryset = queryset.filter(apply_type=apply_type_filter)
+
+        data = [
+            {
                 'id': exp.id,
                 'name': exp.name,
                 'expense_type': exp.expense_type,
@@ -229,7 +243,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 'apply_type': exp.apply_type,
                 'monthly_amount': str(exp.monthly_amount),
                 'daily_amount': str(exp.daily_amount),
-            })
+            }
+            for exp in queryset
+        ]
 
         return Response({'mechanical_expenses': data})
 
@@ -880,6 +896,19 @@ class ProductViewSet(viewsets.ModelViewSet):
         # =====================================================================
         # 3. АНАЛИЗИРУЕМ КАЖДЫЙ ТОВАР
         # =====================================================================
+
+        # BUG FIX #3: загружаем ВСЕ рецепты одним bulk-запросом до цикла (N+1 фикс)
+        all_product_ids = [item['product_id'] for item in sales_data]
+        all_recipes = (
+            ProductRecipe.objects
+            .filter(product_id__in=all_product_ids)
+            .select_related('expense')
+        )
+        # Индексируем: {product_id: [recipe, ...]}
+        recipes_by_product: dict = {}
+        for recipe in all_recipes:
+            recipes_by_product.setdefault(recipe.product_id, []).append(recipe)
+
         products_data = []
         
         for item in sales_data:
@@ -897,27 +926,26 @@ class ProductViewSet(viewsets.ModelViewSet):
             # Накладные для этого товара (пропорционально продажам)
             overhead_share = (total_overhead * sales_share / 100).quantize(Decimal('0.01'))
             
-            # Физические расходы
+            # Физические расходы (BUG FIX #3: без дополнительных запросов)
             physical_cost = Decimal('0')
-            suzerain_recipe = ProductRecipe.objects.filter(
-                product_id=product_id,
-                expense__expense_status=ExpenseStatus.SUZERAIN
-            ).select_related('expense').first()
+            product_recipes = recipes_by_product.get(product_id, [])
+            suzerain_recipe = next(
+                (r for r in product_recipes
+                 if r.expense.expense_status == ExpenseStatus.SUZERAIN),
+                None
+            )
             
             if suzerain_recipe and quantity_sold > 0:
                 suzerain_volume = quantity_sold * suzerain_recipe.quantity_per_unit
                 suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
                 physical_cost += suzerain_cost
-                
-                # Остальные физические
-                other_recipes = ProductRecipe.objects.filter(
-                    product_id=product_id,
-                    expense__expense_type=ExpenseType.PHYSICAL
-                ).exclude(
-                    expense__expense_status=ExpenseStatus.SUZERAIN
-                ).select_related('expense')
-                
-                for recipe in other_recipes:
+
+                # Остальные физические (уже загружены выше)
+                for recipe in product_recipes:
+                    if recipe.expense.expense_status == ExpenseStatus.SUZERAIN:
+                        continue
+                    if recipe.expense.expense_type != ExpenseType.PHYSICAL:
+                        continue
                     if recipe.proportion:
                         item_volume = suzerain_volume * recipe.proportion
                         item_cost = item_volume * (recipe.expense.price_per_unit or Decimal('0'))
@@ -992,7 +1020,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         from datetime import date as dt_date, timedelta
         from django.db.models import Sum, Prefetch
         from orders.models import StoreOrderItem, StoreOrderStatus
-        from .models import ProductRecipe, ExpenseStatus, ExpenseType as ET, Expense as ExpModel, ApplyType
+        from .models import ProductRecipe, ExpenseStatus, ExpenseType as ET, Expense as ExpModel, ApplyType, ProductionBatch
 
         period_days = int(request.query_params.get('period_days', 11))
         date_to_param = request.query_params.get('date_to')
@@ -1045,6 +1073,24 @@ class ProductViewSet(viewsets.ModelViewSet):
         sales_by_product = {s['product_id']: s for s in all_sales}
 
         # =====================================================================
+        # 2б. Последняя производственная партия по каждому товару (1 запрос)
+        # Используется для расчёта физических расходов и cost_per_unit,
+        # когда продаж за период = 0 (например, сразу после save-accounting)
+        # =====================================================================
+        latest_batches_by_product: dict = {}
+        for batch in (
+            ProductionBatch.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date,
+            )
+            .select_related('product')
+            .order_by('product_id', '-date', '-created_at')
+        ):
+            # Берём только первую (последнюю) для каждого товара
+            if batch.product_id not in latest_batches_by_product:
+                latest_batches_by_product[batch.product_id] = batch
+
+        # =====================================================================
         # 3. Накладные расходы (1 запрос), разделяем universal vs regular
         # =====================================================================
         overhead_expenses = list(ExpModel.objects.filter(
@@ -1080,6 +1126,13 @@ class ProductViewSet(viewsets.ModelViewSet):
             total_linked = sum(volume_by_product.get(pid, Decimal('0')) for pid in linked)
             regular_linked_volumes[exp.id] = (total_linked, linked)
 
+        # Маппинг unit_type → человекочитаемая подпись для мобильного клиента
+        UNIT_LABELS = {
+            'per_piece': 'шт.',
+            'per_weight': 'кг.',
+            'per_volume': 'л.',
+        }
+
         # =====================================================================
         # 5. Обрабатываем каждый товар (без дополнительных запросов к БД)
         # =====================================================================
@@ -1096,23 +1149,42 @@ class ProductViewSet(viewsets.ModelViewSet):
                 None
             )
 
+            # --- Определяем базовое количество для расчёта физических расходов ---
+            # BUG FIX: раньше физические расходы считались только при qty_sold > 0.
+            # Теперь приоритет:
+            #   1. Если есть продажи — используем qty_sold (исторические данные)
+            #   2. Если есть партия периода — используем batch.quantity_produced
+            #   3. Иначе — 0 (расходы не показываем)
+            latest_batch = latest_batches_by_product.get(product.id)
+            if qty_sold > 0:
+                calc_qty = qty_sold          # данные из реальных продаж
+                qty_source = 'sales'
+            elif latest_batch and latest_batch.quantity_produced > 0:
+                calc_qty = latest_batch.quantity_produced  # данные из партии
+                qty_source = 'batch'
+            else:
+                calc_qty = Decimal('0')
+                qty_source = 'none'
+
             # --- Физические расходы ---
             physical_items = []
             total_physical = Decimal('0')
             sz_vol = Decimal('0')
 
-            if suzerain_recipe and qty_sold > 0:
-                sz_vol = qty_sold * (suzerain_recipe.quantity_per_unit or Decimal('0'))
+            if suzerain_recipe and calc_qty > 0:
+                sz_vol = calc_qty * (suzerain_recipe.quantity_per_unit or Decimal('0'))
                 sz_price = suzerain_recipe.expense.price_per_unit or Decimal('0')
                 sz_cost = (sz_vol * sz_price).quantize(Decimal('0.01'))
                 total_physical += sz_cost
+                sz_unit = suzerain_recipe.expense.unit_type or ''
                 physical_items.append({
                     'id': suzerain_recipe.expense.id,
                     'name': suzerain_recipe.expense.name,
                     'is_suzerain': True,
                     'quantity': float(sz_vol.quantize(Decimal('0.01'))),
                     'unit_price': float(sz_price),
-                    'unit': suzerain_recipe.expense.unit_type or '',
+                    'unit': sz_unit,
+                    'unit_label': UNIT_LABELS.get(sz_unit, ''),
                     'total': float(sz_cost),
                 })
 
@@ -1126,18 +1198,20 @@ class ProductViewSet(viewsets.ModelViewSet):
                         vol = (sz_vol * recipe.proportion).quantize(Decimal('0.01'))
                         cost = (vol * unit_price).quantize(Decimal('0.01'))
                     elif recipe.quantity_per_unit:
-                        vol = (qty_sold * recipe.quantity_per_unit).quantize(Decimal('0.01'))
+                        vol = (calc_qty * recipe.quantity_per_unit).quantize(Decimal('0.01'))
                         cost = (vol * unit_price).quantize(Decimal('0.01'))
                     else:
                         continue
                     total_physical += cost
+                    r_unit = recipe.expense.unit_type or ''
                     physical_items.append({
                         'id': recipe.expense.id,
                         'name': recipe.expense.name,
                         'is_suzerain': False,
                         'quantity': float(vol),
                         'unit_price': float(unit_price),
-                        'unit': recipe.expense.unit_type or '',
+                        'unit': r_unit,
+                        'unit_label': UNIT_LABELS.get(r_unit, ''),
                         'total': float(cost),
                     })
 
@@ -1201,6 +1275,28 @@ class ProductViewSet(viewsets.ModelViewSet):
             total_expense = total_physical + total_overhead
             profit = revenue - total_expense
 
+            # BUG FIX: cost_per_unit вычисляем в приоритете:
+            # 1. Из batch.cost_per_unit (cost=физ+накл) — если партия есть
+            # 2. Текущий период: total_expense / calc_qty
+            # 3. product.average_cost_price — запасной вариант
+            if latest_batch and latest_batch.cost_per_unit > 0:
+                cost_per_unit_val = latest_batch.cost_per_unit
+            elif calc_qty > 0 and total_expense > 0:
+                cost_per_unit_val = (total_expense / calc_qty).quantize(Decimal('0.01'))
+            else:
+                cost_per_unit_val = product.average_cost_price
+
+            # income = что получили за период
+            # если qty_source='batch' (продаж нет) — income и profit расчётные
+            projected_revenue = calc_qty * product.final_price if qty_source == 'batch' else revenue
+            projected_profit = projected_revenue - total_expense
+
+            # profit_per_unit: прибыль на единицу (для столбца «Себе-сть» в таблице)
+            if calc_qty > 0:
+                profit_per_unit_val = (profit / calc_qty).quantize(Decimal('0.01'))
+            else:
+                profit_per_unit_val = Decimal('0')
+
             products_result.append({
                 'id': product.id,
                 'name': product.name,
@@ -1208,10 +1304,18 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'markup_percentage': float(product.markup_percentage),
                 'final_price': float(product.final_price),
                 'quantity_sold': float(qty_sold),
-                'cost_per_unit': float(product.average_cost_price),
+                'quantity_produced': float(latest_batch.quantity_produced) if latest_batch else None,
+                'qty_source': qty_source,  # 'sales' | 'batch' | 'none'
+                'input_mode': latest_batch.input_type if latest_batch else 'quantity',
+                'cost_per_unit': float(cost_per_unit_val),
                 'total_expense': float(total_expense.quantize(Decimal('0.01'))),
+                'total_physical_cost': float(total_physical.quantize(Decimal('0.01'))),
+                'total_overhead_cost': float(total_overhead.quantize(Decimal('0.01'))),
                 'revenue': float(revenue),
+                'projected_revenue': float(projected_revenue.quantize(Decimal('0.01'))),
                 'profit': float(profit.quantize(Decimal('0.01'))),
+                'profit_per_unit': float(profit_per_unit_val),
+                'projected_profit': float(projected_profit.quantize(Decimal('0.01'))),
                 'physical_expenses': physical_items,
                 'overhead_expenses': overhead_items,
                 'recipe_items': recipe_items_data,
@@ -1250,22 +1354,87 @@ class ProductViewSet(viewsets.ModelViewSet):
             ],
             "production_batches": [{"product_id": 1, "input_type": "quantity", "quantity": "200"}]
         }
+
+        Response:
+        {
+            "mechanical_updated": 2,
+            "recipes_saved": 3,
+            "batches_created": 1,
+            "updated_products": [
+                {
+                    "id": 1,
+                    "name": "...",
+                    "cost_per_unit": 79.13,
+                    "markup_percentage": 20.0,
+                    "final_price": 95.0,
+                    "total_physical_cost": 3000.0,
+                    "total_overhead_cost": 1500.0,
+                    "total_cost": 4500.0,
+                    "quantity_produced": 57
+                }
+            ]
+        }
         """
         serializer = AccountingDataSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         try:
-            results = AccountingService.save_accounting_data(
+            save_results = AccountingService.save_accounting_data(
                 mechanical_expenses_data=serializer.validated_data.get('mechanical_expenses', []),
                 recipe_items_data=serializer.validated_data.get('recipe_items', []),
                 production_batches_data=serializer.validated_data.get('production_batches', [])
             )
-            return Response(results)
         except Exception as e:
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        # BUG FIX: возвращаем пересчитанные данные по затронутым товарам
+        # чтобы мобильный клиент не делал дополнительный запрос
+        from .models import ProductionBatch
+        updated_products = []
+        affected_product_ids = set()
+
+        for item in serializer.validated_data.get('production_batches', []):
+            affected_product_ids.add(item['product_id'])
+        for item in serializer.validated_data.get('recipe_items', []):
+            affected_product_ids.add(item['product_id'])
+
+        if affected_product_ids:
+            from datetime import date as _dt
+            today = _dt.today()
+            latest_batches = (
+                ProductionBatch.objects
+                .filter(product_id__in=affected_product_ids)
+                .select_related('product')
+                .order_by('product_id', '-date', '-created_at')
+            )
+            seen = set()
+            for batch in latest_batches:
+                if batch.product_id in seen:
+                    continue
+                seen.add(batch.product_id)
+                # BUG FIX #4: refresh_from_db чтобы получить актуальные значения после update_average_cost_price
+                batch.product.refresh_from_db()
+                updated_products.append({
+                    'id': batch.product_id,
+                    'name': batch.product.name,
+                    'final_price': float(batch.product.final_price),
+                    'average_cost_price': float(batch.product.average_cost_price),
+                    'markup_percentage': float(batch.product.markup_percentage),
+                    'cost_per_unit': float(batch.cost_per_unit),
+                    'total_physical_cost': float(batch.total_physical_cost),
+                    'total_overhead_cost': float(batch.total_overhead_cost),
+                    'total_cost': float(batch.total_physical_cost + batch.total_overhead_cost),
+                    'quantity_produced': float(batch.quantity_produced),
+                    'batch_date': str(batch.date),
+                })
+
+        return Response({
+            **save_results,
+            'updated_products': updated_products,
+        })
 
 
 # =============================================================================

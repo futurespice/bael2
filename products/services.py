@@ -667,9 +667,11 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем количество на складе (ТЗ v3.0)
+        # Обновляем количество на складе и себестоимость (ТЗ v3.0)
         product.stock_quantity += result.quantity_produced
         product.save(update_fields=['stock_quantity'])
+        # BUG FIX #1: обновляем average_cost_price чтобы final_price пересчитался
+        product.update_average_cost_price()
 
         return batch
 
@@ -711,9 +713,11 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем количество на складе (ТЗ v3.0)
+        # Обновляем количество на складе и себестоимость (ТЗ v3.0)
         product.stock_quantity += result.quantity_produced
         product.save(update_fields=['stock_quantity'])
+        # BUG FIX #1: обновляем average_cost_price чтобы final_price пересчитался
+        product.update_average_cost_price()
 
         return batch
 
@@ -737,6 +741,12 @@ class AccountingService:
             except Expense.DoesNotExist:
                 raise ValueError(f"Расход с id={item['expense_id']} не найден")
 
+            # BUG FIX #2: физические расходы не должны попадать в механический учёт
+            if expense.expense_type != 'overhead':
+                raise ValueError(
+                    f"Расход '{expense.name}' (id={expense.id}) является физическим. "
+                    f"В механический учёт передаются ТОЛЬКО накладные расходы."
+                )
             if expense.expense_state != 'mechanical':
                 raise ValueError(
                     f"Расход '{expense.name}' (id={expense.id}) не является механическим "

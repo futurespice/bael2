@@ -206,7 +206,8 @@
 
 ### `GET /api/products/expenses/mechanical-accounting/`
 
-Возвращает **все** расходы с `expense_state = "mechanical"`.
+Возвращает **только накладные** (`expense_type = "overhead"`) расходы с `expense_state = "mechanical"`.
+Физические расходы (ингредиенты) **не** отображаются — они управляются через рецепты товаров (ProductRecipe).
 
 ### Response `200 OK`
 
@@ -215,23 +216,23 @@
   "mechanical_expenses": [
     {
       "id": 5,
-      "name": "Зарплата работников",
+      "name": "Солярка",
       "expense_type": "overhead",
-      "expense_status": "civilian",
+      "expense_status": "vassal",
       "expense_state": "mechanical",
       "apply_type": "universal",
-      "monthly_amount": "50000.00",
-      "daily_amount": "600.00"
+      "monthly_amount": "0.00",
+      "daily_amount": "700.00"
     },
     {
-      "id": 3,
-      "name": "Тесто пельменное",
-      "expense_type": "physical",
-      "expense_status": "civilian",
+      "id": 6,
+      "name": "Обед",
+      "expense_type": "overhead",
+      "expense_status": "vassal",
       "expense_state": "mechanical",
-      "apply_type": "regular",
+      "apply_type": "universal",
       "monthly_amount": "0.00",
-      "daily_amount": "0.00"
+      "daily_amount": "600.00"
     }
   ]
 }
@@ -241,10 +242,10 @@
 
 | Поле | Тип | Описание | Возможные значения |
 |------|-----|----------|-------------------|
-| `expense_type` | string | Тип расхода | `"physical"`, `"overhead"` |
-| `expense_state` | string | Состояние (всегда mechanical тут) | `"automatic"`, `"mechanical"` |
+| `expense_type` | string | Тип расхода (всегда `"overhead"` тут) | `"overhead"` |
+| `expense_state` | string | Состояние (всегда mechanical тут) | `"mechanical"` |
 | `apply_type` | string | Тип применения | `"regular"`, `"universal"` |
-| `monthly_amount` | decimal | Месячная сумма | `"50000.00"` |
+| `monthly_amount` | decimal | Месячная сумма | `"0.00"` |
 
 ### Поля которые были ранее
 
@@ -317,44 +318,60 @@
 
 ### `GET /api/products/products/accounting-table/`
 
-Без изменений в структуре. Для справки:
+⭐ Новые поля: `total_physical_cost`, `total_overhead_cost`, `profit_per_unit`.
 
 ### Response `200 OK`
 
 ```json
 {
+  "period_days": 11,
+  "date_from": "2026-02-13",
+  "date_to": "2026-02-24",
   "products": [
     {
       "id": 2,
       "name": "Котлеты куриные",
       "markup_percentage": 35.0,
+      "final_price": 42.75,
       "cost_per_unit": 31.67,
-      "total_expense": 63433.37,
-      "revenue": 0.0,
-      "profit": -63433.37,
+      "total_expense": 6334.0,
+      "total_physical_cost": 3200.0,
+      "total_overhead_cost": 3134.0,
+      "revenue": 8550.0,
+      "profit": 2216.0,
+      "profit_per_unit": 11.08,
       "physical_expenses": [
         {
           "id": 1,
           "name": "Фарш говяжий",
-          "quantity": 0.02,
+          "is_suzerain": true,
+          "quantity": 400.0,
           "unit_price": 810.0,
-          "total": 16.2,
-          "unit": "per_weight"
+          "unit": "per_weight",
+          "unit_label": "кг.",
+          "total": 3200.0
         }
       ],
       "overhead_expenses": [
         {
           "id": 4,
           "name": "Аренда помещения",
-          "total": 22000.0
+          "apply_type": "universal",
+          "total": 2200.0
+        },
+        {
+          "id": 5,
+          "name": "Солярка",
+          "apply_type": "universal",
+          "total": 934.0
         }
       ]
     }
   ],
-  "grand_totals": {
-    "total_expenses": 126866.73,
-    "total_revenue": 0.0,
-    "net_profit": -126866.73
+  "totals": {
+    "total_expense": 6334.0,
+    "total_revenue": 8550.0,
+    "net_profit": 2216.0
   }
 }
 ```

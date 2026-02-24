@@ -296,69 +296,75 @@ class ProductRecipeNestedSerializer(serializers.ModelSerializer):
     - Overhead / Universal: поля необязательны (только связь)
     """
 
-    # Все поля writable, пустые строки конвертируем в None
+    # proportion — только для чтения, рассчитывается автоматически в ProductRecipe.save().
+    # Прямой ввод через API запрещён (ТЗ bayel_expense_system_final.pdf, раздел «Главная проблема»).
     quantity_per_unit = serializers.DecimalField(
         max_digits=12, decimal_places=4, required=False, allow_null=True
-    )
-    proportion = serializers.DecimalField(
-        max_digits=10, decimal_places=3, required=False, allow_null=True
     )
 
     class Meta:
         model = ProductRecipe
-        fields = ['expense', 'absolute_quantity', 'product_quantity',
-                  'quantity_per_unit', 'proportion']
+        # proportion намеренно исключён из списка: он вычисляется автоматически
+        # на основе absolute_quantity / suzerain.absolute_quantity в ProductRecipe.save().
+        fields = ['expense', 'absolute_quantity', 'product_quantity', 'quantity_per_unit']
 
     def to_internal_value(self, data):
-        """Конвертация пустых строк в None для decimal полей."""
+        """Конвертация пустых строк в None для decimal полей.
+
+        proportion из входящего запроса игнорируется — рассчитывается автоматически.
+        """
         cleaned = {}
         for key, value in data.items():
-            if key in ('quantity_per_unit', 'proportion', 'absolute_quantity', 'product_quantity'):
+            if key in ('quantity_per_unit', 'absolute_quantity', 'product_quantity'):
                 if value == '' or value is None:
                     cleaned[key] = None
                 else:
                     cleaned[key] = value
             else:
                 cleaned[key] = value
+        # Явно удаляем proportion из запроса — защита от случайного прямого ввода
+        cleaned.pop('proportion', None)
         return super().to_internal_value(cleaned)
 
     def validate(self, attrs):
-        """Валидация с поддержкой обоих форматов ввода."""
-        expense = attrs.get('expense')
+        """Валидация полей.
 
+        proportion не принимается из API вообще (удалён из to_internal_value).
+        Рассчитывается автоматически в ProductRecipe.save().
+        """
+        expense = attrs.get('expense')
         has_absolute = bool(attrs.get('absolute_quantity'))
         has_direct_qpu = bool(attrs.get('quantity_per_unit'))
-        has_direct_prop = bool(attrs.get('proportion'))
-
-        # === Формат 1: absolute_quantity (авторасчёт в model.save()) ===
-        if has_absolute:
-            if expense.expense_status == ExpenseStatus.SUZERAIN:
-                if not attrs.get('product_quantity'):
-                    raise serializers.ValidationError({
-                        'product_quantity': 'Для Сюзерена обязателен product_quantity при вводе absolute_quantity'
-                    })
-            return attrs
-
-        # === Формат 2: прямой ввод quantity_per_unit / proportion ===
 
         # Overhead и Universal — поля необязательны (только привязка)
         if expense.expense_type == 'overhead' or expense.apply_type == 'universal':
             return attrs
 
-        # Сюзерен — обязателен quantity_per_unit
+        # Сюзерен: обязателен absolute_quantity+product_quantity или quantity_per_unit
         if expense.expense_status == ExpenseStatus.SUZERAIN:
-            if not has_direct_qpu:
+            if has_absolute:
+                if not attrs.get('product_quantity'):
+                    raise serializers.ValidationError({
+                        'product_quantity': 'Для Сюзерена обязателен product_quantity при вводе absolute_quantity'
+                    })
+            elif not has_direct_qpu:
                 raise serializers.ValidationError({
-                    'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
+                    'absolute_quantity': (
+                        'Сюзерен: введите absolute_quantity + product_quantity '
+                        'или quantity_per_unit напрямую.'
+                    )
                 })
             return attrs
 
-        # Civilian (физический, не-сюзерен) — обязателен proportion
-        if expense.expense_type == 'physical':
-            if not has_direct_prop:
-                raise serializers.ValidationError({
-                    'proportion': 'Физический расход (Civilian) должен иметь пропорцию'
-                })
+        # Civilian (физический, не-сюзерен) — только через absolute_quantity.
+        # proportion рассчитывается автоматически (absolute_quantity / suzerain.absolute_quantity).
+        if expense.expense_type == 'physical' and not has_absolute:
+            raise serializers.ValidationError({
+                'absolute_quantity': (
+                    'Физический расход (Civilian): введите absolute_quantity. '
+                    'proportion рассчитывается автоматически.'
+                )
+            })
 
         return attrs
 
@@ -622,7 +628,12 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         # 2. РЕЦЕПТЫ (REPLACE)
         if recipe_items_data is not None:
             ProductRecipe.objects.filter(product=instance).delete()
-            for item in recipe_items_data:
+            # Сначала Сюзерен — иначе proportion у Civilian не рассчитается
+            suzerain_items = [i for i in recipe_items_data
+                              if i['expense'].expense_status == ExpenseStatus.SUZERAIN]
+            other_items = [i for i in recipe_items_data
+                           if i['expense'].expense_status != ExpenseStatus.SUZERAIN]
+            for item in suzerain_items + other_items:
                 ProductRecipe.objects.create(
                     product=instance,
                     **item
@@ -798,8 +809,13 @@ class ProductCreateSerializer(serializers.ModelSerializer):
                 order=i
             )
 
-        # Создаём рецепты
-        for item in recipe_items_data:
+        # Создаём рецепты: сначала Сюзерен, потом остальные,
+        # иначе proportion не рассчитается для Civilian (Сюзерен ещё не в БД)
+        suzerain_items = [i for i in recipe_items_data
+                          if i['expense'].expense_status == ExpenseStatus.SUZERAIN]
+        other_items = [i for i in recipe_items_data
+                       if i['expense'].expense_status != ExpenseStatus.SUZERAIN]
+        for item in suzerain_items + other_items:
             ProductRecipe.objects.create(
                 product=product,
                 **item

@@ -252,7 +252,11 @@ class Expense(models.Model):
         return f"[{type_str}][{status_str}] {self.name}"
 
     def clean(self):
-        """Валидация полей."""
+        """Валидация полей (вызывается из форм и admin, но НЕ из .save()).
+
+        Авто-определение Вассала дублируется в save() для надёжности при
+        создании через ORM (Expense.objects.create / bulk_create).
+        """
         # Физические должны иметь unit_type и price_per_unit
         if self.expense_type == ExpenseType.PHYSICAL:
             if not self.unit_type:
@@ -260,11 +264,34 @@ class Expense(models.Model):
             if not self.price_per_unit or self.price_per_unit <= 0:
                 raise ValidationError('Физический расход должен иметь цену за единицу')
 
-        # Автоопределение Вассала: overhead + mechanical + universal → vassal
-        if (self.expense_type == ExpenseType.OVERHEAD
-                and self.expense_state == ExpenseState.MECHANICAL
-                and self.apply_type == ApplyType.UNIVERSAL):
+    def save(self, *args, **kwargs):
+        """Авто-определение статуса Вассал перед сохранением.
+
+        Django НЕ вызывает clean() при Model.save() через DRF, поэтому
+        логика дублируется здесь — это единственный надёжный способ
+        гарантировать корректный статус при любом способе создания объекта.
+
+        Правило (ТЗ bayel_expense_system_final.pdf, раздел «Вассал»):
+            overhead + mechanical + universal  →  expense_status = vassal
+        Зарезервировано на будущее:
+            physical  + universal              →  expense_status = vassal
+        """
+        # Накладной + механический + универсальный → Вассал
+        if (
+            self.expense_type == ExpenseType.OVERHEAD
+            and self.expense_state == ExpenseState.MECHANICAL
+            and self.apply_type == ApplyType.UNIVERSAL
+        ):
             self.expense_status = ExpenseStatus.VASSAL
+
+        # Зарезервировано: физический + универсальный → Вассал (будущее)
+        # if (
+        #     self.expense_type == ExpenseType.PHYSICAL
+        #     and self.apply_type == ApplyType.UNIVERSAL
+        # ):
+        #     self.expense_status = ExpenseStatus.VASSAL
+
+        super().save(*args, **kwargs)
 
     def calculate_amount(self, quantity: Decimal = None) -> Decimal:
         """
@@ -280,7 +307,11 @@ class Expense(models.Model):
             # Физический: quantity × price_per_unit
             return (quantity * (self.price_per_unit or Decimal('0'))).quantize(Decimal('0.01'))
         else:
-            # Накладной: daily + monthly/30
+            # Mechanical: пользователь вручную вводит daily_amount на экране учёта.
+            # monthly_amount НЕ учитывается, чтобы избежать двойного подсчёта.
+            if self.expense_state == ExpenseState.MECHANICAL:
+                return self.daily_amount
+            # Automatic: daily_amount + monthly_amount/30
             return self.daily_amount + (self.monthly_amount / 30).quantize(Decimal('0.01'))
 
 
@@ -468,10 +499,25 @@ class Product(models.Model):
         super().save(*args, **kwargs)
 
     def update_average_cost_price(self):
-        """Обновить среднюю себестоимость из ProductionBatch."""
+        """Обновить среднюю себестоимость из ProductionBatch.
+
+        Используем Avg последних 3 партий, а не всех за всё время.
+        Это позволяет цене реагировать на актуальные расходы,
+        а не замораживаться старыми данными.
+        """
         from django.db.models import Avg
 
-        avg = self.production_batches.aggregate(
+        # Берём среднее только по последним 3 партиям (сортировка по умолчанию в модели: -date, -created_at)
+        recent_ids = list(
+            self.production_batches
+            .order_by('-date', '-created_at')
+            .values_list('id', flat=True)[:3]
+        )
+
+        if not recent_ids:
+            return
+
+        avg = self.production_batches.filter(id__in=recent_ids).aggregate(
             avg_cost=Avg('cost_per_unit')
         )['avg_cost']
 
@@ -714,13 +760,15 @@ class ProductionBatch(models.Model):
         return (total / self.quantity_produced).quantize(Decimal('0.01'))
 
     def save(self, *args, **kwargs):
-        """Автоматический расчёт себестоимости."""
+        """Автоматический расчёт себестоимости.
+
+        update_average_cost_price() НЕ вызывается здесь намеренно.
+        Он вызывается в ProductionService после создания партии,
+        чтобы явно контролировать момент обновления цены товара.
+        Прямое создание ProductionBatch.objects.create() НЕ обновляет Product.average_cost_price.
+        """
         self.cost_per_unit = self.calculate_cost_per_unit()
         super().save(*args, **kwargs)
-
-        # Обновляем среднюю себестоимость товара
-        if hasattr(self.product, 'update_average_cost_price'):
-            self.product.update_average_cost_price()
 
 
 # =============================================================================
