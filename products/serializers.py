@@ -160,6 +160,16 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
             'description'
         ]
 
+    def validate_name(self, value):
+        qs = Expense.objects.filter(name__iexact=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                f"Расход с названием '{value}' уже существует."
+            )
+        return value
+
     def validate(self, attrs):
         """Валидация полей."""
         expense_type = attrs.get('expense_type')

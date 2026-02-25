@@ -123,6 +123,7 @@ class Expense(models.Model):
 
     name = models.CharField(
         max_length=200,
+        unique=True,
         verbose_name='Название',
         help_text='Например: Мука, Фарш, Аренда, Зарплата'
     )

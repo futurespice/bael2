@@ -37,7 +37,8 @@ API ENDPOINTS:
 from decimal import Decimal
 from typing import Any, Dict
 from django.db import transaction
-from django.db.models import QuerySet, Q, F  # ✅ Добавлен Q
+from django.db.models import QuerySet, Q, F, Sum  # ✅ Добавлен Q, Sum
+from django.db.models.functions import Coalesce
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -456,23 +457,27 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         # Определяем owner в зависимости от роли
         if request.user.role == 'partner':
-            # Партнёр ОБЯЗАН указать owner_id
+            # Партнёр ОБЯЗАН указать owner_id.
+            # validate_owner_id уже проверил существование и роль,
+            # и сохранил объект в context['_validated_owner'] — берём оттуда.
             owner_id = serializer.validated_data.get('owner_id')
             if not owner_id:
                 return Response(
                     {'error': 'Партнёр должен указать owner_id (пользователь с ролью store)'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-            # Получаем пользователя с ролью store
-            from users.models import User
-            try:
-                owner = User.objects.get(id=owner_id, role='store')
-            except User.DoesNotExist:
-                return Response(
-                    {'error': 'Пользователь не найден или не имеет роль store'},
-                    status=status.HTTP_404_NOT_FOUND
-                )
+            # Берём из context — без лишнего запроса к БД
+            owner = serializer.context.get('_validated_owner')
+            if not owner:
+                # Fallback на случай если context не прокинулся
+                from users.models import User
+                try:
+                    owner = User.objects.get(id=owner_id, role='store')
+                except User.DoesNotExist:
+                    return Response(
+                        {'error': 'Пользователь не найден или не имеет роль store'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
         else:
             # Для role='store' — owner = сам пользователь
             owner = request.user
@@ -1163,13 +1168,21 @@ class StoreViewSet(viewsets.ModelViewSet):
                     remaining_to_remove = Decimal('0')
 
         # =====================================================================
-        # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ
+        # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ (один агрегационный запрос + bulk_update)
         # =====================================================================
-        for order in orders:
-            order.refresh_from_db()
-            new_total = sum(item.total for item in order.items.all())
-            order.total_amount = new_total
-            order.save(update_fields=['total_amount'])
+        # Один запрос вместо N*2
+        order_totals_map = {
+            row['order_id']: row['total']
+            for row in StoreOrderItem.objects.filter(order__in=orders)
+            .values('order_id')
+            .annotate(total=Coalesce(Sum('total'), Decimal('0')))
+        }
+
+        orders_to_update = list(orders)
+        for order in orders_to_update:
+            order.total_amount = order_totals_map.get(order.id, Decimal('0'))
+
+        StoreOrder.objects.bulk_update(orders_to_update, ['total_amount'])
 
         # =====================================================================
         # 4. ВОЗВРАЩАЕМ ОБНОВЛЁННУЮ КОРЗИНУ

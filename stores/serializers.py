@@ -271,7 +271,8 @@ class StoreCreateSerializer(serializers.ModelSerializer):
                     'Партнёр должен указать owner_id (пользователь с ролью store)'
                 )
 
-            # Проверяем существование пользователя
+            # Проверяем существование пользователя и сохраняем в context
+            # чтобы view не делал повторный запрос
             try:
                 from users.models import User
                 owner = User.objects.get(id=value)
@@ -280,6 +281,10 @@ class StoreCreateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         f'Пользователь {owner.email} не имеет роль "store"'
                     )
+
+                # Кешируем объект — view возьмёт его отсюда, без повторного запроса
+                self.context['_validated_owner'] = owner
+
             except User.DoesNotExist:
                 raise serializers.ValidationError(
                     f'Пользователь с ID {value} не найден'
@@ -317,16 +322,9 @@ class StoreCreateSerializer(serializers.ModelSerializer):
 
         return attrs
 
-    def create(self, validated_data):
-        """
-        Создание магазина с автоматической установкой owner (v3.0).
-        """
-        # 🔴 v3.0: Автоматически устанавливаем owner = текущий пользователь
-        request = self.context.get('request')
-        if request and hasattr(request, 'user'):
-            validated_data['owner'] = request.user
-            
-        return super().create(validated_data)
+    # create() намеренно не переопределяется здесь.
+    # Создание магазина выполняется через StoreService.create_store() в views.py,
+    # который принимает owner отдельно (для партнёров — из owner_id, для store — self).
 
 
 class StoreUpdateSerializer(serializers.ModelSerializer):
