@@ -138,6 +138,33 @@ class ExpenseSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate_name(self, value):
+        qs = Expense.objects.filter(name__iexact=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                f"Расход с названием '{value}' уже существует."
+            )
+        return value
+
+    def validate(self, attrs):
+        # Для PATCH: expense_type берём из instance если не передан
+        expense_type = attrs.get('expense_type')
+        if expense_type is None and self.instance:
+            expense_type = self.instance.expense_type
+        expense_state = attrs.get('expense_state')
+        if expense_state is None and self.instance:
+            expense_state = self.instance.expense_state
+
+        # Физический расход не может быть механическим
+        if expense_type == ExpenseType.PHYSICAL and expense_state == 'mechanical':
+            raise serializers.ValidationError({
+                'expense_state': 'Физический расход не может иметь состояние "Механическое". '
+                                 'Механический учёт доступен только для накладных расходов.'
+            })
+        return attrs
+
 
 class ExpenseCreateSerializer(serializers.ModelSerializer):
     """Создание расхода."""
@@ -183,6 +210,12 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
             if not attrs.get('price_per_unit') or attrs.get('price_per_unit') <= 0:
                 raise serializers.ValidationError({
                     'price_per_unit': 'Физический расход должен иметь цену за единицу'
+                })
+            # Физический расход не может быть механическим (mechanical — только для накладных)
+            if attrs.get('expense_state') == 'mechanical':
+                raise serializers.ValidationError({
+                    'expense_state': 'Физический расход не может иметь состояние "Механическое". '
+                                     'Механический учёт доступен только для накладных расходов.'
                 })
 
         # Запрет прямого выбора статуса vassal — доступны только suzerain и civilian
