@@ -218,17 +218,23 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
                                      'Механический учёт доступен только для накладных расходов.'
                 })
 
-        # Запрет прямого выбора статуса vassal — доступны только suzerain и civilian
-        if attrs.get('expense_status') == ExpenseStatus.VASSAL:
-            raise serializers.ValidationError({
-                'expense_status': 'Статус Вассал устанавливается автоматически. Выберите Сюзерен или Обыватель.'
-            })
-
         # Автоопределение Вассала: overhead + mechanical + universal → vassal
-        if (attrs.get('expense_type') == 'overhead'
-                and attrs.get('expense_state') == 'mechanical'
-                and attrs.get('apply_type') == 'universal'):
+        # Это условие всегда перекрывает любое значение expense_status от клиента
+        is_vassal_combination = (
+            attrs.get('expense_type') == 'overhead'
+            and attrs.get('expense_state') == 'mechanical'
+            and attrs.get('apply_type') == 'universal'
+        )
+        if is_vassal_combination:
             attrs['expense_status'] = ExpenseStatus.VASSAL
+        elif attrs.get('expense_status') == ExpenseStatus.VASSAL:
+            # Клиент явно указал vassal, но комбинация полей не соответствует
+            raise serializers.ValidationError({
+                'expense_status': (
+                    'Статус Вассал устанавливается автоматически только при: '
+                    'expense_type=overhead, expense_state=mechanical, apply_type=universal.'
+                )
+            })
 
         return attrs
 
