@@ -215,6 +215,9 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
         )
         if is_vassal_combination:
             attrs['expense_status'] = ExpenseStatus.VASSAL
+            # При создании вассала платы не требуются — они будут записаны через механический учёт
+            attrs['monthly_amount'] = Decimal('0')
+            attrs['daily_amount'] = Decimal('0')
         elif attrs.get('expense_status') == ExpenseStatus.VASSAL:
             # Клиент явно указал vassal, но комбинация полей не соответствует
             raise serializers.ValidationError({
