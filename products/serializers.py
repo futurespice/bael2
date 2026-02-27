@@ -157,12 +157,6 @@ class ExpenseSerializer(serializers.ModelSerializer):
         if expense_state is None and self.instance:
             expense_state = self.instance.expense_state
 
-        # Физический расход не может быть механическим
-        if expense_type == ExpenseType.PHYSICAL and expense_state == 'mechanical':
-            raise serializers.ValidationError({
-                'expense_state': 'Физический расход не может иметь состояние "Механическое". '
-                                 'Механический учёт доступен только для накладных расходов.'
-            })
         return attrs
 
 
@@ -210,12 +204,6 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
             if not attrs.get('price_per_unit') or attrs.get('price_per_unit') <= 0:
                 raise serializers.ValidationError({
                     'price_per_unit': 'Физический расход должен иметь цену за единицу'
-                })
-            # Физический расход не может быть механическим (mechanical — только для накладных)
-            if attrs.get('expense_state') == 'mechanical':
-                raise serializers.ValidationError({
-                    'expense_state': 'Физический расход не может иметь состояние "Механическое". '
-                                     'Механический учёт доступен только для накладных расходов.'
                 })
 
         # Автоопределение Вассала: overhead + mechanical + universal → vassal
