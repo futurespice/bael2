@@ -336,45 +336,35 @@ class ProductRecipeNestedSerializer(serializers.ModelSerializer):
     - Overhead / Universal: поля необязательны (только связь)
     """
 
-    # proportion — только для чтения, рассчитывается автоматически в ProductRecipe.save().
-    # Прямой ввод через API запрещён (ТЗ bayel_expense_system_final.pdf, раздел «Главная проблема»).
     quantity_per_unit = serializers.DecimalField(
         max_digits=12, decimal_places=4, required=False, allow_null=True
+    )
+    proportion = serializers.DecimalField(
+        max_digits=10, decimal_places=3, required=False, allow_null=True
     )
 
     class Meta:
         model = ProductRecipe
-        # proportion намеренно исключён из списка: он вычисляется автоматически
-        # на основе absolute_quantity / suzerain.absolute_quantity в ProductRecipe.save().
-        fields = ['expense', 'absolute_quantity', 'product_quantity', 'quantity_per_unit']
+        fields = ['expense', 'absolute_quantity', 'product_quantity', 'quantity_per_unit', 'proportion']
 
     def to_internal_value(self, data):
-        """Конвертация пустых строк в None для decimal полей.
-
-        proportion из входящего запроса игнорируется — рассчитывается автоматически.
-        """
+        """Конвертация пустых строк в None для decimal полей."""
         cleaned = {}
         for key, value in data.items():
-            if key in ('quantity_per_unit', 'absolute_quantity', 'product_quantity'):
+            if key in ('quantity_per_unit', 'absolute_quantity', 'product_quantity', 'proportion'):
                 if value == '' or value is None:
                     cleaned[key] = None
                 else:
                     cleaned[key] = value
             else:
                 cleaned[key] = value
-        # Явно удаляем proportion из запроса — защита от случайного прямого ввода
-        cleaned.pop('proportion', None)
         return super().to_internal_value(cleaned)
 
     def validate(self, attrs):
-        """Валидация полей.
-
-        proportion не принимается из API вообще (удалён из to_internal_value).
-        Рассчитывается автоматически в ProductRecipe.save().
-        """
         expense = attrs.get('expense')
         has_absolute = bool(attrs.get('absolute_quantity'))
         has_direct_qpu = bool(attrs.get('quantity_per_unit'))
+        has_proportion = bool(attrs.get('proportion'))
 
         # Overhead и Universal — поля необязательны (только привязка)
         if expense.expense_type == 'overhead' or expense.apply_type == 'universal':
@@ -396,13 +386,11 @@ class ProductRecipeNestedSerializer(serializers.ModelSerializer):
                 })
             return attrs
 
-        # Civilian (физический, не-сюзерен) — только через absolute_quantity.
-        # proportion рассчитывается автоматически (absolute_quantity / suzerain.absolute_quantity).
-        if expense.expense_type == 'physical' and not has_absolute:
+        # Civilian (физический): proportion напрямую или absolute_quantity
+        if expense.expense_type == 'physical' and not has_absolute and not has_proportion:
             raise serializers.ValidationError({
-                'absolute_quantity': (
-                    'Физический расход (Civilian): введите absolute_quantity. '
-                    'proportion рассчитывается автоматически.'
+                'proportion': (
+                    'Физический расход (Civilian): введите proportion или absolute_quantity.'
                 )
             })
 
