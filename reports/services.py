@@ -573,6 +573,7 @@ class ReportService:
                 status=DefectiveProduct.DefectStatus.APPROVED
             ).select_related('product')
 
+            defect_total = Decimal('0')
             for defect in defects:
                 day_data['defective_products'].append({
                     'name': defect.product.name,
@@ -580,6 +581,10 @@ class ReportService:
                     'amount': float(defect.total_amount),
                     'reason': defect.reason,
                 })
+                defect_total += defect.total_amount
+
+            # Вычитаем одобренный брак из долга
+            day_data['total_debt'] -= float(defect_total)
 
             # Погашения долга по этому заказу
             debt_payments_list = day_data.get('debt_payments', [])
