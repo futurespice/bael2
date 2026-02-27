@@ -120,13 +120,9 @@ class CanAccessStore(permissions.BasePermission):
         if user.role == 'store' and obj.owner == user:
             return True
         
-        # Партнер видит магазины, с которыми работает
+        # Партнёр видит все активные магазины (как в get_queryset)
         if user.role == 'partner':
-            from orders.models import StoreOrder
-            return StoreOrder.objects.filter(
-                partner=user,
-                store=obj
-            ).exists()
+            return obj.is_active
         
         return False
 
