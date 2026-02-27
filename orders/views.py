@@ -29,8 +29,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
 from drf_spectacular.utils import extend_schema_view, extend_schema, OpenApiParameter, OpenApiResponse
 from stores.models import Store
 from stores.services import StoreSelectionService
@@ -1355,7 +1353,6 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
             }
         }
     )
-    @method_decorator(cache_page(60 * 5))
     @action(detail=False, methods=['get'])
     def statistics(self, request):
         """

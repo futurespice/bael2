@@ -17,8 +17,6 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import models, transaction
 from django.shortcuts import get_object_or_404
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
 
@@ -382,11 +380,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             return ProductDetailSerializer
         return ProductListSerializer
 
-    @method_decorator(cache_page(60 * 15))
     def list(self, request, *args, **kwargs):
-        """
-        Список товаров (кеш 15 минут).
-        """
         return super().list(request, *args, **kwargs)
 
     def get_queryset(self):

@@ -12,8 +12,6 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
-from django.views.decorators.cache import cache_page
-from django.utils.decorators import method_decorator
 
 from stores.models import Store
 from .serializers import ReportFiltersSerializer, StoreHistoryFiltersSerializer, PartnerStoreSerializer, PartnerTrackerOrderSerializer, PartnerStatisticsSerializer, PartnerProfileSerializer
@@ -40,7 +38,6 @@ from django.db.models import Q, Max, Count
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-@cache_page(60 * 5)
 def get_statistics(request: Request) -> Response:
     """
     Получить статистику с круговой диаграммой (ТЗ v2.0).
@@ -117,7 +114,6 @@ def get_statistics(request: Request) -> Response:
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-@cache_page(60 * 5)
 def get_store_history(request: Request, store_id: int) -> Response:
     """
     История магазина с фильтрацией по дате (ТЗ v2.0).
@@ -222,7 +218,6 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
             200: PartnerStatisticsSerializer,
         }
     )
-    @method_decorator(cache_page(60 * 5))
     def list(self, request):
         """Получить статистику партнёра."""
         from datetime import datetime
@@ -367,7 +362,6 @@ class PartnerProfileViewSet(viewsets.ViewSet):
             200: PartnerProfileSerializer,
         }
     )
-    @method_decorator(cache_page(60 * 5))
     def list(self, request):
         """Получить профиль партнёра."""
         from datetime import datetime
