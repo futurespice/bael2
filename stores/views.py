@@ -229,7 +229,7 @@ class RegionViewSet(viewsets.ModelViewSet):
     ТЗ v2.0: "Области и города управляются админом"
     """
 
-    queryset = Region.objects.all()
+    queryset = Region.objects.prefetch_related('cities', 'stores')
     serializer_class = RegionSerializer
     permission_classes = [IsAdminOrReadOnly]
     pagination_class = StandardPagination
@@ -272,7 +272,7 @@ class CityViewSet(viewsets.ModelViewSet):
     ТЗ v2.0: "Города управляются админом"
     """
 
-    queryset = City.objects.select_related('region').all()
+    queryset = City.objects.select_related('region').prefetch_related('stores')
     serializer_class = CitySerializer
     permission_classes = [IsAdminOrReadOnly]
     pagination_class = StandardPagination

@@ -57,7 +57,11 @@ class ChatSerializer(serializers.ModelSerializer):
     def get_unread_count(self, obj):
         request = self.context.get('request')
         if request:
-            return obj.messages.filter(is_read=False).exclude(sender=request.user).count()
+            # messages prefetch_related уже загружен в get_queryset — фильтруем в Python
+            return sum(
+                1 for m in obj.messages.all()
+                if not m.is_read and m.sender_id != request.user.id
+            )
         return 0
 
 

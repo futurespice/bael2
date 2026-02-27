@@ -369,7 +369,7 @@ class ProductViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [IsAuthenticated]
-    queryset = Product.objects.all().prefetch_related('images', 'recipe_items__expense')
+    queryset = Product.objects.all()
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     pagination_class = StandardPagination
 
@@ -380,12 +380,15 @@ class ProductViewSet(viewsets.ModelViewSet):
             return ProductDetailSerializer
         return ProductListSerializer
 
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
-
     def get_queryset(self):
         """Фильтрация."""
         queryset = super().get_queryset()
+
+        # Prefetch только нужных связей в зависимости от action
+        if self.action == 'list':
+            queryset = queryset.prefetch_related('images')
+        else:
+            queryset = queryset.prefetch_related('images', 'recipe_items__expense')
 
         # Для не-админов показываем только активные
         if self.request.user.role != 'admin':

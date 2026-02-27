@@ -594,31 +594,38 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
     def list(self, request, *args, **kwargs):
         """Список магазинов."""
         from orders.models import StoreOrder, DebtPayment
+        from django.db.models import Count, Max
 
         queryset = self.get_queryset()
+        store_ids = list(queryset.values_list('id', flat=True))
 
-        # Формируем ответ
+        # Bulk-fetch: 1 запрос вместо N
+        orders_counts = dict(
+            StoreOrder.objects.filter(
+                store_id__in=store_ids,
+                confirmed_by=request.user
+            ).values('store_id').annotate(count=Count('id')).values_list('store_id', 'count')
+        )
+
+        # Bulk-fetch: 1 запрос вместо N (DebtPayment → order → store)
+        last_payments = dict(
+            DebtPayment.objects.filter(
+                order__store_id__in=store_ids
+            ).values('order__store_id').annotate(
+                last_paid=Max('created_at')
+            ).values_list('order__store_id', 'last_paid')
+        )
+
         data = []
         for store in queryset:
-            # Получаем количество заказов
-            orders_count = StoreOrder.objects.filter(
-                store=store,
-                confirmed_by=request.user
-            ).count()
-
-            # Получаем последнюю дату погашения
-            last_payment = DebtPayment.objects.filter(
-                store=store
-            ).order_by('-paid_at').first()
-
             data.append({
                 'id': store.id,
                 'name': store.name,
                 'inn': store.inn,
                 'total_debt': str(store.total_debt),
                 'paid_debt': str(store.paid_debt),
-                'last_payment_date': last_payment.paid_at if last_payment else None,
-                'orders_count': orders_count,
+                'last_payment_date': last_payments.get(store.id),
+                'orders_count': orders_counts.get(store.id, 0),
             })
 
         return Response(data)

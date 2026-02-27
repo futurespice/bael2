@@ -178,7 +178,7 @@ class StoreOrderListSerializer(serializers.ModelSerializer):
 
         Формат: "Запрос на 900 шт 20кг"
         """
-        items = obj.items.select_related('product').all()
+        items = obj.items.all()  # использует prefetch_related из get_queryset
 
         piece_count = 0
         weight_total = Decimal('0')
@@ -205,7 +205,7 @@ class StoreOrderListSerializer(serializers.ModelSerializer):
 
     def get_piece_count(self, obj: StoreOrder) -> int:
         """Количество штучных товаров."""
-        items = obj.items.select_related('product').all()
+        items = obj.items.all()  # использует prefetch_related из get_queryset
         return sum(
             int(item.quantity)
             for item in items
@@ -214,7 +214,7 @@ class StoreOrderListSerializer(serializers.ModelSerializer):
 
     def get_weight_total(self, obj: StoreOrder) -> str:
         """Общий вес весовых товаров."""
-        items = obj.items.select_related('product').all()
+        items = obj.items.all()  # использует prefetch_related из get_queryset
         total = sum(
             item.quantity
             for item in items
@@ -226,7 +226,7 @@ class StoreOrderListSerializer(serializers.ModelSerializer):
 
     def get_items_count(self, obj: StoreOrder) -> int:
         """Общее количество позиций в заказе."""
-        return obj.items.count()
+        return len(obj.items.all())  # использует prefetch_related, не делает COUNT запрос
 
 
 class StoreOrderDetailSerializer(serializers.ModelSerializer):
@@ -453,7 +453,7 @@ class StoreOrderForStoreListSerializer(serializers.ModelSerializer):
 
     def get_items_summary(self, obj: StoreOrder) -> str:
         """Генерация сводки по товарам."""
-        items = obj.items.select_related('product').all()
+        items = obj.items.all()  # использует prefetch_related из my_orders queryset
 
         piece_count = 0
         weight_total = Decimal('0')
@@ -481,7 +481,7 @@ class StoreOrderForStoreListSerializer(serializers.ModelSerializer):
         """Количество штучных товаров."""
         return sum(
             int(item.quantity)
-            for item in obj.items.select_related('product').all()
+            for item in obj.items.all()  # использует prefetch_related
             if not item.product.is_weight_based
         )
 
@@ -489,7 +489,7 @@ class StoreOrderForStoreListSerializer(serializers.ModelSerializer):
         """Общий вес весовых товаров."""
         total = sum(
             item.quantity
-            for item in obj.items.select_related('product').all()
+            for item in obj.items.all()  # использует prefetch_related
             if item.product.is_weight_based
         )
         if total == int(total):
@@ -498,7 +498,7 @@ class StoreOrderForStoreListSerializer(serializers.ModelSerializer):
 
     def get_items_count(self, obj: StoreOrder) -> int:
         """Общее количество позиций."""
-        return obj.items.count()
+        return len(obj.items.all())  # использует prefetch_related, не делает COUNT запрос
 
 
 class StoreOrderDetailForStoreSerializer(serializers.ModelSerializer):
@@ -1062,7 +1062,7 @@ class PartnerRequestListSerializer(serializers.Serializer):
     def get_items_count(self, obj) -> int:
         """Количество товаров."""
         if hasattr(obj, 'items'):
-            return obj.items.count()
+            return len(obj.items.all())  # использует prefetch_related
         return 0
 
 
