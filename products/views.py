@@ -655,7 +655,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             expense__expense_status=ExpenseStatus.SUZERAIN
         ).select_related('expense').first()
 
-        if suzerain_recipe and quantity_sold > 0:
+        if suzerain_recipe and quantity_sold > 0 and suzerain_recipe.quantity_per_unit:
             suzerain_volume = quantity_sold * suzerain_recipe.quantity_per_unit
             suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
             total_physical += suzerain_cost
@@ -932,7 +932,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 None
             )
             
-            if suzerain_recipe and quantity_sold > 0:
+            if suzerain_recipe and quantity_sold > 0 and suzerain_recipe.quantity_per_unit:
                 suzerain_volume = quantity_sold * suzerain_recipe.quantity_per_unit
                 suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
                 physical_cost += suzerain_cost
@@ -1154,11 +1154,11 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
 
             # --- Определяем базовое количество для расчёта физических расходов ---
-            # BUG FIX: раньше физические расходы считались только при qty_sold > 0.
-            # Теперь приоритет:
+            # Приоритет:
             #   1. Если есть продажи — используем qty_sold (исторические данные)
             #   2. Если есть партия периода — используем batch.quantity_produced
-            #   3. Иначе — 0 (расходы не показываем)
+            #   3. Если есть остаток на складе — используем stock_quantity (фолбек)
+            #   4. Иначе — 0 (расходы не показываем)
             latest_batch = latest_batches_by_product.get(product.id)
             if qty_sold > 0:
                 calc_qty = qty_sold          # данные из реальных продаж
@@ -1166,6 +1166,9 @@ class ProductViewSet(viewsets.ModelViewSet):
             elif latest_batch and latest_batch.quantity_produced > 0:
                 calc_qty = latest_batch.quantity_produced  # данные из партии
                 qty_source = 'batch'
+            elif product.stock_quantity > 0:
+                calc_qty = product.stock_quantity  # фолбек: остаток на складе
+                qty_source = 'stock'
             else:
                 calc_qty = Decimal('0')
                 qty_source = 'none'
@@ -1266,7 +1269,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 if total_linked_vol > 0:
                     share = product_volume / total_linked_vol
                 else:
-                    share = Decimal('1') / len(linked_ids)
+                    share = Decimal('1') / max(len(linked_ids), 1)
                 product_share = (exp_period_total * share).quantize(Decimal('0.01'))
                 total_overhead += product_share
                 overhead_items.append({
@@ -1289,8 +1292,8 @@ class ProductViewSet(viewsets.ModelViewSet):
                 cost_per_unit_val = product.average_cost_price
 
             # income = что получили за период
-            # если qty_source='batch' (продаж нет) — income и profit расчётные
-            projected_revenue = calc_qty * product.final_price if qty_source == 'batch' else revenue
+            # если qty_source='batch'/'stock' (продаж нет) — income и profit расчётные
+            projected_revenue = calc_qty * product.final_price if qty_source in ('batch', 'stock') else revenue
             projected_profit = projected_revenue - total_expense
 
             # profit_per_unit: прибыль на единицу (для столбца «Себе-сть» в таблице)
@@ -1306,8 +1309,12 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'markup_percentage': float(product.markup_percentage),
                 'final_price': float(product.final_price),
                 'quantity_sold': float(qty_sold),
-                'quantity_produced': float(latest_batch.quantity_produced) if latest_batch else None,
-                'qty_source': qty_source,  # 'sales' | 'batch' | 'none'
+                'quantity_produced': (
+                    float(latest_batch.quantity_produced) if latest_batch
+                    else float(product.stock_quantity) if qty_source == 'stock'
+                    else None
+                ),
+                'qty_source': qty_source,  # 'sales' | 'batch' | 'stock' | 'none'
                 'input_mode': latest_batch.input_type if latest_batch else 'quantity',
                 'cost_per_unit': float(cost_per_unit_val),
                 'total_expense': float(total_expense.quantize(Decimal('0.01'))),

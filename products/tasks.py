@@ -158,7 +158,7 @@ def recalculate_costs_by_sales():
                 expense__expense_status=ExpenseStatus.SUZERAIN
             ).select_related('expense').first()
 
-            if suzerain_recipe and sales_quantity > 0:
+            if suzerain_recipe and sales_quantity > 0 and suzerain_recipe.quantity_per_unit:
                 # Объём сюзерена = количество × норма на единицу
                 suzerain_volume = sales_quantity * suzerain_recipe.quantity_per_unit
                 suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))

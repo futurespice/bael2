@@ -130,7 +130,12 @@ class ProductionCalculator:
         if not suzerain_item:
             raise ValueError(f'У товара {product.name} нет Сюзерена')
 
-        suzerain_quantity = quantity * (suzerain_item.quantity_per_unit or Decimal('0'))
+        if not suzerain_item.quantity_per_unit or suzerain_item.quantity_per_unit <= 0:
+            raise ValueError(
+                f'У Сюзерена "{suzerain_item.expense.name}" не задана норма на единицу '
+                f'(quantity_per_unit). Обновите рецепт товара.'
+            )
+        suzerain_quantity = quantity * suzerain_item.quantity_per_unit
 
         return cls._calculate_expenses(
             product=product,
@@ -163,7 +168,12 @@ class ProductionCalculator:
         if not suzerain_item:
             raise ValueError(f'У товара {product.name} нет Сюзерена')
 
-        quantity = suzerain_quantity / (suzerain_item.quantity_per_unit or Decimal('1'))
+        if not suzerain_item.quantity_per_unit or suzerain_item.quantity_per_unit <= 0:
+            raise ValueError(
+                f'У Сюзерена "{suzerain_item.expense.name}" не задана норма на единицу '
+                f'(quantity_per_unit). Обновите рецепт товара.'
+            )
+        quantity = suzerain_quantity / suzerain_item.quantity_per_unit
 
         return cls._calculate_expenses(
             product=product,
@@ -232,7 +242,8 @@ class ProductionCalculator:
                 ))
             elif item.quantity_per_unit:
                 # Универсальный физический (пленка): quantity_per_unit задан напрямую
-                item_quantity = (suzerain_quantity / (suzerain_item.quantity_per_unit or Decimal('1'))) * item.quantity_per_unit
+                # Используем quantity напрямую, т.к. suzerain_quantity / suzerain_qpu = quantity
+                item_quantity = quantity * item.quantity_per_unit
                 item_cost = (
                     item_quantity * (item.expense.price_per_unit or Decimal('0'))
                 ).quantize(Decimal('0.01'))
@@ -521,16 +532,17 @@ class OverheadDistributor:
         total_volume_all = sum(volume_by_product_id.values()) or Decimal('0')
 
         # Объём текущего товара
-        product_volume = volume_by_product_id.get(product.id)
-        if product_volume is None:
-            # Товар ещё не продавался — берём текущую партию как заглушку
-            product_volume = quantity_produced
-            total_volume_all += product_volume
+        product_volume = volume_by_product_id.get(product.id, Decimal('0'))
 
         # Глобальная доля товара среди всех (для universal)
         if total_volume_all > 0:
+            # Есть реальные продажи — распределяем пропорционально.
+            # Если этот товар не продавался, его доля = 0 (overhead не добавляем).
+            # Это корректно: накладные несут те, кто генерирует выручку.
             universal_share = product_volume / total_volume_all
         else:
+            # Нет продаж ни у кого — делим overhead поровну между активными товарами.
+            # Раньше здесь добавляли quantity_produced в total_volume_all → доля = 100% (БАГ).
             active_count = Product.objects.filter(is_active=True).count() or 1
             universal_share = Decimal('1') / active_count
 
@@ -566,7 +578,7 @@ class OverheadDistributor:
                 if total_linked_vol > 0:
                     regular_share = volume_by_product_id.get(product.id, Decimal('0')) / total_linked_vol
                 else:
-                    regular_share = Decimal('1') / len(linked_ids)
+                    regular_share = Decimal('1') / max(len(linked_ids), 1)
                 product_share = (expense_amount * regular_share).quantize(Decimal('0.01'))
 
             breakdown.append(ExpenseItem(
@@ -685,10 +697,21 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем количество на складе и себестоимость (ТЗ v3.0)
-        product.stock_quantity += result.quantity_produced
+        # Обновляем склад.
+        # Если это ПЕРВАЯ партия для этого товара (stock_quantity был задан вручную
+        # через API/Django admin без системы партий), сбрасываем ручной остаток,
+        # чтобы партия стала единственным авторитетным источником.
+        # Иначе — просто добавляем к текущему складу.
+        has_prev_batches = ProductionBatch.objects.filter(
+            product=product
+        ).exclude(pk=batch.pk).exists()
+
+        if not has_prev_batches and product.stock_quantity > 0:
+            product.stock_quantity = result.quantity_produced
+        else:
+            product.stock_quantity += result.quantity_produced
+
         product.save(update_fields=['stock_quantity'])
-        # BUG FIX #1: обновляем average_cost_price чтобы final_price пересчитался
         product.update_average_cost_price()
 
         return batch
@@ -731,10 +754,18 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем количество на складе и себестоимость (ТЗ v3.0)
-        product.stock_quantity += result.quantity_produced
+        # Аналогично create_batch_from_quantity: если это первая партия
+        # и stock_quantity был задан вручную — заменяем, а не добавляем.
+        has_prev_batches = ProductionBatch.objects.filter(
+            product=product
+        ).exclude(pk=batch.pk).exists()
+
+        if not has_prev_batches and product.stock_quantity > 0:
+            product.stock_quantity = result.quantity_produced
+        else:
+            product.stock_quantity += result.quantity_produced
+
         product.save(update_fields=['stock_quantity'])
-        # BUG FIX #1: обновляем average_cost_price чтобы final_price пересчитался
         product.update_average_cost_price()
 
         return batch
@@ -829,9 +860,51 @@ class AccountingService:
             )
             results['recipes_saved'] += 1
 
-        # 3. Создать производственные партии (ДОБАВЛЯЮТСЯ к существующим)
+        # 3a. Авто-создание партий из котлованских recipe_items.
+        #
+        # Когда пользователь в котлованском режиме пишет "200 пельменей" (product_quantity),
+        # система должна сразу создать ProductionBatch и обновить склад.
+        # Если партия для этого товара на сегодня уже есть — перезаписываем (overwrite-режим):
+        #   - удаляем старую (через delete() автоматически вычитается stock_quantity)
+        #   - создаём новую с новым количеством
+        #
+        # Это позволяет корректировать: написал 200, потом изменил на 150 — на складе станет 150.
+
+        today = date.today()
+        # Собираем: product_id → product_quantity для суверенов с product_quantity
+        auto_batch_products: dict = {}
+        for item in sorted_recipe_items:
+            if expense_statuses.get(item['expense_id']) == ExpenseStatus.SUZERAIN:
+                pq = item.get('product_quantity')
+                if pq is not None and Decimal(str(pq)) > 0:
+                    auto_batch_products[item['product_id']] = Decimal(str(pq))
+
+        # ID товаров, для которых явно передан production_batches (не трогаем их auto-логикой)
+        explicit_batch_product_ids = {item['product_id'] for item in production_batches_data}
+
+        for product_id, product_quantity in auto_batch_products.items():
+            if product_id in explicit_batch_product_ids:
+                continue  # явная партия приоритетнее авто-режима
+
+            # Удаляем существующие партии за сегодня (перезапись)
+            existing_today = ProductionBatch.objects.filter(
+                product_id=product_id,
+                date=today
+            )
+            for old_batch in existing_today:
+                old_batch.delete()  # delete() автоматически вычитает stock_quantity
+
+            ProductionService.create_batch_from_quantity(
+                product_id=product_id,
+                quantity=product_quantity,
+                date=today,
+                notes='Авто-партия из котлованского режима'
+            )
+            results['batches_created'] += 1
+
+        # 3b. Явные производственные партии (ДОБАВЛЯЮТСЯ к существующим)
         for item in production_batches_data:
-            batch_date = item.get('date', date.today())
+            batch_date = item.get('date', today)
             notes = item.get('notes', '')
 
             if item['input_type'] == 'quantity':

@@ -627,7 +627,11 @@ class ProductRecipe(models.Model):
         if self.absolute_quantity:
             if self.expense.expense_status == ExpenseStatus.SUZERAIN and self.product_quantity:
                 # quantity_per_unit = 80 кг / 40 пачек = 2 кг/пачка
-                self.quantity_per_unit = (self.absolute_quantity / self.product_quantity)
+                # БАГ #11: явное quantize чтобы не выйти за decimal_places=4
+                if self.product_quantity != Decimal('0'):
+                    self.quantity_per_unit = (
+                        self.absolute_quantity / self.product_quantity
+                    ).quantize(Decimal('0.0001'))
             elif self.expense.expense_status != ExpenseStatus.SUZERAIN:
                 # Найти Сюзерена этого товара
                 suzerain_recipe = ProductRecipe.objects.filter(
@@ -635,16 +639,21 @@ class ProductRecipe(models.Model):
                     expense__expense_status=ExpenseStatus.SUZERAIN
                 ).first()
                 if suzerain_recipe:
-                    if suzerain_recipe.absolute_quantity:
+                    if suzerain_recipe.absolute_quantity and suzerain_recipe.absolute_quantity != Decimal('0'):
                         # Основной путь (ТЗ): proportion = civilian_abs / suzerain_abs
                         # Пример: 40 кг лука / 80 кг фарша = 0.5
-                        self.proportion = (self.absolute_quantity / suzerain_recipe.absolute_quantity)
+                        self.proportion = (
+                            self.absolute_quantity / suzerain_recipe.absolute_quantity
+                        ).quantize(Decimal('0.001'))
                     elif suzerain_recipe.quantity_per_unit and suzerain_recipe.product_quantity:
                         # Fallback: если Сюзерен создан без absolute_quantity,
                         # восстанавливаем suzerain_abs = quantity_per_unit × product_quantity
                         suzerain_abs = suzerain_recipe.quantity_per_unit * suzerain_recipe.product_quantity
-                        if suzerain_abs:
-                            self.proportion = (self.absolute_quantity / suzerain_abs)
+                        # БАГ #6: явная проверка != 0, а не truthy (Decimal('0') — falsy!)
+                        if suzerain_abs != Decimal('0'):
+                            self.proportion = (
+                                self.absolute_quantity / suzerain_abs
+                            ).quantize(Decimal('0.001'))
         super().save(*args, **kwargs)
 
     def clean(self):
