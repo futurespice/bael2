@@ -1272,13 +1272,11 @@ class ProductViewSet(viewsets.ModelViewSet):
             total_expense = total_physical + total_overhead
             profit = revenue - total_expense
 
-            # BUG FIX: cost_per_unit вычисляем в приоритете:
-            # 1. Из batch.cost_per_unit (cost=физ+накл) — если партия есть
-            # 2. Текущий период: total_expense / calc_qty
-            # 3. product.average_cost_price — запасной вариант
-            if latest_batch and latest_batch.cost_per_unit > 0:
-                cost_per_unit_val = latest_batch.cost_per_unit
-            elif calc_qty > 0 and total_expense > 0:
+            # BUG FIX: cost_per_unit всегда считается из total_expense / calc_qty.
+            # Раньше брался batch.cost_per_unit (старый, на момент создания партии),
+            # но total_expense пересчитывается с актуальными накладными —
+            # клиент получал несогласованные данные в одном ответе.
+            if calc_qty > 0 and total_expense > 0:
                 cost_per_unit_val = (total_expense / calc_qty).quantize(Decimal('0.01'))
             else:
                 cost_per_unit_val = product.average_cost_price

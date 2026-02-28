@@ -235,7 +235,6 @@ class ProductionCalculator:
 
         for item in recipe_items:
             if item.proportion:
-                # Количество = Сюзерен × пропорция
                 item_quantity = suzerain_quantity * item.proportion
                 item_cost = (
                         item_quantity * (item.expense.price_per_unit or Decimal('0'))
@@ -741,7 +740,8 @@ class AccountingService:
             except Expense.DoesNotExist:
                 raise ValueError(f"Расход с id={item['expense_id']} не найден")
 
-            # BUG FIX #2: физические расходы не должны попадать в механический учёт
+            # ТЗ: в механический учёт принимаются ТОЛЬКО Вассалы
+            # Вассал = overhead + mechanical + universal (expense_status=vassal)
             if expense.expense_type != 'overhead':
                 raise ValueError(
                     f"Расход '{expense.name}' (id={expense.id}) является физическим. "
@@ -752,16 +752,42 @@ class AccountingService:
                     f"Расход '{expense.name}' (id={expense.id}) не является механическим "
                     f"(состояние: {expense.expense_state})"
                 )
+            # BUG FIX: добавляем проверку apply_type=universal.
+            # overhead + mechanical + regular проходил валидацию, но не является Вассалом.
+            if expense.apply_type != 'universal':
+                raise ValueError(
+                    f"Расход '{expense.name}' (id={expense.id}) не является универсальным. "
+                    f"Механический учёт работает только для Vassal (overhead+mechanical+universal)."
+                )
 
             expense.daily_amount = item['amount']
             expense.save(update_fields=['daily_amount'])
             results['mechanical_updated'] += 1
 
         # 2. Котлованская часть — создать/обновить рецепты товаров
-        for item in recipe_items_data:
+        #
+        # BUG FIX: Сюзерены обрабатываются ПЕРВЫМИ.
+        # ProductRecipe.save() для не-Сюзерена ищет Сюзерена в БД, чтобы рассчитать
+        # proportion = absolute_quantity / suzerain.absolute_quantity.
+        # Если не-Сюзерен идёт первым, Сюзерен ещё не записан — proportion останется None.
+
+        # Загружаем expense_status для всех recipe_items (один bulk-запрос)
+        expense_ids = [item['expense_id'] for item in recipe_items_data]
+        expense_statuses = {
+            e.id: e.expense_status
+            for e in Expense.objects.filter(id__in=expense_ids).only('id', 'expense_status')
+        }
+
+        # Сортируем: Сюзерены первыми, остальные потом
+        sorted_recipe_items = sorted(
+            recipe_items_data,
+            key=lambda x: 0 if expense_statuses.get(x['expense_id']) == ExpenseStatus.SUZERAIN else 1
+        )
+
+        for item in sorted_recipe_items:
             if not Product.objects.filter(id=item['product_id']).exists():
                 raise ValueError(f"Товар с id={item['product_id']} не найден")
-            if not Expense.objects.filter(id=item['expense_id']).exists():
+            if item['expense_id'] not in expense_statuses:
                 raise ValueError(f"Расход с id={item['expense_id']} не найден")
 
             defaults = {}
@@ -774,13 +800,14 @@ class AccountingService:
             if item.get('proportion') is not None:
                 defaults['proportion'] = item['proportion']
 
-            recipe, created = ProductRecipe.objects.update_or_create(
+            # update_or_create внутри вызывает save(), который автоматически
+            # рассчитывает proportion/quantity_per_unit из absolute_quantity.
+            # Дополнительный recipe.save() НЕ нужен.
+            ProductRecipe.objects.update_or_create(
                 product_id=item['product_id'],
                 expense_id=item['expense_id'],
                 defaults=defaults
             )
-            # Пересохраним для автоматического расчёта proportion/quantity_per_unit
-            recipe.save()
             results['recipes_saved'] += 1
 
         # 3. Создать производственные партии (ДОБАВЛЯЮТСЯ к существующим)

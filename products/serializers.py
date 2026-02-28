@@ -219,11 +219,12 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
             attrs['monthly_amount'] = Decimal('0')
             attrs['daily_amount'] = Decimal('0')
         elif attrs.get('expense_status') == ExpenseStatus.VASSAL:
-            # Клиент явно указал vassal, но комбинация полей не соответствует
+            # ТЗ: пользователь НЕ может выбрать Vassal вручную — это автостатус через комбинацию
             raise serializers.ValidationError({
                 'expense_status': (
-                    'Статус Вассал устанавливается автоматически только при: '
-                    'expense_type=overhead, expense_state=mechanical, apply_type=universal.'
+                    'Статус «Вассал» нельзя задать вручную. '
+                    'Он устанавливается автоматически при комбинации: '
+                    'expense_type=overhead + expense_state=mechanical + apply_type=universal.'
                 )
             })
 

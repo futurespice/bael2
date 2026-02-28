@@ -266,17 +266,24 @@ class Expense(models.Model):
                 raise ValidationError('Физический расход должен иметь цену за единицу')
 
     def save(self, *args, **kwargs):
-        """Авто-определение статуса Вассал перед сохранением.
+        """Авто-определение статуса Вассал + валидация физических расходов.
 
         Django НЕ вызывает clean() при Model.save() через DRF, поэтому
-        логика дублируется здесь — это единственный надёжный способ
-        гарантировать корректный статус при любом способе создания объекта.
+        критическая валидация дублируется здесь (проблема #3).
 
-        Правило (ТЗ bayel_expense_system_final.pdf, раздел «Вассал»):
+        Правило (ТЗ, раздел «Вассал»):
             overhead + mechanical + universal  →  expense_status = vassal
-        Зарезервировано на будущее:
-            physical  + universal              →  expense_status = vassal
         """
+        # Проблема #3: валидация физических расходов на уровне save()
+        # (clean() не вызывается из DRF/ORM-create)
+        if self.expense_type == ExpenseType.PHYSICAL:
+            if not self.unit_type:
+                from django.core.exceptions import ValidationError
+                raise ValidationError({'unit_type': 'Физический расход должен иметь тип учёта'})
+            if not self.price_per_unit or self.price_per_unit <= 0:
+                from django.core.exceptions import ValidationError
+                raise ValidationError({'price_per_unit': 'Физический расход должен иметь цену за единицу'})
+
         # Накладной + механический + универсальный → Вассал
         if (
             self.expense_type == ExpenseType.OVERHEAD
@@ -284,13 +291,6 @@ class Expense(models.Model):
             and self.apply_type == ApplyType.UNIVERSAL
         ):
             self.expense_status = ExpenseStatus.VASSAL
-
-        # Зарезервировано: физический + универсальный → Вассал (будущее)
-        # if (
-        #     self.expense_type == ExpenseType.PHYSICAL
-        #     and self.apply_type == ApplyType.UNIVERSAL
-        # ):
-        #     self.expense_status = ExpenseStatus.VASSAL
 
         super().save(*args, **kwargs)
 
@@ -632,9 +632,17 @@ class ProductRecipe(models.Model):
                     product=self.product,
                     expense__expense_status=ExpenseStatus.SUZERAIN
                 ).first()
-                if suzerain_recipe and suzerain_recipe.absolute_quantity:
-                    # proportion = 40 кг лука / 80 кг фарша = 0.5
-                    self.proportion = (self.absolute_quantity / suzerain_recipe.absolute_quantity)
+                if suzerain_recipe:
+                    if suzerain_recipe.absolute_quantity:
+                        # Основной путь (ТЗ): proportion = civilian_abs / suzerain_abs
+                        # Пример: 40 кг лука / 80 кг фарша = 0.5
+                        self.proportion = (self.absolute_quantity / suzerain_recipe.absolute_quantity)
+                    elif suzerain_recipe.quantity_per_unit and suzerain_recipe.product_quantity:
+                        # Fallback: если Сюзерен создан без absolute_quantity,
+                        # восстанавливаем suzerain_abs = quantity_per_unit × product_quantity
+                        suzerain_abs = suzerain_recipe.quantity_per_unit * suzerain_recipe.product_quantity
+                        if suzerain_abs:
+                            self.proportion = (self.absolute_quantity / suzerain_abs)
         super().save(*args, **kwargs)
 
     def clean(self):
@@ -815,6 +823,13 @@ class ProductImage(models.Model):
                 raise ValidationError('Максимум 3 изображения')
 
     def save(self, *args, **kwargs):
+        # Проблема #13: clean() не вызывается из ORM/DRF, поэтому
+        # лимит 3 изображения дублируется в save() для защиты на уровне модели
+        if not self.pk and self.product_id:
+            existing_count = ProductImage.objects.filter(product_id=self.product_id).count()
+            if existing_count >= 3:
+                raise ValidationError('Максимум 3 изображения на товар')
+
         if self.image and not self.preview:
             self._process_image()
         super().save(*args, **kwargs)
