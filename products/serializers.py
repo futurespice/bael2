@@ -298,27 +298,45 @@ class ProductRecipeSerializer(serializers.ModelSerializer):
 
 
 class ProductRecipeCreateSerializer(serializers.ModelSerializer):
-    """Создание рецепта."""
+    """Создание/обновление рецепта.
+
+    Поддерживает ДВА формата ввода (ТЗ v3.0):
+    1. Новый: absolute_quantity + product_quantity (backend считает пропорцию/quantity_per_unit)
+    2. Старый: quantity_per_unit/proportion напрямую (обратная совместимость)
+    """
 
     class Meta:
         model = ProductRecipe
-        fields = ['product', 'expense', 'quantity_per_unit', 'proportion']
+        fields = ['product', 'expense', 'quantity_per_unit', 'proportion',
+                  'absolute_quantity', 'product_quantity']
 
     def validate(self, attrs):
-        """Валидация."""
+        """Валидация: поддержка нового (absolute) и старого (direct) формата."""
         expense = attrs.get('expense')
+        has_absolute = bool(attrs.get('absolute_quantity'))
+        has_qpu = bool(attrs.get('quantity_per_unit'))
+        has_proportion = bool(attrs.get('proportion'))
 
-        # Сюзерен должен иметь quantity_per_unit
+        # Накладные и универсальные — только связь, поля не обязательны
+        if expense.expense_type == 'overhead' or expense.apply_type == 'universal':
+            return attrs
+
         if expense.expense_status == ExpenseStatus.SUZERAIN:
-            if not attrs.get('quantity_per_unit'):
+            # Сюзерен: absolute_quantity+product_quantity ИЛИ quantity_per_unit напрямую
+            if has_absolute:
+                if not attrs.get('product_quantity'):
+                    raise serializers.ValidationError({
+                        'product_quantity': 'Для Сюзерена с absolute_quantity обязателен product_quantity'
+                    })
+            elif not has_qpu:
                 raise serializers.ValidationError({
-                    'quantity_per_unit': 'Сюзерен должен иметь quantity_per_unit'
+                    'absolute_quantity': 'Сюзерен: введите absolute_quantity+product_quantity или quantity_per_unit'
                 })
         else:
-            # Остальные должны иметь proportion (кроме универсальных)
-            if expense.apply_type != 'universal' and not attrs.get('proportion'):
+            # Civilian/Vassal: absolute_quantity ИЛИ proportion напрямую
+            if not has_absolute and not has_proportion:
                 raise serializers.ValidationError({
-                    'proportion': 'Расход должен иметь пропорцию'
+                    'proportion': 'Физический расход: введите absolute_quantity или proportion'
                 })
 
         return attrs

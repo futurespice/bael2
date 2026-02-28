@@ -245,6 +245,8 @@ class Expense(models.Model):
         indexes = [
             models.Index(fields=['expense_type', 'is_active']),
             models.Index(fields=['expense_status']),
+            models.Index(fields=['expense_state']),  # BUG FIX: для mechanical-accounting filter
+            models.Index(fields=['expense_type', 'expense_state', 'is_active']),  # composite
         ]
 
     def __str__(self):
@@ -778,6 +780,22 @@ class ProductionBatch(models.Model):
         """
         self.cost_per_unit = self.calculate_cost_per_unit()
         super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        """При удалении партии — уменьшаем stock_quantity товара.
+
+        BUG FIX: create_batch_from_quantity/suzerain добавляет stock_quantity,
+        но ProductionBatch.delete() раньше не уменьшал его обратно.
+        """
+        product = self.product
+        qty = self.quantity_produced
+        super().delete(*args, **kwargs)
+        # Уменьшаем склад, но не ниже нуля
+        product.stock_quantity = max(
+            Decimal('0'),
+            product.stock_quantity - qty
+        )
+        product.save(update_fields=['stock_quantity'])
 
 
 # =============================================================================

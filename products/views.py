@@ -1035,6 +1035,13 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # BUG FIX: проверка date_from > date_to
+        if start_date > end_date:
+            return Response(
+                {'error': f'date_from ({start_date}) не может быть позже date_to ({end_date})'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         actual_days = max((end_date - start_date).days, 1)
 
         # Сортировка на уровне БД (для полей модели)

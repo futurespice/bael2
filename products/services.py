@@ -96,6 +96,13 @@ class ProductionCalculator:
     """
 
     @classmethod
+    def _load_recipe(cls, product: Product) -> List[ProductRecipe]:
+        """Загрузить рецепт товара одним запросом (используется в обоих сценариях)."""
+        return list(
+            ProductRecipe.objects.filter(product=product).select_related('expense')
+        )
+
+    @classmethod
     def calculate_from_quantity(
             cls,
             product: Product,
@@ -109,39 +116,28 @@ class ProductionCalculator:
         2. Вычисляем пропорции: Лук (50%), Тесто (100%)
         3. Рассчитываем стоимость каждого расхода
         4. Распределяем накладные по объёму производства
-
-        Args:
-            product: Товар
-            quantity: Количество товара
-
-        Returns:
-            ProductionCalculationResult
         """
-        # Получаем рецепт товара
-        recipe_items = ProductRecipe.objects.filter(
-            product=product
-        ).select_related('expense')
+        # BUG FIX: загружаем все рецепты ОДНИМ запросом
+        all_recipes = cls._load_recipe(product)
 
-        if not recipe_items.exists():
+        if not all_recipes:
             raise ValueError(f'У товара {product.name} нет рецепта')
 
-        # Находим Сюзерена
-        suzerain_item = recipe_items.filter(
-            expense__expense_status=ExpenseStatus.SUZERAIN
-        ).first()
-
+        suzerain_item = next(
+            (r for r in all_recipes if r.expense.expense_status == ExpenseStatus.SUZERAIN),
+            None
+        )
         if not suzerain_item:
             raise ValueError(f'У товара {product.name} нет Сюзерена')
 
-        # Рассчитываем объём Сюзерена
-        suzerain_quantity = quantity * suzerain_item.quantity_per_unit
+        suzerain_quantity = quantity * (suzerain_item.quantity_per_unit or Decimal('0'))
 
-        # Теперь вызываем общий метод расчёта
         return cls._calculate_expenses(
             product=product,
             quantity=quantity,
             suzerain_item=suzerain_item,
-            suzerain_quantity=suzerain_quantity
+            suzerain_quantity=suzerain_quantity,
+            all_recipes=all_recipes,
         )
 
     @classmethod
@@ -157,36 +153,24 @@ class ProductionCalculator:
         1. Находим Сюзерена (Фарш)
         2. Вычисляем количество: 2 / 0.01 = 200 пельменей
         3. Далее аналогично сценарию 1
-
-        Args:
-            product: Товар
-            suzerain_quantity: Количество Сюзерена (кг/шт)
-
-        Returns:
-            ProductionCalculationResult
         """
-        # Получаем рецепт
-        recipe_items = ProductRecipe.objects.filter(
-            product=product
-        ).select_related('expense')
+        all_recipes = cls._load_recipe(product)
 
-        # Находим Сюзерена
-        suzerain_item = recipe_items.filter(
-            expense__expense_status=ExpenseStatus.SUZERAIN
-        ).first()
-
+        suzerain_item = next(
+            (r for r in all_recipes if r.expense.expense_status == ExpenseStatus.SUZERAIN),
+            None
+        )
         if not suzerain_item:
             raise ValueError(f'У товара {product.name} нет Сюзерена')
 
-        # Вычисляем количество товара
-        quantity = suzerain_quantity / suzerain_item.quantity_per_unit
+        quantity = suzerain_quantity / (suzerain_item.quantity_per_unit or Decimal('1'))
 
-        # Вызываем общий метод
         return cls._calculate_expenses(
             product=product,
             quantity=quantity,
             suzerain_item=suzerain_item,
-            suzerain_quantity=suzerain_quantity
+            suzerain_quantity=suzerain_quantity,
+            all_recipes=all_recipes,
         )
 
     @classmethod
@@ -195,17 +179,16 @@ class ProductionCalculator:
             product: Product,
             quantity: Decimal,
             suzerain_item: ProductRecipe,
-            suzerain_quantity: Decimal
+            suzerain_quantity: Decimal,
+            all_recipes: List[ProductRecipe],
     ) -> ProductionCalculationResult:
         """
         Общий метод расчёта расходов.
 
-        1. Физические расходы (с пропорциями)
-        2. Накладные расходы (распределение по объёму)
-        3. Универсальные расходы
+        Принимает уже загруженный список рецептов (all_recipes),
+        чтобы избежать N+1 запросов к БД.
         """
         physical_expenses = []
-        overhead_expenses = []
 
         # =====================================================================
         # 1. ФИЗИЧЕСКИЕ РАСХОДЫ
@@ -213,7 +196,7 @@ class ProductionCalculator:
 
         # Сюзерен
         suzerain_cost = (
-                suzerain_quantity * (suzerain_item.expense.price_per_unit or Decimal('0'))
+            suzerain_quantity * (suzerain_item.expense.price_per_unit or Decimal('0'))
         ).quantize(Decimal('0.01'))
 
         physical_expenses.append(ExpenseItem(
@@ -225,21 +208,34 @@ class ProductionCalculator:
             total_cost=suzerain_cost
         ))
 
-        # Остальные физические (пропорции от Сюзерена)
-        recipe_items = ProductRecipe.objects.filter(
-            product=product,
-            expense__expense_type=ExpenseType.PHYSICAL
-        ).exclude(
-            expense__expense_status=ExpenseStatus.SUZERAIN
-        ).select_related('expense')
+        # Остальные физические — из уже загруженного all_recipes (без нового запроса к БД)
+        other_physical_recipes = [
+            r for r in all_recipes
+            if r.expense.expense_type == ExpenseType.PHYSICAL
+            and r.expense.expense_status != ExpenseStatus.SUZERAIN
+        ]
 
-        for item in recipe_items:
+        for item in other_physical_recipes:  # BUG FIX: было recipe_items (NameError)
             if item.proportion:
                 item_quantity = suzerain_quantity * item.proportion
                 item_cost = (
                         item_quantity * (item.expense.price_per_unit or Decimal('0'))
                 ).quantize(Decimal('0.01'))
 
+                physical_expenses.append(ExpenseItem(
+                    expense_id=item.expense.id,
+                    expense_name=item.expense.name,
+                    expense_type='physical',
+                    quantity=item_quantity,
+                    unit_price=item.expense.price_per_unit or Decimal('0'),
+                    total_cost=item_cost
+                ))
+            elif item.quantity_per_unit:
+                # Универсальный физический (пленка): quantity_per_unit задан напрямую
+                item_quantity = (suzerain_quantity / (suzerain_item.quantity_per_unit or Decimal('1'))) * item.quantity_per_unit
+                item_cost = (
+                    item_quantity * (item.expense.price_per_unit or Decimal('0'))
+                ).quantize(Decimal('0.01'))
                 physical_expenses.append(ExpenseItem(
                     expense_id=item.expense.id,
                     expense_name=item.expense.name,
@@ -495,68 +491,91 @@ class OverheadDistributor:
         """
         Получить ДЕТАЛИЗАЦИЮ накладных расходов для товара.
 
-        ТЗ Бахрам акя: вместо одной строки "Накладные (общие)" показывать
-        каждый расход отдельно: аренда, зарплата, электричество и т.д.
+        ТЗ: разделяем universal и regular overhead:
+        - Universal: доля среди ВСЕХ активных товаров
+        - Regular: доля только среди ПРИВЯЗАННЫХ товаров (галочка при создании товара)
 
         Args:
             product: Товар
-            quantity_produced: Количество для расчёта
+            quantity_produced: Количество для расчёта (если нет истории продаж)
             date_filter: Конечная дата анализа
-            period_days: Период анализа (по умолчанию 11 дней)
+            period_days: Период анализа в днях
 
         Returns:
             Список ExpenseItem с детализацией по каждому накладному расходу
         """
-        # Получаем все накладные расходы
-        overhead_expenses = Expense.objects.filter(
+        overhead_expenses = list(Expense.objects.filter(
             expense_type=ExpenseType.OVERHEAD,
             is_active=True
-        )
+        ))
 
-        if not overhead_expenses.exists():
+        if not overhead_expenses:
             return []
 
-        # Получаем объёмы ПРОДАЖ всех товаров
+        # Объёмы продаж за период (один запрос к БД)
         all_products_volumes = cls._get_all_products_volumes(
             date_filter=date_filter,
             period_days=period_days
         )
+        volume_by_product_id = {v['product_id']: v['volume'] for v in all_products_volumes}
+        total_volume_all = sum(volume_by_product_id.values()) or Decimal('0')
 
-        total_volume = sum(v['volume'] for v in all_products_volumes)
+        # Объём текущего товара
+        product_volume = volume_by_product_id.get(product.id)
+        if product_volume is None:
+            # Товар ещё не продавался — берём текущую партию как заглушку
+            product_volume = quantity_produced
+            total_volume_all += product_volume
 
-        # Находим долю текущего товара
-        current_product_volume = next(
-            (v for v in all_products_volumes if v['product_id'] == product.id),
-            None
-        )
-
-        if current_product_volume:
-            volume = current_product_volume['volume']
+        # Глобальная доля товара среди всех (для universal)
+        if total_volume_all > 0:
+            universal_share = product_volume / total_volume_all
         else:
-            volume = quantity_produced
-            total_volume += volume
+            active_count = Product.objects.filter(is_active=True).count() or 1
+            universal_share = Decimal('1') / active_count
 
-        # Вычисляем долю товара
-        if total_volume > 0:
-            share = volume / total_volume
-        else:
-            # Если нет продаж, делим поровну
-            active_products_count = Product.objects.filter(is_active=True).count()
-            share = Decimal('1') / active_products_count if active_products_count > 0 else Decimal('0')
+        # Привязки regular-расходов к товарам (один запрос к БД)
+        regular_expense_ids = [
+            e.id for e in overhead_expenses if e.apply_type == ApplyType.REGULAR
+        ]
+        # {expense_id: set(product_ids)} — кому привязан каждый regular-расход
+        regular_linked: dict = {}
+        if regular_expense_ids:
+            for rec in ProductRecipe.objects.filter(
+                expense_id__in=regular_expense_ids
+            ).values('expense_id', 'product_id'):
+                regular_linked.setdefault(rec['expense_id'], set()).add(rec['product_id'])
 
-        # Детализируем каждый накладной расход
         breakdown = []
         for expense in overhead_expenses:
             expense_amount = expense.calculate_amount()
-            product_share = (expense_amount * share).quantize(Decimal('0.01'))
+
+            if expense.apply_type == ApplyType.UNIVERSAL:
+                # Universal: доля среди ВСЕХ товаров
+                product_share = (expense_amount * universal_share).quantize(Decimal('0.01'))
+            else:
+                # Regular: только если товар привязан галочкой
+                linked_ids = regular_linked.get(expense.id, set())
+                if product.id not in linked_ids:
+                    continue  # этот расход не касается данного товара
+
+                # Объём среди привязанных товаров
+                total_linked_vol = sum(
+                    volume_by_product_id.get(pid, Decimal('0')) for pid in linked_ids
+                )
+                if total_linked_vol > 0:
+                    regular_share = volume_by_product_id.get(product.id, Decimal('0')) / total_linked_vol
+                else:
+                    regular_share = Decimal('1') / len(linked_ids)
+                product_share = (expense_amount * regular_share).quantize(Decimal('0.01'))
 
             breakdown.append(ExpenseItem(
                 expense_id=expense.id,
                 expense_name=expense.name,
                 expense_type='overhead',
-                quantity=Decimal('0'),  # Не применимо для накладных
-                unit_price=expense_amount,  # Общая сумма расхода
-                total_cost=product_share  # Доля товара
+                quantity=Decimal('0'),
+                unit_price=expense_amount,
+                total_cost=product_share
             ))
 
         return breakdown
