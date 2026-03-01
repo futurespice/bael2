@@ -746,6 +746,7 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             'unit_display',
             'is_weight_based',
             'is_bonus',
+            'average_cost_price',
             'markup_percentage',
             'manual_price',
             'final_price',
