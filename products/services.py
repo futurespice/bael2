@@ -169,10 +169,18 @@ class ProductionCalculator:
             raise ValueError(f'У товара {product.name} нет Сюзерена')
 
         if not suzerain_item.quantity_per_unit or suzerain_item.quantity_per_unit <= 0:
-            raise ValueError(
-                f'У Сюзерена "{suzerain_item.expense.name}" не задана норма на единицу '
-                f'(quantity_per_unit). Обновите рецепт товара.'
-            )
+            # Fallback: вычислить quantity_per_unit из absolute_quantity / product_quantity
+            if (suzerain_item.absolute_quantity and suzerain_item.product_quantity
+                    and suzerain_item.product_quantity > 0):
+                suzerain_item.quantity_per_unit = (
+                    suzerain_item.absolute_quantity / suzerain_item.product_quantity
+                ).quantize(Decimal('0.0001'))
+            else:
+                raise ValueError(
+                    f'У Сюзерена "{suzerain_item.expense.name}" не задана норма на единицу '
+                    f'(quantity_per_unit). Введите количество товара (product_quantity) '
+                    f'при настройке рецепта.'
+                )
         quantity = suzerain_quantity / suzerain_item.quantity_per_unit
 
         return cls._calculate_expenses(
@@ -697,20 +705,8 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем склад.
-        # Если это ПЕРВАЯ партия для этого товара (stock_quantity был задан вручную
-        # через API/Django admin без системы партий), сбрасываем ручной остаток,
-        # чтобы партия стала единственным авторитетным источником.
-        # Иначе — просто добавляем к текущему складу.
-        has_prev_batches = ProductionBatch.objects.filter(
-            product=product
-        ).exclude(pk=batch.pk).exists()
-
-        if not has_prev_batches and product.stock_quantity > 0:
-            product.stock_quantity = result.quantity_produced
-        else:
-            product.stock_quantity += result.quantity_produced
-
+        # Обновляем склад: всегда добавляем количество новой партии.
+        product.stock_quantity += result.quantity_produced
         product.save(update_fields=['stock_quantity'])
         product.update_average_cost_price()
 
@@ -754,17 +750,8 @@ class ProductionService:
             notes=notes
         )
 
-        # Аналогично create_batch_from_quantity: если это первая партия
-        # и stock_quantity был задан вручную — заменяем, а не добавляем.
-        has_prev_batches = ProductionBatch.objects.filter(
-            product=product
-        ).exclude(pk=batch.pk).exists()
-
-        if not has_prev_batches and product.stock_quantity > 0:
-            product.stock_quantity = result.quantity_produced
-        else:
-            product.stock_quantity += result.quantity_produced
-
+        # Обновляем склад: всегда добавляем количество новой партии.
+        product.stock_quantity += result.quantity_produced
         product.save(update_fields=['stock_quantity'])
         product.update_average_cost_price()
 
@@ -878,6 +865,19 @@ class AccountingService:
                 pq = item.get('product_quantity')
                 if pq is not None and Decimal(str(pq)) > 0:
                     auto_batch_products[item['product_id']] = Decimal(str(pq))
+                elif item.get('absolute_quantity') is not None:
+                    # Если есть absolute_quantity без product_quantity —
+                    # вычисляем количество через quantity_per_unit из сохранённого рецепта
+                    aq = Decimal(str(item['absolute_quantity']))
+                    if aq > 0:
+                        recipe = ProductRecipe.objects.filter(
+                            product_id=item['product_id'],
+                            expense_id=item['expense_id']
+                        ).first()
+                        if recipe and recipe.quantity_per_unit and recipe.quantity_per_unit > 0:
+                            computed_pq = (aq / recipe.quantity_per_unit).quantize(Decimal('0.01'))
+                            if computed_pq > 0:
+                                auto_batch_products[item['product_id']] = computed_pq
 
         # ID товаров, для которых явно передан production_batches (не трогаем их auto-логикой)
         explicit_batch_product_ids = {item['product_id'] for item in production_batches_data}

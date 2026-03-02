@@ -799,6 +799,9 @@ class ProductionBatch(models.Model):
         product = self.product
         qty = self.quantity_produced
         super().delete(*args, **kwargs)
+        # Перечитываем актуальный остаток из БД, чтобы избежать стейл-кэша
+        # при удалении нескольких партий подряд (котлованский перезаписывающий режим)
+        product.refresh_from_db(fields=['stock_quantity'])
         # Уменьшаем склад, но не ниже нуля
         product.stock_quantity = max(
             Decimal('0'),
