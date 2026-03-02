@@ -157,7 +157,7 @@ class ReportService:
         Returns:
             (start_date, end_date)
         """
-        today = timezone.now().date()
+        today = timezone.localdate()
 
         if start_date and end_date:
             return start_date, end_date
