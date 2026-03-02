@@ -225,6 +225,28 @@ CHANNEL_LAYERS = {
 }
 
 # =============================================================================
+# ТЕСТОВОЕ ОКРУЖЕНИЕ (FORCE_SQLITE=True)
+# =============================================================================
+# Активируется при запуске тестов: FORCE_SQLITE=True python -m pytest
+if FORCE_SQLITE:
+    # Django TestClient отправляет запросы на 'testserver' — нужно разрешить
+    ALLOWED_HOSTS += ['testserver']
+
+    # Заменяем Redis-кэш на in-memory (Redis не нужен при тестировании)
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        }
+    }
+
+    # Channels без Redis (InMemory для тестов)
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        }
+    }
+
+# =============================================================================
 # CORS SETTINGS
 # =============================================================================
 

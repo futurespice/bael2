@@ -623,7 +623,15 @@ class ProductRecipe(models.Model):
             return f"{self.product.name}: {self.expense.name}"
 
     def save(self, *args, **kwargs):
-        """Автоматический расчёт quantity_per_unit и proportion из absolute_quantity."""
+        """Автоматический расчёт quantity_per_unit и proportion из absolute_quantity.
+
+        Когда вызов идёт через update_or_create (например, из save-accounting),
+        Django передаёт update_fields только с изменёнными полями из defaults.
+        Чтобы вычисленные поля (quantity_per_unit, proportion) тоже сохранились
+        в БД, добавляем их в update_fields при необходимости.
+        """
+        computed_fields = []
+
         if self.absolute_quantity:
             if self.expense.expense_status == ExpenseStatus.SUZERAIN and self.product_quantity:
                 # quantity_per_unit = 80 кг / 40 пачек = 2 кг/пачка
@@ -632,6 +640,7 @@ class ProductRecipe(models.Model):
                     self.quantity_per_unit = (
                         self.absolute_quantity / self.product_quantity
                     ).quantize(Decimal('0.0001'))
+                    computed_fields.append('quantity_per_unit')
             elif self.expense.expense_status != ExpenseStatus.SUZERAIN:
                 # Найти Сюзерена этого товара
                 suzerain_recipe = ProductRecipe.objects.filter(
@@ -645,6 +654,7 @@ class ProductRecipe(models.Model):
                         self.proportion = (
                             self.absolute_quantity / suzerain_recipe.absolute_quantity
                         ).quantize(Decimal('0.001'))
+                        computed_fields.append('proportion')
                     elif suzerain_recipe.quantity_per_unit and suzerain_recipe.product_quantity:
                         # Fallback: если Сюзерен создан без absolute_quantity,
                         # восстанавливаем suzerain_abs = quantity_per_unit × product_quantity
@@ -654,6 +664,17 @@ class ProductRecipe(models.Model):
                             self.proportion = (
                                 self.absolute_quantity / suzerain_abs
                             ).quantize(Decimal('0.001'))
+                            computed_fields.append('proportion')
+
+        # Если вызов через update_or_create с update_fields — добавляем
+        # вычисленные поля, иначе они не попадут в SQL UPDATE
+        if computed_fields and 'update_fields' in kwargs and kwargs['update_fields'] is not None:
+            existing = list(kwargs['update_fields'])
+            for field in computed_fields:
+                if field not in existing:
+                    existing.append(field)
+            kwargs['update_fields'] = existing
+
         super().save(*args, **kwargs)
 
     def clean(self):
