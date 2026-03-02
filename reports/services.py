@@ -25,7 +25,7 @@ from decimal import Decimal
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
-from django.db.models import Q, Sum, Count, F, QuerySet
+from django.db.models import Q, Sum, Count, F, QuerySet, Prefetch
 from django.utils import timezone
 
 from stores.models import Store, Region, City, StoreInventory
@@ -82,7 +82,7 @@ class StatisticsData:
     total_expenses: Decimal  # Общая сумма расходов
 
     # Количественные показатели
-    bonus_count: int  # ✅ ИСПРАВЛЕНО: Бонусы из инвентаря
+    bonus_count: int  # Количество бонусных единиц из заказов
     orders_count: int  # Заказов
     products_count: int  # Товаров продано
 
@@ -494,12 +494,20 @@ class ReportService:
         Returns:
             List[Dict] с историей по дням
         """
+        from collections import defaultdict
         from orders.models import StoreOrderItem, OrderHistory, OrderType
 
-        # Получаем заказы магазина
+        # Получаем заказы магазина с prefetch для устранения N+1
         orders_qs = StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.ACCEPTED
+        ).select_related('partner').prefetch_related(
+            Prefetch('items', queryset=StoreOrderItem.objects.select_related('product')),
+            Prefetch('defective_products', queryset=DefectiveProduct.objects.filter(
+                status=DefectiveProduct.DefectStatus.APPROVED
+            ).select_related('product')),
+            Prefetch('debt_payments', queryset=DebtPayment.objects.order_by('created_at')
+                     .select_related('paid_by', 'received_by')),
         ).order_by('confirmed_at')
 
         # Применяем фильтр по датам
@@ -509,10 +517,20 @@ class ReportService:
         if end_date:
             orders_qs = orders_qs.filter(confirmed_at__date__lte=end_date)
 
+        # Bulk fetch OrderHistory для всех заказов сразу
+        orders_list = list(orders_qs)
+        order_ids = [o.id for o in orders_list]
+        all_histories = OrderHistory.objects.filter(
+            order_type=OrderType.STORE, order_id__in=order_ids
+        ).select_related('changed_by').order_by('created_at')
+        histories_by_order = defaultdict(list)
+        for h in all_histories:
+            histories_by_order[h.order_id].append(h)
+
         # Группируем заказы по дням
         history = []
 
-        for order in orders_qs:
+        for order in orders_list:
             order_date = order.confirmed_at.date()
 
             # Ищем существующую запись за этот день
@@ -551,10 +569,8 @@ class ReportService:
             day_data['total_debt'] += float(order.debt_amount)
             day_data['total_prepayment'] += float(order.prepayment_amount)
 
-            # Товары заказа
-            items = order.items.all().select_related('product')
-
-            for item in items:
+            # Товары заказа (уже prefetch)
+            for item in order.items.all():
                 product_data = {
                     'name': item.product.name,
                     'quantity': float(item.quantity),
@@ -567,14 +583,9 @@ class ReportService:
                 else:
                     day_data['products'].append(product_data)
 
-            # Бракованные товары
-            defects = DefectiveProduct.objects.filter(
-                order=order,
-                status=DefectiveProduct.DefectStatus.APPROVED
-            ).select_related('product')
-
+            # Бракованные товары (уже prefetch с фильтром APPROVED)
             defect_total = Decimal('0')
-            for defect in defects:
+            for defect in order.defective_products.all():
                 day_data['defective_products'].append({
                     'name': defect.product.name,
                     'quantity': float(defect.quantity),
@@ -586,10 +597,10 @@ class ReportService:
             # Вычитаем одобренный брак из долга
             day_data['total_debt'] -= float(defect_total)
 
-            # Погашения долга по этому заказу
+            # Погашения долга по этому заказу (уже prefetch, отсортированы)
             debt_payments_list = day_data.get('debt_payments', [])
             order_paid_debt = Decimal('0')
-            for payment in order.debt_payments.all().order_by('created_at'):
+            for payment in order.debt_payments.all():
                 debt_payments_list.append({
                     'payment_id': payment.id,
                     'amount': float(payment.amount),
@@ -603,14 +614,9 @@ class ReportService:
             day_data['debt_payments'] = debt_payments_list
             day_data['total_paid_debt'] += float(order_paid_debt)
 
-            # История статусов заказа
+            # История статусов заказа (из bulk fetch)
             status_history_list = []
-            order_history = OrderHistory.objects.filter(
-                order_type=OrderType.STORE,
-                order_id=order.id
-            ).order_by('created_at')
-
-            for history_entry in order_history:
+            for history_entry in histories_by_order[order.id]:
                 status_history_list.append({
                     'old_status': history_entry.old_status,
                     'new_status': history_entry.new_status,
@@ -821,7 +827,7 @@ class PartnerStatisticsService:
         # =========================================================================
         expenses_qs = PartnerExpense.objects.filter(
             partner_id=partner_id,
-            created_at__range=[date_from, date_to]
+            date__range=[date_from, date_to]
         )
         
         expenses_total = Decimal('0')
@@ -919,19 +925,21 @@ class PartnerStatisticsService:
             })
         
         # =========================================================================
-        # 7. ДОЛГИ
+        # 7. ДОЛГИ (за выбранный период)
         # =========================================================================
-        # Исходный долг по всем заказам партнёра
+        # Исходный долг по заказам партнёра за период
         original_debt = StoreOrder.objects.filter(
             partner_id=partner_id,
-            status=StoreOrderStatus.ACCEPTED
+            status=StoreOrderStatus.ACCEPTED,
+            confirmed_at__range=[date_from, date_to]
         ).aggregate(
             total=Sum('debt_amount')
         )['total'] or Decimal('0')
 
-        # Все погашения долга по заказам партнёра
+        # Погашения долга по заказам партнёра за период
         all_debt_payments = DebtPayment.objects.filter(
             order__partner_id=partner_id,
+            created_at__range=[date_from, date_to]
         ).aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')

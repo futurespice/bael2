@@ -37,7 +37,7 @@ API ENDPOINTS:
 from decimal import Decimal
 from typing import Any, Dict
 from django.db import transaction
-from django.db.models import QuerySet, Q, F, Sum  # ✅ Добавлен Q, Sum
+from django.db.models import QuerySet, Q, F, Sum, Count  # ✅ Добавлен Q, Sum, Count
 from django.db.models.functions import Coalesce
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action, api_view, permission_classes
@@ -433,6 +433,12 @@ class StoreViewSet(viewsets.ModelViewSet):
             ).values_list('store_id', flat=True).distinct()
             queryset = queryset.exclude(id__in=stores_with_active_orders)
 
+        queryset = queryset.annotate(
+            total_orders_count=Count('orders', distinct=True),
+            accepted_orders_count=Count('orders', filter=Q(orders__status='accepted'), distinct=True),
+            inventory_items_count=Count('inventory', distinct=True),
+            users_count=Count('selections', filter=Q(selections__is_current=True), distinct=True),
+        )
         return queryset.select_related('region', 'city').order_by('-created_at')
 
     def get_serializer_class(self):

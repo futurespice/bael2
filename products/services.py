@@ -771,10 +771,12 @@ class AccountingService:
         results = {'mechanical_updated': 0, 'recipes_saved': 0, 'batches_created': 0}
 
         # 1. Валидация и обновление daily_amount для механических расходов
+        mech_expense_ids = [item['expense_id'] for item in mechanical_expenses_data]
+        mech_expenses_map = {e.id: e for e in Expense.objects.filter(id__in=mech_expense_ids)}
+
         for item in mechanical_expenses_data:
-            try:
-                expense = Expense.objects.get(id=item['expense_id'])
-            except Expense.DoesNotExist:
+            expense = mech_expenses_map.get(item['expense_id'])
+            if expense is None:
                 raise ValueError(f"Расход с id={item['expense_id']} не найден")
 
             # ТЗ: в механический учёт принимаются ТОЛЬКО Вассалы

@@ -52,7 +52,7 @@ class RegionSerializer(serializers.ModelSerializer):
 
     def get_cities_count(self, obj: Region) -> int:
         """Количество городов в регионе."""
-        return len(obj.cities.all())  # использует prefetch_related из RegionViewSet
+        return obj.cities.count()
 
     def get_stores_count(self, obj: Region) -> int:
         """Количество магазинов в регионе."""
@@ -205,18 +205,26 @@ class StoreSerializer(serializers.ModelSerializer):
 
     def get_total_orders_count(self, obj: Store) -> int:
         """Общее количество заказов."""
+        if hasattr(obj, 'total_orders_count'):
+            return obj.total_orders_count
         return obj.get_total_orders_count()
 
     def get_accepted_orders_count(self, obj: Store) -> int:
         """Количество принятых заказов."""
+        if hasattr(obj, 'accepted_orders_count'):
+            return obj.accepted_orders_count
         return obj.get_accepted_orders_count()
 
     def get_inventory_items_count(self, obj: Store) -> int:
         """Количество позиций в инвентаре."""
+        if hasattr(obj, 'inventory_items_count'):
+            return obj.inventory_items_count
         return obj.get_inventory_items_count()
 
     def get_users_count(self, obj: Store) -> int:
         """Количество пользователей в магазине."""
+        if hasattr(obj, 'users_count'):
+            return obj.users_count
         return obj.get_users_count()
 
 
