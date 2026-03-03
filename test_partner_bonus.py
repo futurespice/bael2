@@ -178,20 +178,20 @@ class PartnerBonusTest(TestCase):
         )
         
         # Verify Order Items
-        # Should have 1 Paid item (25 qty) and 1 Bonus item (2 qty)
+        # 25 платных → 1 бонус (формула: 4*(25//50) + (25%50)//20 = 0+1 = 1)
         self.assertEqual(order.items.count(), 2)
         item_paid = order.items.get(is_bonus=False)
         item_bonus = order.items.get(is_bonus=True)
-        
+
         self.assertEqual(item_paid.quantity, Decimal('25'))
-        self.assertEqual(item_bonus.quantity, Decimal('2'))
-        
+        self.assertEqual(item_bonus.quantity, Decimal('1'))
+
         # Verify Inventory Deduction
         inv_paid = PartnerInventory.objects.get(partner=self.partner_user, product=self.product_bonus, is_bonus=False)
         inv_bonus = PartnerInventory.objects.get(partner=self.partner_user, product=self.product_bonus, is_bonus=True)
-        
+
         self.assertEqual(inv_paid.quantity, Decimal('75'))  # 100 - 25
-        self.assertEqual(inv_bonus.quantity, Decimal('8'))  # 10 - 2
+        self.assertEqual(inv_bonus.quantity, Decimal('9'))  # 10 - 1
 
     def test_manual_order_auto_bonus_insufficient(self):
         """

@@ -137,7 +137,12 @@ class PartnerRequest(models.Model):
         ]
 
     def __str__(self):
-        items_count = self.items.count() if hasattr(self, 'items') else 0
+        # Используем _prefetched_objects_cache чтобы избежать N+1 если items уже prefetch-нуты
+        if hasattr(self, '_prefetched_objects_cache') and 'items' in self._prefetched_objects_cache:
+            cached_items = self._prefetched_objects_cache['items']
+            items_count = len(cached_items)
+        else:
+            items_count = 0
         if items_count > 0:
             return f"{self.get_request_type_display()}: {items_count} товаров - {self.get_status_display()}"
         elif self.product:
@@ -147,22 +152,28 @@ class PartnerRequest(models.Model):
     @property
     def is_pending(self):
         return self.status == PartnerRequestStatus.PENDING
-    
+
     @property
     def total_amount(self) -> Decimal:
-        """Общая сумма запроса."""
-        if hasattr(self, 'items') and self.items.exists():
-            return sum(
-                item.total_amount  # ✅ Используем item.total_amount для единой логики
-                for item in self.items.all()
-            )
-        elif self.product and self.quantity:
+        """Общая сумма запроса. Используйте prefetch_related('items') для избежания N+1."""
+        # Используем кэш prefetch если доступен, иначе делаем один запрос
+        if hasattr(self, '_prefetched_objects_cache') and 'items' in self._prefetched_objects_cache:
+            cached_items = self._prefetched_objects_cache['items']
+            if cached_items:
+                return sum(item.total_amount for item in cached_items)
+        elif hasattr(self, 'items'):
+            items = list(self.items.all())
+            if items:
+                return sum(item.total_amount for item in items)
+        if self.product and self.quantity:
             return self.quantity * self.product.final_price
         return Decimal('0')
-    
+
     @property
     def items_count(self) -> int:
-        """Количество товаров в запросе."""
+        """Количество товаров в запросе. Используйте prefetch_related('items') для избежания N+1."""
+        if hasattr(self, '_prefetched_objects_cache') and 'items' in self._prefetched_objects_cache:
+            return len(self._prefetched_objects_cache['items'])
         if hasattr(self, 'items'):
             return self.items.count()
         return 1 if self.product else 0

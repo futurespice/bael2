@@ -128,9 +128,10 @@ def _build_inventory_items(inventory_qs):
 
         main_image = None
         if hasattr(product, 'images'):
-            first_image = product.images.first()
-            if first_image and first_image.image:
-                main_image = first_image.image.url
+            # Используем prefetch-кэш (.all()) вместо .first() чтобы избежать N+1
+            cached_images = list(product.images.all())
+            if cached_images and cached_images[0].image:
+                main_image = cached_images[0].image.url
 
         price = product.final_price
         total = inv.quantity * price
@@ -1013,13 +1014,15 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Получаем IN_TRANSIT заказы
-        orders = StoreOrder.objects.filter(
+        # Получаем IN_TRANSIT заказы.
+        # order_by('id') обязателен: без детерминированного порядка
+        # select_for_update может вызвать deadlock при параллельных запросах.
+        orders = list(StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        ).select_for_update().prefetch_related('items__product')
+        ).order_by('id').select_for_update().prefetch_related('items__product'))
 
-        if not orders.exists():
+        if not orders:
             return Response(
                 {'error': 'Нет заказов в корзине'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -1206,10 +1209,11 @@ class StoreViewSet(viewsets.ModelViewSet):
 
                 if product_id not in items_map:
                     main_image = None
-                    if hasattr(product, 'images') and product.images.exists():
-                        first_image = product.images.first()
-                        if first_image and first_image.image:
-                            main_image = first_image.image.url
+                    if hasattr(product, 'images'):
+                        # Используем prefetch-кэш (.all()) вместо .first() чтобы избежать N+1
+                        cached_images = list(product.images.all())
+                        if cached_images and cached_images[0].image:
+                            main_image = cached_images[0].image.url
 
                     items_map[product_id] = {
                         'product_id': product_id,
@@ -1354,13 +1358,15 @@ class StoreViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Получаем IN_TRANSIT заказы
-        orders = StoreOrder.objects.filter(
+        # Получаем IN_TRANSIT заказы.
+        # order_by('id') обязателен: без детерминированного порядка
+        # select_for_update может вызвать deadlock при параллельных запросах.
+        orders = list(StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        ).select_for_update().prefetch_related('items__product')
+        ).order_by('id').select_for_update().prefetch_related('items__product'))
 
-        if not orders.exists():
+        if not orders:
             return Response(
                 {'error': 'Нет заказов для подтверждения'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -1414,7 +1420,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=item.product,
-                    quantity=item.quantity
+                    quantity=item.quantity,
+                    is_bonus=item.is_bonus,
                 )
 
             # История
@@ -1755,9 +1762,10 @@ class StoreViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Проверка наличия товара в инвентаре
+        # Проверка наличия товара в инвентаре (select_for_update исключает race condition
+        # при параллельных запросах на брак одного и того же товара)
         try:
-            inventory_item = StoreInventory.objects.select_related('product').get(
+            inventory_item = StoreInventory.objects.select_related('product').select_for_update().get(
                 store=store,
                 product_id=product_id
             )
@@ -1819,15 +1827,24 @@ class StoreViewSet(viewsets.ModelViewSet):
         # Берем рассчитанную сумму из модели
         defect_amount = defect.total_amount
 
-        # Уменьшаем инвентарь
-        inventory_item.quantity -= quantity
-        if inventory_item.quantity <= 0:
+        # Уменьшаем инвентарь атомарно через F() — без race condition
+        StoreInventory.objects.filter(pk=inventory_item.pk).update(
+            quantity=F('quantity') - quantity,
+            last_updated=timezone.now(),
+        )
+        inventory_item.refresh_from_db(fields=['quantity'])
+        if inventory_item.quantity <= Decimal('0'):
             inventory_item.delete()
-        else:
-            inventory_item.save(update_fields=['quantity', 'last_updated'])
 
-        # Уменьшаем долг магазина
-        Store.objects.filter(pk=store.pk).update(debt=F('debt') - defect_amount)
+        # Уменьшаем долг магазина, но НЕ ниже 0 (ТЗ: дефект не может уменьшить долг ниже 0)
+        from django.db.models import Case, When, Value, DecimalField as _DecimalField
+        Store.objects.filter(pk=store.pk).update(
+            debt=Case(
+                When(debt__gte=defect_amount, then=F('debt') - defect_amount),
+                default=Value(Decimal('0')),
+                output_field=_DecimalField(max_digits=14, decimal_places=2),
+            )
+        )
         store.refresh_from_db()
 
         return Response({
@@ -1853,6 +1870,7 @@ class StoreViewSet(viewsets.ModelViewSet):
         url_path='pay-debt',
         permission_classes=[IsAuthenticated]
     )
+    @transaction.atomic
     def pay_store_debt(self, request: Request, pk=None) -> Response:
         """
         Погашение долга магазина (ТЗ v2.0).
@@ -1911,6 +1929,10 @@ class StoreViewSet(viewsets.ModelViewSet):
                 {'error': 'Сумма должна быть больше 0'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        # Блокируем строку магазина до проверки долга,
+        # чтобы исключить race condition при параллельных платежах
+        store = Store.objects.select_for_update().get(pk=store.pk)
 
         if amount > store.debt:
             return Response(

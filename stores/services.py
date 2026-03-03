@@ -588,21 +588,25 @@ class StoreInventoryService:
             *,
             store: Store,
             product: 'Product',
-            quantity: Decimal
+            quantity: Decimal,
+            is_bonus: bool = False
     ) -> StoreInventory:
         """
         Добавить товар в инвентарь магазина.
 
-        Используется при одобрении заказа админом.
+        Используется при подтверждении корзины партнёром.
 
         Args:
             store: Магазин
             product: Товар
             quantity: Количество
+            is_bonus: Признак бонусного товара (не входит в стоимость)
 
         Returns:
             StoreInventory
         """
+        from django.utils import timezone as _tz
+
         if quantity <= Decimal('0'):
             raise ValidationError('Количество должно быть больше 0')
 
@@ -613,9 +617,21 @@ class StoreInventoryService:
             defaults={'quantity': Decimal('0')}
         )
 
-        # Добавляем количество
-        inventory.add_quantity(quantity)
+        # Обновляем quantity и paid_count/bonus_count атомарно через F()
+        if is_bonus:
+            StoreInventory.objects.filter(pk=inventory.pk).update(
+                quantity=F('quantity') + quantity,
+                bonus_count=F('bonus_count') + quantity,
+                last_updated=_tz.now(),
+            )
+        else:
+            StoreInventory.objects.filter(pk=inventory.pk).update(
+                quantity=F('quantity') + quantity,
+                paid_count=F('paid_count') + quantity,
+                last_updated=_tz.now(),
+            )
 
+        inventory.refresh_from_db(fields=['quantity', 'paid_count', 'bonus_count'])
         return inventory
 
     @classmethod
@@ -674,21 +690,24 @@ class StoreInventoryService:
     @classmethod
     def get_inventory_total_value(cls, store: Store) -> Decimal:
         """
-        Общая стоимость инвентаря магазина.
+        Общая стоимость ОПЛАЧЕННЫХ товаров в инвентаре (один SQL-запрос).
 
         Args:
             store: Магазин
 
         Returns:
-            Сумма всех товаров в инвентаре
+            Сумма оплаченных товаров в инвентаре
         """
-        inventory = cls.get_inventory(store)
+        from django.db.models import Sum as _Sum, ExpressionWrapper, DecimalField as _DecimalField
 
-        total = Decimal('0')
-        for item in inventory:
-            total += item.total_price
+        result = StoreInventory.objects.filter(store=store).annotate(
+            paid_value=ExpressionWrapper(
+                (F('quantity') - F('bonus_count')) * F('product__final_price'),
+                output_field=_DecimalField(max_digits=18, decimal_places=2),
+            )
+        ).aggregate(total=_Sum('paid_value'))['total']
 
-        return total
+        return result or Decimal('0')
 
 
 # =============================================================================
@@ -705,14 +724,15 @@ class BonusCalculationService:
     - Бонусы применяются ТОЛЬКО к штучным товарам с флагом is_bonus=True
     - Весовые товары НЕ могут быть бонусными
 
-    ПРИМЕРЫ (заказанное количество → бонус):
-    - 20 шт → 1 бонус
-    - 50 шт → 4 бонуса
-    - 70 шт → 5 бонусов
-    - 100 шт → 8 бонусов
-    - 120 шт → 9 бонусов
-    - 150 шт → 12 бонусов
-    - 200 шт → 16 бонусов
+    ПРИМЕРЫ (заказанное/платное количество → бонус):
+    - 20 шт → 1 бонус  (total=21)
+    - 40 шт → 2 бонуса (total=42)
+    - 50 шт → 4 бонуса (total=54)  ← milestone
+    - 70 шт → 5 бонусов (total=75)
+    - 90 шт → 6 бонусов (total=96)
+    - 100 шт → 8 бонусов (total=108) ← milestone
+    - 120 шт → 9 бонусов (total=129)
+    - 150 шт → 12 бонусов (total=162) ← milestone
     """
 
     @classmethod
@@ -723,17 +743,21 @@ class BonusCalculationService:
         """
         Рассчитать бонусы для товара по количеству в одном заказе.
 
+        Формула: 4*(qty//50) + (qty%50)//20
+        За каждые 50 платных — milestone +4 бонуса,
+        плюс внутри каждого блока 50 за каждые 20 — +1 бонус.
+
         Args:
-            total_quantity: Количество товара в заказе
+            total_quantity: Платное количество товара в заказе
 
         Returns:
             {
-                'total': 21,
+                'total': 21,       # paid + bonus
                 'bonus_count': 1,
-                'paid_count': 20
+                'paid_count': 20   # платное кол-во (= total_quantity)
             }
         """
-        bonus_count = (total_quantity * 2) // 25
+        bonus_count = 4 * (total_quantity // 50) + (total_quantity % 50) // 20
         paid_count = total_quantity
 
         return {
@@ -764,7 +788,18 @@ class BonusCalculationService:
 
         for item in inventory:
             product = item.product
-            quantity = int(item.quantity)  # Для бонусов только целые
+            total_quantity = int(item.quantity)  # Всего (paid + bonus)
+
+            # Используем накопленные paid_count/bonus_count из модели (заполняются при confirm_basket)
+            # Если они не заполнены (старые данные) — вычисляем из total_quantity
+            if item.paid_count > 0 or item.bonus_count > 0:
+                paid_qty = int(item.paid_count)
+                bonus_qty = int(item.bonus_count)
+            else:
+                paid_qty = total_quantity
+                bonus_qty = 0
+
+            paid_price = float(Decimal(str(paid_qty)) * product.final_price)
 
             item_data = {
                 'id': item.id,
@@ -774,21 +809,11 @@ class BonusCalculationService:
                 'unit_price': float(product.final_price),
                 'is_weight_based': product.is_weight_based,
                 'is_bonus_product': product.is_bonus,  # Флаг "бонусный товар"
-                'bonus_count': 0,
-                'paid_count': quantity,
+                'bonus_count': bonus_qty,
+                'paid_count': paid_qty,
                 'total_price': float(item.total_price),
-                'paid_price': float(item.total_price),
+                'paid_price': paid_price,
             }
-
-            # Бонусы только для штучных товаров с is_bonus=True
-            if product.is_bonus and not product.is_weight_based:
-                bonus_info = cls.calculate_bonuses_for_product(quantity)
-                item_data['bonus_count'] = bonus_info['bonus_count']
-                item_data['paid_count'] = bonus_info['paid_count']
-                # Платная сумма = paid_count × цена
-                item_data['paid_price'] = float(
-                    Decimal(str(bonus_info['paid_count'])) * product.final_price
-                )
 
             result.append(item_data)
 

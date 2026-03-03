@@ -125,10 +125,14 @@ class OrderWorkflowService:
             if product.is_weight_based:
                 cls._validate_weight_quantity(product, quantity)
 
-            # Рассчитываем бонус для штучных бонусных товаров
+            # Рассчитываем бонус для штучных бонусных товаров.
+            # Формула: за каждые 50 платных → 4 бонуса (milestone),
+            # плюс внутри каждого отрезка 50 за каждые 20 → 1 бонус.
+            # Примеры: 20→1, 40→2, 50→4, 70→5, 90→6, 100→8
             bonus_quantity = Decimal('0')
             if product.is_bonus and not product.is_weight_based:
-                bonus_count = (int(quantity) * 2) // 25
+                qty_int = int(quantity)
+                bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
                 bonus_quantity = Decimal(str(bonus_count))
 
             # Проверка наличия на складе (основное + бонусное количество)
@@ -641,8 +645,8 @@ class BasketService:
             'store_id': store.id,
             'store_name': store.name,
             'is_empty': False,
-            'orders_count': orders.count(),
-            'order_ids': list(orders.values_list('id', flat=True)),
+            'orders_count': len(orders),
+            'order_ids': [o.id for o in orders],
             'items': items,
             'totals': {
                 'piece_count': piece_count,
@@ -695,14 +699,20 @@ class BasketService:
         if partner_user.role != 'partner':
             raise ValidationError('Только партнёры могут подтверждать корзину')
 
-        # Получаем IN_TRANSIT заказы
+        # Получаем IN_TRANSIT заказы.
+        # order_by('id') обязателен при select_for_update:
+        # без детерминированного порядка блокировки разные транзакции
+        # могут захватывать строки в разном порядке → deadlock.
         orders = StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        ).select_for_update().prefetch_related('items__product')
+        ).order_by('id').select_for_update().prefetch_related('items__product')
 
-        if not orders.exists():
+        # Материализуем сразу — избегаем двойного SQL (exists + затем цикл)
+        orders_materialized = list(orders)
+        if not orders_materialized:
             raise ValidationError('Нет заказов для подтверждения')
+        orders = orders_materialized
 
         # =====================================================================
         # 1. УДАЛЕНИЕ ТОВАРОВ
@@ -767,11 +777,10 @@ class BasketService:
                 continue
 
             if new_quantity <= 0:
-                # Удаляем все позиции
-                for item in items:
-                    item.product.stock_quantity += item.quantity
-                    item.product.save(update_fields=['stock_quantity'])
-
+                # Удаляем все позиции — возвращаем весь объём на склад одним UPDATE
+                items_list = list(items)
+                total_to_return = sum(i.quantity for i in items_list)
+                for item in items_list:
                     removed_info.append({
                         'product_id': product_id,
                         'product_name': item.product.name,
@@ -779,11 +788,16 @@ class BasketService:
                         'order_id': item.order_id,
                     })
                 items.delete()
+                # Атомарный возврат на склад через F() — без race condition
+                Product.objects.filter(pk=product_id).update(
+                    stock_quantity=F('stock_quantity') + total_to_return
+                )
                 continue
 
             # Уменьшаем количество пропорционально или в первом заказе
             difference = current_total - new_quantity
-            first_item = items.first()
+            items_list = list(items)  # Материализуем, чтобы не делать повторные запросы
+            first_item = items_list[0]
             product = first_item.product
 
             if first_item.quantity >= difference:
@@ -793,9 +807,10 @@ class BasketService:
                 first_item.total = first_item.quantity * first_item.price
                 first_item.save(update_fields=['quantity', 'total'])
 
-                # Возвращаем на склад
-                product.stock_quantity += difference
-                product.save(update_fields=['stock_quantity'])
+                # Атомарный возврат на склад через F() — без race condition
+                Product.objects.filter(pk=product_id).update(
+                    stock_quantity=F('stock_quantity') + difference
+                )
 
                 modified_info.append({
                     'product_id': product_id,
@@ -807,15 +822,15 @@ class BasketService:
             else:
                 # Нужно удалить несколько позиций
                 remaining_to_remove = difference
-                for item in items:
+                total_returned = Decimal('0')
+                for item in items_list:
                     if remaining_to_remove <= 0:
                         break
 
                     if item.quantity <= remaining_to_remove:
                         # Удаляем полностью
                         remaining_to_remove -= item.quantity
-                        product.stock_quantity += item.quantity
-                        product.save(update_fields=['stock_quantity'])
+                        total_returned += item.quantity
                         item.delete()
                     else:
                         # Уменьшаем частично
@@ -823,9 +838,7 @@ class BasketService:
                         item.quantity -= remaining_to_remove
                         item.total = item.quantity * item.price
                         item.save(update_fields=['quantity', 'total'])
-
-                        product.stock_quantity += remaining_to_remove
-                        product.save(update_fields=['stock_quantity'])
+                        total_returned += remaining_to_remove
 
                         modified_info.append({
                             'product_id': product_id,
@@ -834,7 +847,13 @@ class BasketService:
                             'new_quantity': float(item.quantity),
                             'order_id': item.order_id,
                         })
-                        remaining_to_remove = 0
+                        remaining_to_remove = Decimal('0')
+
+                # Один атомарный UPDATE для всего возвращённого объёма
+                if total_returned > 0:
+                    Product.objects.filter(pk=product_id).update(
+                        stock_quantity=F('stock_quantity') + total_returned
+                    )
 
             logger.info(
                 f"Изменено количество товара {product_id} в корзине магазина {store.id}: "
@@ -844,11 +863,19 @@ class BasketService:
         # =====================================================================
         # 3. ПЕРЕСЧЁТ СУММ ЗАКАЗОВ
         # =====================================================================
+        # Используем aggregate вместо Python-цикла — один SQL-запрос на заказ
+        # вместо N+1. refresh_from_db() здесь не нужен: мы только что сами
+        # изменили items через ORM и кэш prefetch уже не актуален.
+        from django.db.models import Sum as _Sum
+        order_ids = [o.id for o in orders]
+        totals_by_order = dict(
+            StoreOrderItem.objects.filter(order_id__in=order_ids)
+            .values('order_id')
+            .annotate(s=_Sum('total'))
+            .values_list('order_id', 's')
+        )
         for order in orders:
-            order.refresh_from_db()
-            new_total = sum(
-                item.total for item in order.items.all()
-            )
+            new_total = totals_by_order.get(order.id) or Decimal('0')
             order.total_amount = new_total
             order.save(update_fields=['total_amount'])
 
@@ -870,18 +897,30 @@ class BasketService:
         # Долг = сумма - предоплата
         total_debt = total_amount - prepayment_amount
 
-        # Распределяем предоплату по заказам пропорционально
+        # Распределяем предоплату по заказам пропорционально.
+        # Остаток после округления кладём в последний заказ, чтобы сумма
+        # распределённых предоплат точно равнялась prepayment_amount.
         remaining_prepayment = prepayment_amount
 
         # =====================================================================
         # 5. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
         # =====================================================================
         confirmed_orders = []
+        orders_list = list(orders)  # Материализуем для корректной работы enumerate
 
-        for order in orders:
+        for idx, order in enumerate(orders_list):
             # Рассчитываем предоплату для этого заказа
             if total_amount > 0:
-                order_prepayment = (order.total_amount / total_amount) * prepayment_amount
+                is_last = (idx == len(orders_list) - 1)
+                if is_last:
+                    # Последний заказ получает остаток, чтобы избежать
+                    # накопленной ошибки округления
+                    order_prepayment = remaining_prepayment
+                else:
+                    order_prepayment = (
+                        (order.total_amount / total_amount) * prepayment_amount
+                    ).quantize(Decimal('0.01'))
+                    remaining_prepayment -= order_prepayment
             else:
                 order_prepayment = Decimal('0')
 
@@ -910,11 +949,12 @@ class BasketService:
                     quantity=item.quantity,
                     is_bonus=item.is_bonus
                 )
-                # Добавляем в инвентарь магазина
+                # Добавляем в инвентарь магазина (is_bonus важен для корректного paid_count/bonus_count)
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=item.product,
-                    quantity=item.quantity
+                    quantity=item.quantity,
+                    is_bonus=item.is_bonus,
                 )
 
             # История
@@ -947,9 +987,9 @@ class BasketService:
         # =====================================================================
         # 6. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
         # =====================================================================
-        store = Store.objects.select_for_update().get(pk=store.pk)
-        store.debt += total_debt
-        store.save(update_fields=['debt'])
+        # Используем F() expression вместо read-modify-write для исключения race condition
+        Store.objects.filter(pk=store.pk).update(debt=F('debt') + total_debt)
+        store = Store.objects.get(pk=store.pk)
 
         logger.info(
             f"Корзина подтверждена | Store: {store.id} | "
@@ -1193,30 +1233,36 @@ class PartnerRequestService:
         
         if request.request_type == PartnerRequestType.REQUEST:
             # ЗАПРОС ТОВАРОВ: Админ → Партнёр
-            
-            # Сначала проверяем наличие ВСЕХ товаров
-            for item in items:
-                product = item.product
-                quantity = item.quantity
-                
-                if product.stock_quantity < quantity:
+            items_list = list(items)
+            product_ids = [item.product_id for item in items_list]
+
+            # Блокируем строки продуктов для исключения TOCTOU race condition:
+            # между проверкой наличия и списанием другая транзакция не изменит сток.
+            locked_products = {
+                p.id: p
+                for p in Product.objects.select_for_update().filter(id__in=product_ids)
+            }
+
+            # Проверяем наличие ВСЕХ товаров на заблокированных данных
+            for item in items_list:
+                product = locked_products[item.product_id]
+                if product.stock_quantity < item.quantity:
                     raise ValidationError(
                         f'Недостаточно товара "{product.name}" на складе. '
-                        f'Доступно: {product.stock_quantity}, запрошено: {quantity}'
+                        f'Доступно: {product.stock_quantity}, запрошено: {item.quantity}'
                     )
-            
-            # Теперь обрабатываем товары
-            for item in items:
-                product = item.product
+
+            # Обрабатываем товары — атомарное списание через F() без stale read
+            for item in items_list:
+                product = locked_products[item.product_id]
                 quantity = item.quantity
-                
-                # Уменьшаем количество в каталоге
-                product.stock_quantity -= quantity
-                if product.stock_quantity <= Decimal('0'):
-                    product.stock_quantity = Decimal('0')
-                    product.is_available = False
-                product.save(update_fields=['stock_quantity', 'is_available'])
-                
+
+                new_qty = product.stock_quantity - quantity
+                Product.objects.filter(pk=product.pk).update(
+                    stock_quantity=F('stock_quantity') - quantity,
+                    is_available=new_qty > Decimal('0'),
+                )
+
                 # Добавляем в инвентарь партнёра
                 PartnerInventoryService.add_to_inventory(
                     partner=partner,
@@ -1225,18 +1271,18 @@ class PartnerRequestService:
                     is_bonus=item.is_bonus,
                     source_request=request
                 )
-                
+
                 logger.info(
                     f"Запрос #{request.id} | "
                     f"Товар '{product.name}' x{quantity} добавлен в инвентарь партнёра {partner.id}"
                 )
-            
+
         else:  # RETURN
             # ВОЗВРАТ ТОВАРОВ: Партнёр → Админ
             for item in items:
                 product = item.product
                 quantity = item.quantity
-                
+
                 # Удаляем из инвентаря партнёра
                 PartnerInventoryService.remove_from_inventory(
                     partner=partner,
@@ -1244,11 +1290,12 @@ class PartnerRequestService:
                     quantity=quantity,
                     is_bonus=item.is_bonus
                 )
-                
-                # Увеличиваем количество в каталоге
-                product.stock_quantity += quantity
-                product.is_available = True
-                product.save(update_fields=['stock_quantity', 'is_available'])
+
+                # Атомарное увеличение склада через F() без stale read
+                Product.objects.filter(pk=product.pk).update(
+                    stock_quantity=F('stock_quantity') + quantity,
+                    is_available=True,
+                )
                 
                 logger.info(
                     f"Возврат #{request.id} | "
@@ -1431,7 +1478,7 @@ class PartnerRequestService:
         """
         queryset = PartnerRequest.objects.filter(
             partner=partner
-        ).select_related('product', 'reviewed_by').order_by('-created_at')
+        ).select_related('product', 'reviewed_by').prefetch_related('items__product').order_by('-created_at')
         
         if request_type:
             queryset = queryset.filter(request_type=request_type)
@@ -1450,8 +1497,8 @@ class PartnerRequestService:
             QuerySet[PartnerRequest]
         """
         return PartnerRequest.objects.filter(
-            status=PartnerRequestStatus.PENDING
-        ).select_related('partner', 'product').order_by('created_at')
+            status=PartnerRequestStatus.PENDING,
+        ).select_related('partner', 'product').prefetch_related('items__product').order_by('created_at')
 
 
 # =============================================================================
@@ -1575,12 +1622,12 @@ class ManualOrderService:
                     is_bonus=True
                 )
                 
-                # Добавляем в инвентарь магазина (как бонус?)
-                # StoreInventory считает бонусы автоматически, но мы передаём кол-во.
+                # Добавляем в инвентарь магазина как бонусный товар
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=product,
-                    quantity=quantity
+                    quantity=quantity,
+                    is_bonus=True,
                 )
                 
                 # Собираем позицию заказа (бонус)
@@ -1600,7 +1647,8 @@ class ManualOrderService:
                 # Товар должен быть помечен как бонусный в каталоге
                 bonus_quantity = Decimal('0')
                 if product.is_bonus and not product.is_weight_based:
-                    bonus_count = (int(quantity) * 2) // 25
+                    qty_int = int(quantity)
+                    bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
                     bonus_quantity = Decimal(str(bonus_count))
 
                 # Проверяем наличие основного товара (Paid)
@@ -1646,12 +1694,20 @@ class ManualOrderService:
                         is_bonus=True
                     )
 
-                # Добавляем в инвентарь магазина
+                # Добавляем платную и бонусную части в инвентарь раздельно
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=product,
-                    quantity=quantity + bonus_quantity
+                    quantity=quantity,
+                    is_bonus=False,
                 )
+                if bonus_quantity > 0:
+                    StoreInventoryService.add_to_inventory(
+                        store=store,
+                        product=product,
+                        quantity=bonus_quantity,
+                        is_bonus=True,
+                    )
 
                 # Собираем позицию заказа (платная часть)
                 price = item_data.price or product.final_price
@@ -1688,10 +1744,9 @@ class ManualOrderService:
         order.debt_amount = debt_amount
         order.save(update_fields=['total_amount', 'debt_amount'])
         
-        # Обновляем долг магазина
-        store = Store.objects.select_for_update().get(pk=store.pk)
-        store.debt = (store.debt + debt_amount).quantize(Decimal('0.01'))
-        store.save(update_fields=['debt'])
+        # Обновляем долг магазина атомарно через F() — без race condition
+        Store.objects.filter(pk=store.pk).update(debt=F('debt') + debt_amount)
+        store = Store.objects.get(pk=store.pk)
         
         # История
         OrderHistory.objects.create(

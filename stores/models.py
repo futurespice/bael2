@@ -709,9 +709,10 @@ class StoreInventory(models.Model):
 
     @property
     def total_price(self) -> Decimal:
-        """Общая стоимость товара в инвентаре."""
+        """Общая стоимость ОПЛАЧЕННЫХ товаров в инвентаре (без бонусных)."""
         if self.product and self.product.final_price:
-            return self.quantity * self.product.final_price
+            paid_qty = self.quantity - self.bonus_count
+            return paid_qty * self.product.final_price
         return Decimal('0')
 
     @property
@@ -775,22 +776,28 @@ class StoreInventory(models.Model):
         """
         Расчёт бонусов за один заказ.
 
-        Формула: bonus_count = (quantity * 2) // 25
+        Формула: 4*(qty//50) + (qty%50)//20
+        За каждые 50 платных — milestone +4 бонуса,
+        внутри каждого блока за каждые 20 — +1 бонус.
+        Примеры: 20→1, 40→2, 50→4, 70→5, 90→6, 100→8
 
-        ВАЖНО: Бонусы теперь рассчитываются за один заказ,
+        ВАЖНО: Бонусы рассчитываются за один заказ,
         а не кумулятивно. Этот метод используется для ручного
         пересчёта если нужно.
         """
         if not self.product or self.product.is_weight_based or not self.product.is_bonus:
             return
 
-        total_qty = int(self.quantity)
-        new_bonus_count = (total_qty * 2) // 25
-        new_paid_count = total_qty - new_bonus_count
+        # Формула применяется к ПЛАТНОМУ (paid) количеству, а не к total.
+        # paid_count должен быть заполнен через add_to_inventory(is_bonus=False).
+        # Если paid_count не заполнен — используем quantity как fallback.
+        paid_qty = int(self.paid_count) if self.paid_count > 0 else int(self.quantity)
+        new_bonus_count = 4 * (paid_qty // 50) + (paid_qty % 50) // 20
+        new_paid_count = paid_qty
 
         self.bonus_count = Decimal(str(new_bonus_count))
         self.paid_count = Decimal(str(new_paid_count))
-        self.save(update_fields=['quantity', 'bonus_count', 'paid_count', 'last_updated'])
+        self.save(update_fields=['bonus_count', 'paid_count', 'last_updated'])
 
 
 # =============================================================================
