@@ -70,6 +70,14 @@ class ChatListCreateView(APIView):
             if key and chat:
                 result[key].append(ChatSerializer(chat, context={'request': request}).data)
 
+        # Если передан ?role= — возвращаем только эту категорию как плоский список
+        role_filter = request.query_params.get('role')
+        if role_filter:
+            key = role_key_map.get(role_filter)
+            if key and key in result:
+                return Response(result[key])
+            return Response([])
+
         return Response(result)
 
     def post(self, request):
