@@ -64,6 +64,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self.send(text_data=json.dumps({'error': 'Некорректный JSON'}))
             return
 
+        if not isinstance(data, dict):
+            await self.send(text_data=json.dumps({
+                'error': 'Ожидается JSON объект вида {"content": "текст"}'
+            }))
+            return
+
         content = data.get('content', '').strip()
         if not content:
             await self.send(text_data=json.dumps({'error': 'Пустое сообщение'}))
