@@ -60,9 +60,9 @@ class ChatListCreateView(APIView):
             .prefetch_related('participants', 'messages')
         }
 
-        # Группируем по роли собеседника
+        # Группируем по роли собеседника (все 3 ключа всегда присутствуют)
         role_key_map = {'admin': 'admins', 'partner': 'partners', 'store': 'stores'}
-        result = {role_key_map[r]: [] for r in allowed_roles}
+        result = {'admins': [], 'partners': [], 'stores': []}
 
         for other_user in available_users:
             key = role_key_map.get(other_user.role)

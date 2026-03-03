@@ -57,14 +57,15 @@ class TestChatList:
         assert "partners" in response.data
         assert "stores" in response.data
 
-    def test_store_sees_only_admins_and_partners(self, store_user, partner, admin):
-        """Магазин видит только категории admins и partners."""
+    def test_store_has_empty_stores_category(self, store_user, partner, admin):
+        """Магазин получает все 3 ключа, но stores всегда пустой."""
         response = auth_client(store_user).get("/api/chats/")
 
         assert response.status_code == status.HTTP_200_OK
         assert "admins" in response.data
         assert "partners" in response.data
-        assert "stores" not in response.data
+        assert "stores" in response.data
+        assert response.data["stores"] == []
 
     def test_chats_auto_created_on_first_call(self, partner, store_user, admin):
         """При первом вызове чаты создаются автоматически для всех доступных пользователей."""
