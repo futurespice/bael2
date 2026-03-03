@@ -11,6 +11,7 @@ from .serializers import (
     CreateChatSerializer,
     MessageSerializer,
     UserShortSerializer,
+    UserWithChatSerializer,
 )
 
 User = get_user_model()
@@ -110,5 +111,21 @@ class AvailableUsersView(APIView):
         if user.role == 'store':
             qs = qs.filter(role__in=['partner', 'admin'])
 
-        serializer = UserShortSerializer(qs, many=True)
+        # Строим маппинг {other_user_id: chat_id} для текущего пользователя
+        chats = Chat.objects.filter(participants=user).prefetch_related('participants')
+        chat_map = {}
+        for chat in chats:
+            for participant in chat.participants.all():
+                if participant.id != user.id:
+                    chat_map[participant.id] = chat.id
+
+        # Авто-создаём чаты для тех, у кого их ещё нет
+        users_list = list(qs)
+        for other_user in users_list:
+            if other_user.id not in chat_map:
+                chat = Chat.objects.create()
+                chat.participants.add(user, other_user)
+                chat_map[other_user.id] = chat.id
+
+        serializer = UserWithChatSerializer(users_list, many=True, context={'chat_map': chat_map})
         return Response(serializer.data)

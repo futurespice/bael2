@@ -16,6 +16,18 @@ class UserShortSerializer(serializers.ModelSerializer):
         return obj.get_full_name()
 
 
+class UserWithChatSerializer(UserShortSerializer):
+    """UserShortSerializer + chat_id (None если чата ещё нет)."""
+    chat_id = serializers.SerializerMethodField()
+
+    class Meta(UserShortSerializer.Meta):
+        fields = UserShortSerializer.Meta.fields + ['chat_id']
+
+    def get_chat_id(self, obj):
+        chat_map = self.context.get('chat_map', {})
+        return chat_map.get(obj.id)
+
+
 class MessageSerializer(serializers.ModelSerializer):
     sender = UserShortSerializer(read_only=True)
 

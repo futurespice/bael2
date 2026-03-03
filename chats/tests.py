@@ -340,6 +340,23 @@ class TestAvailableUsers:
             store_user.is_active = True
             store_user.save()
 
+    def test_user_has_chat_id_if_chat_exists(self, partner, store_user):
+        """chat_id не None, если чат с этим пользователем уже существует."""
+        chat = make_chat(partner, store_user)
+
+        response = auth_client(partner).get("/api/chats/users/")
+
+        user_data = next(u for u in response.data if u["id"] == store_user.id)
+        assert user_data["chat_id"] == chat.id
+
+    def test_chat_auto_created_if_not_exists(self, partner, store_user):
+        """GET /users/ авто-создаёт чат если его ещё нет, chat_id всегда не None."""
+        response = auth_client(partner).get("/api/chats/users/")
+
+        user_data = next(u for u in response.data if u["id"] == store_user.id)
+        assert user_data["chat_id"] is not None
+        assert Chat.objects.filter(participants=partner).filter(participants=store_user).exists()
+
 
 # ===========================================================================
 # Матрица ролей (все комбинации из ТЗ)
