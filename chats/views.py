@@ -25,26 +25,52 @@ class ChatListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        chats = (
-            Chat.objects.filter(participants=request.user)
-            .prefetch_related('participants', 'messages')
-            .order_by('-updated_at')
+        user = request.user
+
+        # Роли собеседников в зависимости от роли текущего пользователя
+        if user.role == 'store':
+            allowed_roles = ['admin', 'partner']
+        else:
+            allowed_roles = ['admin', 'partner', 'store']
+
+        available_users = list(
+            User.objects.exclude(id=user.id)
+            .filter(is_active=True, role__in=allowed_roles)
         )
 
-        # Фильтр по роли собеседника: ?role=store | partner | admin
-        # Доступен только для admin и partner (store видит всего два типа, фильтр им не нужен)
-        role_filter = request.query_params.get('role')
-        if role_filter and request.user.role in ('admin', 'partner'):
-            valid_roles = {'store', 'partner', 'admin'}
-            if role_filter in valid_roles:
-                chats = chats.filter(participants__role=role_filter).exclude(
-                    participants=request.user
-                )
-                # После filter/exclude могут появиться дубли — убираем
-                chats = chats.distinct()
+        # Маппинг {other_user_id: chat_id} из уже существующих чатов
+        existing_chats = Chat.objects.filter(participants=user).prefetch_related('participants')
+        chat_id_map = {}
+        for chat in existing_chats:
+            for participant in chat.participants.all():
+                if participant.id != user.id:
+                    chat_id_map[participant.id] = chat.id
 
-        serializer = ChatSerializer(chats, many=True, context={'request': request})
-        return Response(serializer.data)
+        # Авто-создаём чаты для тех, у кого их ещё нет
+        for other_user in available_users:
+            if other_user.id not in chat_id_map:
+                chat = Chat.objects.create()
+                chat.participants.add(user, other_user)
+                chat_id_map[other_user.id] = chat.id
+
+        # Загружаем все чаты с prefetch
+        chats_by_id = {
+            c.id: c
+            for c in Chat.objects.filter(id__in=chat_id_map.values())
+            .prefetch_related('participants', 'messages')
+        }
+
+        # Группируем по роли собеседника
+        role_key_map = {'admin': 'admins', 'partner': 'partners', 'store': 'stores'}
+        result = {role_key_map[r]: [] for r in allowed_roles}
+
+        for other_user in available_users:
+            key = role_key_map.get(other_user.role)
+            chat = chats_by_id.get(chat_id_map[other_user.id])
+            if key and chat:
+                result[key].append(ChatSerializer(chat, context={'request': request}).data)
+
+        return Response(result)
 
     def post(self, request):
         serializer = CreateChatSerializer(data=request.data, context={'request': request})

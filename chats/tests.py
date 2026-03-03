@@ -48,61 +48,50 @@ def auth_client(user) -> APIClient:
 
 class TestChatList:
 
-    def test_returns_only_own_chats(self, partner, store_user, store_user_2):
-        """Пользователь видит только свои чаты."""
-        make_chat(partner, store_user)
-        make_chat(partner, store_user_2)
-        make_chat(store_user, store_user_2)  # partner не участник
-
+    def test_returns_grouped_by_role(self, partner, store_user, admin):
+        """Ответ сгруппирован по ролям: admins, partners, stores."""
         response = auth_client(partner).get("/api/chats/")
 
         assert response.status_code == status.HTTP_200_OK
-        assert len(response.data) == 2
+        assert "admins" in response.data
+        assert "partners" in response.data
+        assert "stores" in response.data
 
-    def test_chats_sorted_newest_first(self, partner, store_user, admin):
-        """Чаты сортируются по updated_at — новые первее."""
-        make_chat(partner, store_user)
-        chat_new = make_chat(partner, admin)
-        make_message(chat_new, partner, "обновляем")  # chat_new будет новее
+    def test_store_sees_only_admins_and_partners(self, store_user, partner, admin):
+        """Магазин видит только категории admins и partners."""
+        response = auth_client(store_user).get("/api/chats/")
 
+        assert response.status_code == status.HTTP_200_OK
+        assert "admins" in response.data
+        assert "partners" in response.data
+        assert "stores" not in response.data
+
+    def test_chats_auto_created_on_first_call(self, partner, store_user, admin):
+        """При первом вызове чаты создаются автоматически для всех доступных пользователей."""
         response = auth_client(partner).get("/api/chats/")
 
         assert response.status_code == status.HTTP_200_OK
-        assert response.data[0]["id"] == chat_new.id
+        # У partner есть чаты с admin (admins) и store_user (stores)
+        assert len(response.data["admins"]) >= 1
+        assert len(response.data["stores"]) >= 1
 
-    def test_response_contains_last_message_and_unread_count(self, partner, store_user):
-        """Список чатов содержит last_message и unread_count."""
-        chat = make_chat(partner, store_user)
+    def test_response_contains_last_message_and_unread_count(self, partner, store_user, admin):
+        """Каждый чат содержит last_message и unread_count."""
+        # Вызываем сначала чтобы чат создался
+        auth_client(partner).get("/api/chats/")
+        chat = Chat.objects.filter(participants=partner).filter(participants=store_user).first()
         make_message(chat, store_user, "Новое сообщение")
 
         response = auth_client(partner).get("/api/chats/")
 
-        assert response.status_code == status.HTTP_200_OK
-        data = response.data[0]
-        assert data["last_message"]["content"] == "Новое сообщение"
-        assert data["unread_count"] == 1
+        stores_chats = response.data["stores"]
+        chat_data = next(c for c in stores_chats if c["id"] == chat.id)
+        assert chat_data["last_message"]["content"] == "Новое сообщение"
+        assert chat_data["unread_count"] == 1
 
     def test_unauthenticated_request_returns_401(self):
         """Без авторизации — 401."""
         assert APIClient().get("/api/chats/").status_code == status.HTTP_401_UNAUTHORIZED
-
-    def test_role_filter_returns_correct_chats(self, admin, partner, store_user):
-        """?role=store показывает только чаты с магазинами."""
-        make_chat(admin, partner)
-        make_chat(admin, store_user)
-
-        response = auth_client(admin).get("/api/chats/?role=store")
-
-        assert response.status_code == status.HTTP_200_OK
-        for item in response.data:
-            assert item["other_participant"]["role"] == "store"
-
-    def test_no_chats_returns_empty_list(self, store_user_2):
-        """Пользователь без чатов получает пустой список."""
-        response = auth_client(store_user_2).get("/api/chats/")
-
-        assert response.status_code == status.HTTP_200_OK
-        assert response.data == []
 
 
 # ===========================================================================
