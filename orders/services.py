@@ -101,17 +101,20 @@ class OrderWorkflowService:
                 f'Статус: {store.get_approval_status_display()}'
             )
 
+        # Предзагружаем все товары одним запросом вместо N запросов в цикле
+        product_ids = [item.product_id for item in items_data]
+        products_map = {
+            p.id: p
+            for p in Product.objects.filter(id__in=product_ids, is_active=True)
+        }
+
         # Валидация и создание позиций
         total_amount = Decimal('0')
         items_to_create = []
 
         for item_data in items_data:
-            try:
-                product = Product.objects.get(
-                    pk=item_data.product_id,
-                    is_active=True
-                )
-            except Product.DoesNotExist:
+            product = products_map.get(item_data.product_id)
+            if product is None:
                 raise ValidationError(
                     f'Товар с ID {item_data.product_id} не найден или неактивен'
                 )
@@ -169,9 +172,9 @@ class OrderWorkflowService:
             created_by=created_by,
         )
 
-        # Создание позиций
-        for item in items_to_create:
-            StoreOrderItem.objects.create(
+        # Создание позиций одним bulk_create вместо N отдельных INSERT
+        StoreOrderItem.objects.bulk_create([
+            StoreOrderItem(
                 order=order,
                 product=item['product'],
                 quantity=item['quantity'],
@@ -179,6 +182,8 @@ class OrderWorkflowService:
                 total=item['total'],
                 is_bonus=item['is_bonus'],
             )
+            for item in items_to_create
+        ])
 
         # История
         OrderHistory.objects.create(
@@ -348,28 +353,30 @@ class OrderWorkflowService:
                 f'Только предзаказы можно принимать. Текущий тип: {order.order_type}'
             )
 
-        # Проверка наличия товаров на складе и уменьшение остатков
-        order_items = order.items.select_related('product').all()
+        # Загружаем товары с блокировкой, чтобы исключить TOCTOU при параллельных заказах
+        order_items = list(order.items.select_related('product').all())
+        product_ids = [item.product_id for item in order_items]
+        locked_products = {
+            p.id: p
+            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
 
+        # Проверка наличия на актуальных заблокированных данных
         for item in order_items:
-            product = item.product
-
+            product = locked_products[item.product_id]
             if product.stock_quantity < item.quantity:
                 raise ValidationError(
                     f'Недостаточно товара "{product.name}" на складе. '
                     f'Доступно: {product.stock_quantity}, требуется: {item.quantity}'
                 )
 
-        # Уменьшаем остатки на складе
+        # Уменьшаем остатки атомарно через F()
         for item in order_items:
-            product = item.product
-            product.stock_quantity -= item.quantity
-
-            if product.stock_quantity <= Decimal('0'):
-                product.stock_quantity = Decimal('0')
-                product.is_available = False
-
-            product.save(update_fields=['stock_quantity', 'is_available'])
+            new_qty = locked_products[item.product_id].stock_quantity - item.quantity
+            Product.objects.filter(pk=item.product_id).update(
+                stock_quantity=F('stock_quantity') - item.quantity,
+                is_available=new_qty > Decimal('0'),
+            )
 
         # Изменение статуса
         old_status = order.status
@@ -541,13 +548,13 @@ class BasketService:
         """
         from django.db.models import Sum
 
-        # Получаем все IN_TRANSIT заказы
-        orders = StoreOrder.objects.filter(
+        # Получаем все IN_TRANSIT заказы (list чтобы не делать два SQL вызова)
+        orders = list(StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.IN_TRANSIT
-        ).prefetch_related('items__product__images').order_by('created_at')
+        ).prefetch_related('items__product__images').order_by('created_at'))
 
-        if not orders.exists():
+        if not orders:
             return {
                 'store_id': store.id,
                 'store_name': store.name,
@@ -1046,16 +1053,23 @@ class PartnerRequestService:
             notes=notes
         )
         
+        # Предварительно загружаем все товары одним запросом
+        product_ids = [item_data.get('product') for item_data in items]
+        products_map = {
+            p.id: p for p in Product.objects.filter(pk__in=product_ids)
+        }
+
+        items_to_create = []
+
         # Создаём позиции запроса
         for item_data in items:
             product_id = item_data.get('product')
             quantity = Decimal(str(item_data.get('quantity', 0)))
             weight = item_data.get('weight')
             is_bonus = item_data.get('is_bonus', False)
-            
-            try:
-                product = Product.objects.get(pk=product_id)
-            except Product.DoesNotExist:
+
+            product = products_map.get(product_id)
+            if product is None:
                 request.delete()
                 raise ValidationError(f'Товар с ID {product_id} не найден')
             
@@ -1103,17 +1117,19 @@ class PartnerRequestService:
                     is_bonus=is_bonus
                 )
             
-            # Создаём позицию
+            # Собираем позицию для bulk_create
             # Для весовых: quantity = weight (для правильного расчёта суммы)
-            PartnerRequestItem.objects.create(
+            items_to_create.append(PartnerRequestItem(
                 request=request,
                 product=product,
                 quantity=effective_quantity,
                 weight=weight if product.is_weight_based else None,
                 price_at_request=product.final_price,
-                is_bonus=is_bonus
-            )
-        
+                is_bonus=is_bonus,
+            ))
+
+        PartnerRequestItem.objects.bulk_create(items_to_create)
+
         logger.info(
             f"Создан запрос партнёра #{request.id} | "
             f"Partner: {partner.id} | Type: {request_type} | "
@@ -1519,12 +1535,19 @@ class ManualOrderService:
         )
         
         total_amount = Decimal('0')
-        
+
+        # Предварительно загружаем все товары одним запросом
+        product_ids = [item_data.product_id for item_data in items]
+        products_map = {
+            p.id: p for p in Product.objects.filter(pk__in=product_ids)
+        }
+
+        order_items_to_create = []
+
         # Обрабатываем товары
         for item_data in items:
-            try:
-                product = Product.objects.get(pk=item_data.product_id)
-            except Product.DoesNotExist:
+            product = products_map.get(item_data.product_id)
+            if product is None:
                 raise ValidationError(f'Товар с ID {item_data.product_id} не найден')
 
             quantity = item_data.quantity
@@ -1560,15 +1583,15 @@ class ManualOrderService:
                     quantity=quantity
                 )
                 
-                # Создаём позицию заказа (бонус)
-                StoreOrderItem.objects.create(
+                # Собираем позицию заказа (бонус)
+                order_items_to_create.append(StoreOrderItem(
                     order=order,
                     product=product,
                     quantity=quantity,
-                    price=item_data.price or product.final_price, # Цена справочная, total=0
+                    price=item_data.price or product.final_price,  # Цена справочная, total=0
                     total=Decimal('0'),
-                    is_bonus=True
-                )
+                    is_bonus=True,
+                ))
                 
             else:
                 # 2. Если это обычный товар
@@ -1630,32 +1653,34 @@ class ManualOrderService:
                     quantity=quantity + bonus_quantity
                 )
 
-                # Создаём позицию заказа (платная часть)
+                # Собираем позицию заказа (платная часть)
                 price = item_data.price or product.final_price
                 item_total = price * quantity
 
-                StoreOrderItem.objects.create(
+                order_items_to_create.append(StoreOrderItem(
                     order=order,
                     product=product,
                     quantity=quantity,
                     price=price,
                     total=item_total,
-                    is_bonus=False
-                )
+                    is_bonus=False,
+                ))
 
-                # Создаём бонусную позицию
+                # Собираем бонусную позицию
                 if bonus_quantity > 0:
-                    StoreOrderItem.objects.create(
+                    order_items_to_create.append(StoreOrderItem(
                         order=order,
                         product=product,
                         quantity=bonus_quantity,
                         price=price,
                         total=Decimal('0'),
-                        is_bonus=True
-                    )
+                        is_bonus=True,
+                    ))
 
                 total_amount += item_total
-        
+
+        StoreOrderItem.objects.bulk_create(order_items_to_create)
+
         # Обновляем заказ (округляем до 2 знаков после запятой)
         total_amount = total_amount.quantize(Decimal('0.01'))
         debt_amount = (total_amount - prepayment_amount).quantize(Decimal('0.01'))

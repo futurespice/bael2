@@ -120,12 +120,36 @@ def recalculate_costs_by_sales():
     logger.info(f"Накладные расходы за период: {total_overhead}")
 
     # =========================================================================
-    # 3. ОБНОВЛЯЕМ КАЖДЫЙ ТОВАР
+    # 3. ПРЕДЗАГРУЖАЕМ ВСЕ РЕЦЕПТЫ ОДНИМ ЗАПРОСОМ
     # =========================================================================
 
-    products = Product.objects.filter(is_active=True)
+    products = list(Product.objects.filter(is_active=True))
+    product_ids = [p.id for p in products]
+
+    # Один запрос вместо N запросов per product
+    all_recipes = ProductRecipe.objects.filter(
+        product_id__in=product_ids,
+        expense__expense_type=ExpenseType.PHYSICAL,
+    ).select_related('expense')
+
+    # Строим lookup: product_id → {'suzerain': recipe|None, 'others': [recipe, ...]}
+    recipes_by_product: dict = {pid: {'suzerain': None, 'others': []} for pid in product_ids}
+    for recipe in all_recipes:
+        entry = recipes_by_product[recipe.product_id]
+        if recipe.expense.expense_status == ExpenseStatus.SUZERAIN:
+            entry['suzerain'] = recipe
+        else:
+            entry['others'].append(recipe)
+
+    # =========================================================================
+    # 4. ОБНОВЛЯЕМ КАЖДЫЙ ТОВАР
+    # =========================================================================
+
+    from django.utils import timezone as tz
+
     updated = 0
     results = []
+    products_to_bulk_update = []
 
     for product in products:
         try:
@@ -135,7 +159,6 @@ def recalculate_costs_by_sales():
             })
 
             sales_quantity = product_sales['quantity']
-            sales_revenue = product_sales['revenue']
 
             # Доля в продажах
             if total_sales_quantity > 0:
@@ -151,28 +174,15 @@ def recalculate_costs_by_sales():
             # =====================================================
 
             total_physical = Decimal('0')
-
-            # Получаем рецепт товара
-            suzerain_recipe = ProductRecipe.objects.filter(
-                product=product,
-                expense__expense_status=ExpenseStatus.SUZERAIN
-            ).select_related('expense').first()
+            entry = recipes_by_product.get(product.id, {'suzerain': None, 'others': []})
+            suzerain_recipe = entry['suzerain']
 
             if suzerain_recipe and sales_quantity > 0 and suzerain_recipe.quantity_per_unit:
-                # Объём сюзерена = количество × норма на единицу
                 suzerain_volume = sales_quantity * suzerain_recipe.quantity_per_unit
                 suzerain_cost = suzerain_volume * (suzerain_recipe.expense.price_per_unit or Decimal('0'))
                 total_physical += suzerain_cost
 
-                # Остальные физические расходы (пропорции от сюзерена)
-                other_recipes = ProductRecipe.objects.filter(
-                    product=product,
-                    expense__expense_type=ExpenseType.PHYSICAL
-                ).exclude(
-                    expense__expense_status=ExpenseStatus.SUZERAIN
-                ).select_related('expense')
-
-                for recipe in other_recipes:
+                for recipe in entry['others']:
                     if recipe.proportion:
                         item_volume = suzerain_volume * recipe.proportion
                         item_cost = item_volume * (recipe.expense.price_per_unit or Decimal('0'))
@@ -187,15 +197,13 @@ def recalculate_costs_by_sales():
             if sales_quantity > 0:
                 cost_per_unit = (total_cost / sales_quantity).quantize(Decimal('0.01'))
             else:
-                # Для товаров без продаж используем старую себестоимость
                 cost_per_unit = product.average_cost_price or Decimal('0')
 
-            # Обновляем товар
             old_cost = product.average_cost_price
             product.average_cost_price = cost_per_unit
-            product.popularity_weight = sales_share * 100  # В процентах
-            product.save(update_fields=['average_cost_price', 'popularity_weight', 'updated_at'])
-
+            product.popularity_weight = sales_share * 100
+            product.updated_at = tz.now()
+            products_to_bulk_update.append(product)
             updated += 1
 
             results.append({
@@ -216,6 +224,14 @@ def recalculate_costs_by_sales():
 
         except Exception as e:
             logger.error(f"Ошибка пересчёта {product.name}: {e}")
+
+    # Один bulk_update вместо N отдельных .save()
+    if products_to_bulk_update:
+        Product.objects.bulk_update(
+            products_to_bulk_update,
+            ['average_cost_price', 'popularity_weight', 'updated_at'],
+            batch_size=500,
+        )
 
     logger.info(f"Пересчитана себестоимость {updated} товаров")
 

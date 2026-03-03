@@ -154,43 +154,44 @@ def send_pending_orders_reminder():
         created_at__lt=threshold
     ).select_related('store')
     
-    if not pending_orders.exists():
+    pending_count = pending_orders.count()
+    if not pending_count:
         logger.info("Нет заказов, ожидающих более 24 часов")
         return
-    
+
     # Формируем сводку
     order_list = "\n".join([
         f"- Заказ #{o.id} от {o.store.name} ({o.created_at.strftime('%d.%m.%Y')})"
         for o in pending_orders[:20]  # Максимум 20 в письме
     ])
-    
+
     message = f"""
 Внимание! Есть заказы, ожидающие обработки более 24 часов:
 
 {order_list}
 
-Всего: {pending_orders.count()} заказ(ов)
+Всего: {pending_count} заказ(ов)
 
 ---
 БайЭл - B2B платформа
     """
-    
+
     # Отправляем админам
     admin_emails = User.objects.filter(
         role='admin',
         is_active=True
     ).exclude(email='').values_list('email', flat=True)
-    
+
     for email in admin_emails:
         send_mail(
-            subject=f'Напоминание: {pending_orders.count()} заказов ожидают обработки',
+            subject=f'Напоминание: {pending_count} заказов ожидают обработки',
             message=message,
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[email],
             fail_silently=True,
         )
-    
-    logger.info(f"Напоминание отправлено: {pending_orders.count()} заказов")
+
+    logger.info(f"Напоминание отправлено: {pending_count} заказов")
 
 
 # =============================================================================
@@ -207,19 +208,27 @@ def generate_daily_stats_report():
     from .models import StoreOrder, StoreOrderStatus
     from users.models import User
     from datetime import date
-    
+    from django.db.models import Count, Sum, Q
+
     today = date.today()
-    
-    # Собираем статистику за день
-    orders_today = StoreOrder.objects.filter(created_at__date=today)
-    
+
+    # Собираем статистику за день одним запросом
+    counts = StoreOrder.objects.filter(created_at__date=today).aggregate(
+        total_orders=Count('id'),
+        pending=Count('id', filter=Q(status=StoreOrderStatus.PENDING)),
+        in_transit=Count('id', filter=Q(status=StoreOrderStatus.IN_TRANSIT)),
+        accepted=Count('id', filter=Q(status=StoreOrderStatus.ACCEPTED)),
+        rejected=Count('id', filter=Q(status=StoreOrderStatus.REJECTED)),
+        total_amount=Sum('total_amount', filter=Q(status=StoreOrderStatus.ACCEPTED)),
+    )
+
     stats = {
-        'total_orders': orders_today.count(),
-        'pending': orders_today.filter(status=StoreOrderStatus.PENDING).count(),
-        'in_transit': orders_today.filter(status=StoreOrderStatus.IN_TRANSIT).count(),
-        'accepted': orders_today.filter(status=StoreOrderStatus.ACCEPTED).count(),
-        'rejected': orders_today.filter(status=StoreOrderStatus.REJECTED).count(),
-        'total_amount': sum(o.total_amount for o in orders_today.filter(status=StoreOrderStatus.ACCEPTED)),
+        'total_orders': counts['total_orders'],
+        'pending': counts['pending'],
+        'in_transit': counts['in_transit'],
+        'accepted': counts['accepted'],
+        'rejected': counts['rejected'],
+        'total_amount': counts['total_amount'] or Decimal('0'),
     }
     
     message = f"""

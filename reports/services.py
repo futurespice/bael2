@@ -527,21 +527,17 @@ class ReportService:
         for h in all_histories:
             histories_by_order[h.order_id].append(h)
 
-        # Группируем заказы по дням
+        # Группируем заказы по дням (dict для O(1) lookup вместо O(N) linear scan)
         history = []
+        history_by_date: dict = {}
 
         for order in orders_list:
-            order_date = order.confirmed_at.date()
-
-            # Ищем существующую запись за этот день
-            day_data = next(
-                (item for item in history if item['date'] == str(order_date)),
-                None
-            )
+            order_date = str(order.confirmed_at.date())
+            day_data = history_by_date.get(order_date)
 
             if not day_data:
                 day_data = {
-                    'date': str(order_date),
+                    'date': order_date,
                     'orders': [],
                     'products': [],
                     'bonus_products': [],
@@ -554,6 +550,7 @@ class ReportService:
                     'total_paid_debt': 0.0,
                     'remaining_debt': 0.0,
                 }
+                history_by_date[order_date] = day_data
                 history.append(day_data)
 
             # Добавляем информацию о заказе
@@ -925,34 +922,20 @@ class PartnerStatisticsService:
             })
         
         # =========================================================================
-        # 7. ДОЛГИ (за выбранный период)
+        # 7 & 8. ДОЛГИ — два aggregate с одинаковыми фильтрами объединены в один запрос
         # =========================================================================
-        # Исходный долг по заказам партнёра за период
-        original_debt = StoreOrder.objects.filter(
+        orders_agg = StoreOrder.objects.filter(
             partner_id=partner_id,
             status=StoreOrderStatus.ACCEPTED,
             confirmed_at__range=[date_from, date_to]
         ).aggregate(
-            total=Sum('debt_amount')
-        )['total'] or Decimal('0')
+            total_debt=Sum('debt_amount'),
+            total_prepayment=Sum('prepayment_amount'),
+        )
+        original_debt = orders_agg['total_debt'] or Decimal('0')
+        prepayment_in_period = orders_agg['total_prepayment'] or Decimal('0')
 
-        # Погашения долга по заказам партнёра за период
-        all_debt_payments = DebtPayment.objects.filter(
-            order__partner_id=partner_id,
-            created_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum('amount')
-        )['total'] or Decimal('0')
-
-        # Оставшийся долг = исходный - погашения
-        unpaid_debt = original_debt - all_debt_payments
-        if unpaid_debt < Decimal('0'):
-            unpaid_debt = Decimal('0')
-
-        # =========================================================================
-        # 8. ПОГАШЕННЫЙ ДОЛГ (предоплата + погашения через pay-debt за период)
-        # =========================================================================
-        # Погашения через pay-debt за период
+        # Погашения долга по заказам партнёра за период (один запрос вместо двух)
         debt_payments_in_period = DebtPayment.objects.filter(
             order__partner_id=partner_id,
             created_at__range=[date_from, date_to]
@@ -960,14 +943,10 @@ class PartnerStatisticsService:
             total=Sum('amount')
         )['total'] or Decimal('0')
 
-        # Предоплата за период
-        prepayment_in_period = StoreOrder.objects.filter(
-            partner_id=partner_id,
-            status=StoreOrderStatus.ACCEPTED,
-            confirmed_at__range=[date_from, date_to]
-        ).aggregate(
-            total=Sum('prepayment_amount')
-        )['total'] or Decimal('0')
+        # Оставшийся долг = исходный - погашения
+        unpaid_debt = original_debt - debt_payments_in_period
+        if unpaid_debt < Decimal('0'):
+            unpaid_debt = Decimal('0')
 
         # Всего погашено = предоплата + погашения долга
         paid_debt = prepayment_in_period + debt_payments_in_period

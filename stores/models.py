@@ -737,14 +737,16 @@ class StoreInventory(models.Model):
                 'quantity': 'Количество не может быть отрицательным'
             })
 
-    @transaction.atomic
     def add_quantity(self, amount: Decimal) -> None:
         """Добавить количество товара в инвентарь."""
         if amount <= Decimal('0'):
             raise ValidationError('Количество для добавления должно быть больше 0')
 
-        self.quantity += amount
-        self.save(update_fields=['quantity', 'last_updated'])
+        StoreInventory.objects.filter(pk=self.pk).update(
+            quantity=models.F('quantity') + amount,
+            last_updated=timezone.now(),
+        )
+        self.refresh_from_db(fields=['quantity'])
 
     @transaction.atomic
     def subtract_quantity(self, amount: Decimal) -> None:
@@ -752,14 +754,18 @@ class StoreInventory(models.Model):
         if amount <= Decimal('0'):
             raise ValidationError('Количество для вычитания должно быть больше 0')
 
-        if amount > self.quantity:
+        locked = StoreInventory.objects.select_for_update().get(pk=self.pk)
+        if amount > locked.quantity:
             raise ValidationError(
                 f'Недостаточно товара в инвентаре. '
-                f'Доступно: {self.quantity}, запрошено: {amount}'
+                f'Доступно: {locked.quantity}, запрошено: {amount}'
             )
 
-        self.quantity -= amount
-        self.save(update_fields=['quantity', 'last_updated'])
+        StoreInventory.objects.filter(pk=self.pk).update(
+            quantity=models.F('quantity') - amount,
+            last_updated=timezone.now(),
+        )
+        self.refresh_from_db(fields=['quantity'])
 
         if self.quantity == Decimal('0'):
             self.delete()

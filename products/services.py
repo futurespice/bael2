@@ -13,7 +13,7 @@ from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from django.db import transaction
-from django.db.models import Sum, Q
+from django.db.models import Sum, Q, F
 
 from .models import (
     Expense,
@@ -347,13 +347,13 @@ class OverheadDistributor:
         Returns:
             Сумма накладных расходов для данного товара
         """
-        # Получаем все накладные расходы
-        overhead_expenses = Expense.objects.filter(
+        # Один запрос вместо двух (.exists() + итерация)
+        overhead_expenses = list(Expense.objects.filter(
             expense_type=ExpenseType.OVERHEAD,
             is_active=True
-        )
+        ))
 
-        if not overhead_expenses.exists():
+        if not overhead_expenses:
             return Decimal('0')
 
         # Считаем общую сумму накладных за день
@@ -705,9 +705,11 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем склад: всегда добавляем количество новой партии.
-        product.stock_quantity += result.quantity_produced
-        product.save(update_fields=['stock_quantity'])
+        # Обновляем склад атомарно (F-expression предотвращает race condition).
+        Product.objects.filter(pk=product.pk).update(
+            stock_quantity=F('stock_quantity') + result.quantity_produced
+        )
+        product.refresh_from_db(fields=['stock_quantity'])
         product.update_average_cost_price()
 
         return batch
@@ -750,9 +752,11 @@ class ProductionService:
             notes=notes
         )
 
-        # Обновляем склад: всегда добавляем количество новой партии.
-        product.stock_quantity += result.quantity_produced
-        product.save(update_fields=['stock_quantity'])
+        # Обновляем склад атомарно (F-expression предотвращает race condition).
+        Product.objects.filter(pk=product.pk).update(
+            stock_quantity=F('stock_quantity') + result.quantity_produced
+        )
+        product.refresh_from_db(fields=['stock_quantity'])
         product.update_average_cost_price()
 
         return batch
@@ -823,8 +827,14 @@ class AccountingService:
             key=lambda x: 0 if expense_statuses.get(x['expense_id']) == ExpenseStatus.SUZERAIN else 1
         )
 
+        # Bulk-проверка товаров одним запросом вместо N запросов per item
+        recipe_product_ids = [item['product_id'] for item in sorted_recipe_items]
+        valid_product_ids = set(
+            Product.objects.filter(id__in=recipe_product_ids).values_list('id', flat=True)
+        )
+
         for item in sorted_recipe_items:
-            if not Product.objects.filter(id=item['product_id']).exists():
+            if item['product_id'] not in valid_product_ids:
                 raise ValueError(f"Товар с id={item['product_id']} не найден")
             if item['expense_id'] not in expense_statuses:
                 raise ValueError(f"Расход с id={item['expense_id']} не найден")

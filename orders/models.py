@@ -563,6 +563,8 @@ class StoreOrder(models.Model):
             models.Index(fields=['reviewed_by']),
             models.Index(fields=['confirmed_by']),
             models.Index(fields=['-created_at']),
+            models.Index(fields=['store', 'status']),
+            models.Index(fields=['partner', 'status']),
         ]
 
     def __str__(self) -> str:
@@ -600,9 +602,11 @@ class StoreOrder(models.Model):
         ВНИМАНИЕ: Рекомендуется использовать /api/stores/{id}/pay-debt/
         для погашения общего долга магазина.
         """
-        if amount > self.outstanding_debt:
+        # select_for_update чтобы избежать TOCTOU: проверяем актуальные данные
+        locked = StoreOrder.objects.select_for_update().get(pk=self.pk)
+        if amount > locked.outstanding_debt:
             raise ValidationError(
-                f'Сумма ({amount}) превышает непогашенный долг ({self.outstanding_debt})'
+                f'Сумма ({amount}) превышает непогашенный долг ({locked.outstanding_debt})'
             )
 
         payment = DebtPayment.objects.create(
@@ -613,7 +617,7 @@ class StoreOrder(models.Model):
             comment=comment
         )
 
-        # Обновляем paid_amount
+        # Обновляем paid_amount атомарно
         StoreOrder.objects.filter(pk=self.pk).update(
             paid_amount=models.F('paid_amount') + amount
         )

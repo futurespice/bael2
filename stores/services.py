@@ -23,7 +23,7 @@ from typing import List, Optional, Dict, Any, Tuple
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import QuerySet, Q, Sum, Count
+from django.db.models import QuerySet, Q, Sum, Count, F
 from django.utils import timezone
 
 from .models import (
@@ -962,9 +962,12 @@ class PartnerInventoryService:
             defaults={'quantity': Decimal('0')}
         )
         
-        # Увеличить количество
-        inventory.quantity += quantity
-        inventory.save(update_fields=['quantity', 'updated_at'])
+        # Увеличить количество атомарно (F-expression предотвращает race condition)
+        from .models import PartnerInventory as _PI
+        _PI.objects.filter(pk=inventory.pk).update(
+            quantity=F('quantity') + quantity,
+        )
+        inventory.refresh_from_db(fields=['quantity'])
         
         bonus_mark = " [БОНУС]" if is_bonus else ""
         logger.info(
@@ -1003,21 +1006,22 @@ class PartnerInventoryService:
         
         bonus_mark = " [БОНУС]" if is_bonus else ""
         try:
-            inventory = PartnerInventory.objects.get(
+            # select_for_update фиксирует строку, исключает TOCTOU при параллельных вызовах
+            inventory = PartnerInventory.objects.select_for_update().get(
                 partner=partner,
                 product=product,
                 is_bonus=is_bonus
             )
         except PartnerInventory.DoesNotExist:
             raise ValidationError(f'Товар {product.name}{bonus_mark} не найден в инвентаре')
-        
-        # Проверка доступного количества
+
+        # Проверка доступного количества (на актуальных заблокированных данных)
         if inventory.available_quantity < quantity:
             raise ValidationError(
                 f'Недостаточно товара {product.name}{bonus_mark}. '
                 f'Доступно: {inventory.available_quantity}, запрошено: {quantity}'
             )
-        
+
         # Уменьшить количество
         inventory.quantity -= quantity
         
