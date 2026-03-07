@@ -50,6 +50,12 @@ CSRF_TRUSTED_ORIGINS = [
     'https://api.baielapp.com.kg',
 ]
 
+# Django стоит за Nginx, который терминирует SSL.
+# Без этой настройки Django думает что схема = http и генерирует
+# пагинационные ссылки вида http://, которые блокируются Android 9+.
+# Nginx передаёт заголовок: proxy_set_header X-Forwarded-Proto $scheme;
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 # Добавляем локальные origins для разработки
 if DEBUG:
     CSRF_TRUSTED_ORIGINS += [
@@ -305,7 +311,6 @@ USE_HTTPS = os.environ.get('USE_HTTPS', 'False').lower() in ('true', '1', 'yes')
 if USE_HTTPS and not DEBUG:
     # HTTPS редиректы
     SECURE_SSL_REDIRECT = True
-    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
     # Cookies
     SESSION_COOKIE_SECURE = True
@@ -414,8 +419,6 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': '/api/',
-
-    # В DEBUG режиме локальный сервер первый
 
     # Настройки Swagger UI
     'SWAGGER_UI_SETTINGS': {
