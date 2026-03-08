@@ -135,13 +135,16 @@ class OrderWorkflowService:
                 bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
                 bonus_quantity = Decimal(str(bonus_count))
 
-            # Проверка наличия на складе (основное + бонусное количество)
-            total_needed = quantity + bonus_quantity
-            if product.stock_quantity < total_needed:
+            # Проверка наличия на складе (только платная часть)
+            if product.stock_quantity < quantity:
                 raise ValidationError(
                     f'Недостаточно товара "{product.name}" на складе. '
-                    f'Доступно: {product.stock_quantity}, запрошено: {total_needed}'
+                    f'Доступно: {product.stock_quantity}, запрошено: {quantity}'
                 )
+
+            # Если бонусов не хватает — уменьшаем до доступного остатка
+            if bonus_quantity > 0 and product.stock_quantity < quantity + bonus_quantity:
+                bonus_quantity = product.stock_quantity - quantity
 
             # Цена
             price = item_data.price or product.final_price

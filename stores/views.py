@@ -1842,6 +1842,10 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         # Уменьшаем долг магазина, но НЕ ниже 0 (ТЗ: дефект не может уменьшить долг ниже 0)
         from django.db.models import Case, When, Value, DecimalField as _DecimalField
+        debt_before = store.debt
+        actual_debt_reduction = min(defect_amount, debt_before)
+        defect_credit = defect_amount - actual_debt_reduction  # избыток сверх долга
+
         Store.objects.filter(pk=store.pk).update(
             debt=Case(
                 When(debt__gte=defect_amount, then=F('debt') - defect_amount),
@@ -1851,9 +1855,18 @@ class StoreViewSet(viewsets.ModelViewSet):
         )
         store.refresh_from_db()
 
+        if defect_credit > 0:
+            message = (
+                f'Брак зафиксирован. Долг уменьшен на {actual_debt_reduction} сом. '
+                f'Сумма брака ({defect_amount} сом) превысила долг — '
+                f'излишек {defect_credit} сом не учтён в долге.'
+            )
+        else:
+            message = f'Брак зафиксирован. Долг уменьшен на {defect_amount} сом.'
+
         return Response({
             'success': True,
-            'message': f'Брак зафиксирован. Долг уменьшен на {defect_amount} сом.',
+            'message': message,
             'defect': {
                 'id': defect.id,
                 'product_id': product_id,
@@ -1863,6 +1876,8 @@ class StoreViewSet(viewsets.ModelViewSet):
                 'quantity': float(quantity),
                 'price': float(price),
                 'total_amount': float(defect_amount),
+                'actual_debt_reduction': float(actual_debt_reduction),
+                'defect_credit': float(defect_credit),
                 'reason': reason,
             },
             'store_debt': float(store.debt),
