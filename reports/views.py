@@ -114,7 +114,7 @@ def get_statistics(request: Request) -> Response:
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def get_store_history(request: Request, store_id: int) -> Response:
+def (request: Request, store_id: int) -> Response:
     """
     История магазина с фильтрацией по дате (ТЗ v2.0).
 

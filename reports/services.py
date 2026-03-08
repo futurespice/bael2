@@ -953,9 +953,9 @@ class PartnerStatisticsService:
         
         # =========================================================================
         # 9. ОБЩАЯ СУММА
-        # Формула: продажи - расходы - брак - возвраты + погашенный долг - непогашенный долг
+        # Формула: продажи - расходы - брак - возвраты
         # =========================================================================
-        grand_total = sold_total - expenses_total - defective_total - returned_total + paid_debt - unpaid_debt
+        grand_total = sold_total - expenses_total - defective_total - returned_total
         
         # =========================================================================
         # ФОРМИРУЕМ ОТВЕТ
@@ -1184,17 +1184,20 @@ class PartnerProfileService:
             order_date = order.confirmed_at.strftime('%d.%m.%y')
             
             for item in order.items.all():
+                if item.is_bonus:
+                    continue
+
                 product = item.product
-                
+
                 if product.is_weight_based:
                     unit = 'кг'
                     weight_total += item.quantity
                 else:
                     unit = 'шт'
                     piece_count += int(item.quantity)
-                
+
                 total_amount += item.total
-                
+
                 sales.append({
                     'date': order_date,
                     'store_id': store.id,
