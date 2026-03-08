@@ -1668,38 +1668,37 @@ class ManualOrderService:
                     bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
                     bonus_quantity = Decimal(str(bonus_count))
 
-                # Проверяем наличие основного товара (Paid)
+                # Проверяем наличие у партнёра (платная + бонусная часть из одного склада)
+                total_needed = quantity + bonus_quantity
                 has_inventory = PartnerInventoryService.check_availability(
                     partner=partner,
                     product=product,
-                    quantity=quantity,
+                    quantity=total_needed,
                     is_bonus=False
                 )
                 if not has_inventory:
-                    raise ValidationError(
-                        f'Недостаточно товара {product.name} в инвентаре партнёра'
+                    # Хватает только на платную часть — бонусов нет
+                    has_paid_only = PartnerInventoryService.check_availability(
+                        partner=partner,
+                        product=product,
+                        quantity=quantity,
+                        is_bonus=False
                     )
-                
-                # Списываем основной товар
+                    if not has_paid_only:
+                        raise ValidationError(
+                            f'Недостаточно товара {product.name} в инвентаре партнёра'
+                        )
+                    bonus_quantity = Decimal('0')
+
+                # Списываем из платного инвентаря: основной товар + бонус
                 PartnerInventoryService.remove_from_inventory(
                     partner=partner,
                     product=product,
-                    quantity=quantity,
+                    quantity=quantity + bonus_quantity,
                     is_bonus=False
                 )
 
-                # Если бонусов достаточно в инвентаре — списываем и добавляем магазину
-                if bonus_quantity > 0:
-                    has_bonus_inventory = PartnerInventoryService.check_availability(
-                        partner=partner,
-                        product=product,
-                        quantity=bonus_quantity,
-                        is_bonus=True
-                    )
-                    if not has_bonus_inventory:
-                        bonus_quantity = Decimal('0')
-
-                # Добавляем платную часть в инвентарь магазина
+                # Добавляем в инвентарь магазина
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=product,
@@ -1707,12 +1706,6 @@ class ManualOrderService:
                     is_bonus=False,
                 )
                 if bonus_quantity > 0:
-                    PartnerInventoryService.remove_from_inventory(
-                        partner=partner,
-                        product=product,
-                        quantity=bonus_quantity,
-                        is_bonus=True
-                    )
                     StoreInventoryService.add_to_inventory(
                         store=store,
                         product=product,

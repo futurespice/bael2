@@ -156,13 +156,6 @@ class PartnerBonusTest(TestCase):
             quantity=Decimal('100'),
             is_bonus=False
         )
-        PartnerInventoryService.add_to_inventory(
-            partner=self.partner_user,
-            product=self.product_bonus,
-            quantity=Decimal('10'), # Enough for auto bonus
-            is_bonus=True
-        )
-        
         order_items_data = [
             OrderItemData(
                 product_id=self.product_bonus.id,
@@ -170,15 +163,16 @@ class PartnerBonusTest(TestCase):
                 is_bonus=False
             )
         ]
-        
+
         order = ManualOrderService.create_manual_order(
             partner=self.partner_user,
             store=self.store,
             items=order_items_data
         )
-        
+
         # Verify Order Items
         # 25 платных → 1 бонус (формула: 4*(25//50) + (25%50)//20 = 0+1 = 1)
+        # Бонус берётся из платного инвентаря партнёра (25 платных + 1 бонус = 26 списано)
         self.assertEqual(order.items.count(), 2)
         item_paid = order.items.get(is_bonus=False)
         item_bonus = order.items.get(is_bonus=True)
@@ -186,28 +180,24 @@ class PartnerBonusTest(TestCase):
         self.assertEqual(item_paid.quantity, Decimal('25'))
         self.assertEqual(item_bonus.quantity, Decimal('1'))
 
-        # Verify Inventory Deduction
+        # Verify Inventory Deduction: 100 - 26 = 74 (платный инвентарь)
         inv_paid = PartnerInventory.objects.get(partner=self.partner_user, product=self.product_bonus, is_bonus=False)
-        inv_bonus = PartnerInventory.objects.get(partner=self.partner_user, product=self.product_bonus, is_bonus=True)
-
-        self.assertEqual(inv_paid.quantity, Decimal('75'))  # 100 - 25
-        self.assertEqual(inv_bonus.quantity, Decimal('9'))  # 10 - 1
+        self.assertEqual(inv_paid.quantity, Decimal('74'))  # 100 - 25 - 1(bonus)
 
     def test_manual_order_auto_bonus_insufficient(self):
         """
-        Test manual order auto-bonus when Partner has NO bonus stock.
-        Bonus should NOT be granted.
+        Бонус не выдаётся если у партнёра ровно столько товара сколько заказано (нет остатка под бонус).
+        25 заказано → нужно 25+1=26, но в инвентаре ровно 25 → бонуса нет.
         """
-        
-        # Setup inventory (Paid only)
+
+        # Ровно на платную часть, без запаса для бонуса
         PartnerInventoryService.add_to_inventory(
             partner=self.partner_user,
             product=self.product_bonus,
-            quantity=Decimal('100'),
+            quantity=Decimal('25'),
             is_bonus=False
         )
-        # No bonus inventory
-        
+
         order_items_data = [
             OrderItemData(
                 product_id=self.product_bonus.id,
@@ -215,19 +205,21 @@ class PartnerBonusTest(TestCase):
                 is_bonus=False
             )
         ]
-        
+
         order = ManualOrderService.create_manual_order(
             partner=self.partner_user,
             store=self.store,
             items=order_items_data
         )
-        
-        # Verify Order Items
-        # Should have 1 Paid item (25 qty) and NO Bonus item (because partner has no bonus stock)
+
+        # Только платная позиция, бонуса нет
         self.assertEqual(order.items.count(), 1)
         item_paid = order.items.get(is_bonus=False)
         self.assertEqual(item_paid.quantity, Decimal('25'))
-        
-        # Verify Inventory Deduction
-        inv_paid = PartnerInventory.objects.get(partner=self.partner_user, product=self.product_bonus, is_bonus=False)
-        self.assertEqual(inv_paid.quantity, Decimal('75'))
+
+        # Инвентарь полностью списан
+        self.assertFalse(
+            PartnerInventory.objects.filter(
+                partner=self.partner_user, product=self.product_bonus, is_bonus=False
+            ).exists()
+        )
