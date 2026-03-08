@@ -787,6 +787,13 @@ class BasketService:
                         'quantity': float(item.quantity),
                         'order_id': item.order_id,
                     })
+                    # Освобождаем резерв в PartnerInventory
+                    PartnerInventoryService.release_reserved(
+                        partner=partner_user,
+                        product=item.product,
+                        quantity=item.quantity,
+                        is_bonus=item.is_bonus,
+                    )
                 items.delete()
                 # Атомарный возврат на склад через F() — без race condition
                 Product.objects.filter(pk=product_id).update(
@@ -831,6 +838,13 @@ class BasketService:
                         # Удаляем полностью
                         remaining_to_remove -= item.quantity
                         total_returned += item.quantity
+                        # Освобождаем резерв в PartnerInventory
+                        PartnerInventoryService.release_reserved(
+                            partner=partner_user,
+                            product=item.product,
+                            quantity=item.quantity,
+                            is_bonus=item.is_bonus,
+                        )
                         item.delete()
                     else:
                         # Уменьшаем частично
@@ -1671,7 +1685,18 @@ class ManualOrderService:
                     is_bonus=False
                 )
 
-                # Добавляем платную и бонусную части в инвентарь раздельно
+                # Если бонусов достаточно в инвентаре — списываем и добавляем магазину
+                if bonus_quantity > 0:
+                    has_bonus_inventory = PartnerInventoryService.check_availability(
+                        partner=partner,
+                        product=product,
+                        quantity=bonus_quantity,
+                        is_bonus=True
+                    )
+                    if not has_bonus_inventory:
+                        bonus_quantity = Decimal('0')
+
+                # Добавляем платную часть в инвентарь магазина
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=product,
@@ -1679,6 +1704,12 @@ class ManualOrderService:
                     is_bonus=False,
                 )
                 if bonus_quantity > 0:
+                    PartnerInventoryService.remove_from_inventory(
+                        partner=partner,
+                        product=product,
+                        quantity=bonus_quantity,
+                        is_bonus=True
+                    )
                     StoreInventoryService.add_to_inventory(
                         store=store,
                         product=product,
@@ -1716,6 +1747,8 @@ class ManualOrderService:
 
         # Обновляем заказ (округляем до 2 знаков после запятой)
         total_amount = total_amount.quantize(Decimal('0.01'))
+        if prepayment_amount > total_amount:
+            raise ValidationError('Предоплата не может превышать сумму заказа')
         debt_amount = (total_amount - prepayment_amount).quantize(Decimal('0.01'))
         order.total_amount = total_amount
         order.debt_amount = debt_amount

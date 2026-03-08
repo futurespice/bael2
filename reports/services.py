@@ -275,6 +275,12 @@ class ReportService:
         if filters.partner_id:
             paid_debt_qs = paid_debt_qs.filter(order__partner_id=filters.partner_id)
 
+        if filters.region_id:
+            paid_debt_qs = paid_debt_qs.filter(order__store__region_id=filters.region_id)
+
+        if filters.city_id:
+            paid_debt_qs = paid_debt_qs.filter(order__store__city_id=filters.city_id)
+
         paid_debt_data = paid_debt_qs.aggregate(total=Sum('amount'))
         debt_payments_total = paid_debt_data['total'] or Decimal('0')
 
@@ -302,12 +308,15 @@ class ReportService:
 
         if filters.store_id:
             bonus_items_qs = bonus_items_qs.filter(order__store_id=filters.store_id)
-        else:
-            bonus_items_qs = bonus_items_qs.filter(order__store__is_active=True)
-            if filters.region_id:
-                bonus_items_qs = bonus_items_qs.filter(order__store__region_id=filters.region_id)
-            if filters.city_id:
-                bonus_items_qs = bonus_items_qs.filter(order__store__city_id=filters.city_id)
+
+        if filters.partner_id:
+            bonus_items_qs = bonus_items_qs.filter(order__partner_id=filters.partner_id)
+
+        if filters.region_id:
+            bonus_items_qs = bonus_items_qs.filter(order__store__region_id=filters.region_id)
+
+        if filters.city_id:
+            bonus_items_qs = bonus_items_qs.filter(order__store__city_id=filters.city_id)
 
         bonus_items_qs = bonus_items_qs.filter(
             order__confirmed_at__date__gte=start_date,
@@ -333,7 +342,7 @@ class ReportService:
             defect_qs = defect_qs.filter(order__store_id=filters.store_id)
 
         if filters.partner_id:
-            defect_qs = defect_qs.filter(reviewed_by_id=filters.partner_id)
+            defect_qs = defect_qs.filter(order__partner_id=filters.partner_id)
 
         if filters.region_id:
             defect_qs = defect_qs.filter(order__store__region_id=filters.region_id)
@@ -343,11 +352,6 @@ class ReportService:
 
         defect_data = defect_qs.aggregate(total=Sum('total_amount'))
         defect_amount = defect_data['total'] or Decimal('0')
-
-        # Корректируем долг с учётом дефектов:
-        # report_defect уменьшает Store.debt, но не StoreOrder.debt_amount,
-        # поэтому вычитаем дефекты здесь вручную
-        debt = max(Decimal('0'), debt - defect_amount)
 
         # =========================================================================
         # 8. РАСХОДЫ (разделённые)
@@ -1190,9 +1194,6 @@ class PartnerProfileService:
             order_date = order.confirmed_at.strftime('%d.%m.%y')
             
             for item in order.items.all():
-                if item.is_bonus:
-                    continue
-
                 product = item.product
 
                 if product.is_weight_based:

@@ -62,6 +62,7 @@ from .models import (
     StoreSelection,
     StoreInventory, PartnerInventory,
 )
+from products.models import Product
 from .serializers import (
     RegionSerializer,
     CitySerializer,
@@ -1058,9 +1059,10 @@ class StoreViewSet(viewsets.ModelViewSet):
                     'quantity_removed': float(item.quantity),
                     'order_id': item.order_id,
                 })
-                # Возвращаем товар на склад
-                item.product.stock_quantity += item.quantity
-                item.product.save(update_fields=['stock_quantity'])
+                # Возвращаем товар на склад атомарно
+                Product.objects.filter(pk=item.product_id).update(
+                    stock_quantity=F('stock_quantity') + item.quantity
+                )
 
             deleted_items.delete()
 
@@ -1125,9 +1127,10 @@ class StoreViewSet(viewsets.ModelViewSet):
                         returned_by=user,
                     )
 
-                    # Возвращаем на склад
-                    product.stock_quantity += removed_qty
-                    product.save(update_fields=['stock_quantity'])
+                    # Возвращаем на склад атомарно
+                    Product.objects.filter(pk=product.pk).update(
+                        stock_quantity=F('stock_quantity') + removed_qty
+                    )
 
                     removed_info.append({
                         'product_id': product_id,
@@ -1161,9 +1164,10 @@ class StoreViewSet(viewsets.ModelViewSet):
                         returned_by=user,
                     )
 
-                    # Возвращаем на склад
-                    product.stock_quantity += remaining_to_remove
-                    product.save(update_fields=['stock_quantity'])
+                    # Возвращаем на склад атомарно
+                    Product.objects.filter(pk=product.pk).update(
+                        stock_quantity=F('stock_quantity') + remaining_to_remove
+                    )
 
                     modified_info.append({
                         'product_id': product_id,
@@ -2411,11 +2415,12 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
                 quantity=quantity
             )
 
-            # 2. Вернуть на склад админа
+            # 2. Вернуть на склад админа атомарно
             product = inventory.product
-            product.stock_quantity += quantity
-            product.is_available = True
-            product.save(update_fields=['stock_quantity', 'is_available'])
+            Product.objects.filter(pk=product.pk).update(
+                stock_quantity=F('stock_quantity') + quantity,
+                is_available=True,
+            )
 
             # Обновить объект (может быть удалён если quantity=0)
             try:
