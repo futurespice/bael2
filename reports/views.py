@@ -120,6 +120,7 @@ def get_store_history(request: Request, store_id: int) -> Response:
 
     GET /api/reports/store-history/{store_id}/
 
+
     Query параметры (все опциональны):
     - start_date: YYYY-MM-DD (по умолчанию: с первого заказа)
     - end_date: YYYY-MM-DD (по умолчанию: сегодня)

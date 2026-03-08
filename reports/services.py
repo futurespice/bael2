@@ -83,6 +83,7 @@ class StatisticsData:
 
     # Количественные показатели
     bonus_count: int  # Количество бонусных единиц из заказов
+    bonus_amount: Decimal  # Сумма бонусов (кол-во × цена товара)
     orders_count: int  # Заказов
     products_count: int  # Товаров продано
 
@@ -104,6 +105,7 @@ class StatisticsData:
             'total_expenses': float(self.total_expenses),
 
             'bonus_count': self.bonus_count,
+            'bonus_amount': float(self.bonus_amount),
             'orders_count': self.orders_count,
             'products_count': self.products_count,
             'total_balance': float(self.total_balance),
@@ -323,8 +325,16 @@ class ReportService:
             order__confirmed_at__date__lte=end_date
         )
 
-        bonus_data = bonus_items_qs.aggregate(total=Sum('quantity'))
-        bonus_count = int(bonus_data['total'] or 0)
+        from django.db.models import ExpressionWrapper, F as F_, DecimalField as DField
+        bonus_data = bonus_items_qs.aggregate(
+            total_qty=Sum('quantity'),
+            total_amount=Sum(ExpressionWrapper(
+                F_('price') * F_('quantity'),
+                output_field=DField(max_digits=14, decimal_places=2)
+            ))
+        )
+        bonus_count = int(bonus_data['total_qty'] or 0)
+        bonus_amount = bonus_data['total_amount'] or Decimal('0')
 
         # =========================================================================
         # 7. ✅ БРАК - ИСПРАВЛЕНО v2.1
@@ -440,7 +450,8 @@ class ReportService:
             production_expenses=production_expenses,
             total_expenses=total_expenses,
 
-            bonus_count=bonus_count,  # ✅ ИСПРАВЛЕНО: из инвентаря
+            bonus_count=bonus_count,
+            bonus_amount=bonus_amount,
             orders_count=orders_count,
             products_count=products_count,
             total_balance=total_balance,

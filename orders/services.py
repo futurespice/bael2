@@ -129,30 +129,30 @@ class OrderWorkflowService:
             # Формула: за каждые 50 платных → 4 бонуса (milestone),
             # плюс внутри каждого отрезка 50 за каждые 20 → 1 бонус.
             # Примеры: 20→1, 40→2, 50→4, 70→5, 90→6, 100→8
+            # quantity = ИТОГО (платные + бонусные включены)
+            # 75 итого → бонус=5 → платных=70, списывается 75 со склада
             bonus_quantity = Decimal('0')
+            paid_quantity = quantity
             if product.is_bonus and not product.is_weight_based:
                 qty_int = int(quantity)
                 bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
                 bonus_quantity = Decimal(str(bonus_count))
+                paid_quantity = quantity - bonus_quantity
 
-            # Проверка наличия на складе (только платная часть)
+            # Проверка наличия на складе (total = quantity)
             if product.stock_quantity < quantity:
                 raise ValidationError(
                     f'Недостаточно товара "{product.name}" на складе. '
                     f'Доступно: {product.stock_quantity}, запрошено: {quantity}'
                 )
 
-            # Если бонусов не хватает — уменьшаем до доступного остатка
-            if bonus_quantity > 0 and product.stock_quantity < quantity + bonus_quantity:
-                bonus_quantity = product.stock_quantity - quantity
-
-            # Цена
+            # Цена считается только с платной части
             price = item_data.price or product.final_price
-            item_total = quantity * price
+            item_total = paid_quantity * price
 
             items_to_create.append({
                 'product': product,
-                'quantity': quantity,
+                'quantity': paid_quantity,
                 'price': price,
                 'total': item_total,
                 'is_bonus': False,
