@@ -1660,41 +1660,34 @@ class ManualOrderService:
             else:
                 # 2. Если это обычный товар
                 
-                # Рассчитываем автоматический бонус (если применимо и если это не весовой товар)
-                # Товар должен быть помечен как бонусный в каталоге
+                # quantity = ИТОГО везёт партнёр (платные + бонусные включены)
+                # Бонус рассчитывается ОТ этого количества и уже входит в него:
+                # 54 итого → 4 бонуса → 50 платных (списывается 54 из инвентаря)
                 bonus_quantity = Decimal('0')
+                paid_quantity = quantity
                 if product.is_bonus and not product.is_weight_based:
                     qty_int = int(quantity)
                     bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
                     bonus_quantity = Decimal(str(bonus_count))
+                    paid_quantity = quantity - bonus_quantity
 
-                # Проверяем наличие у партнёра (платная + бонусная часть из одного склада)
-                total_needed = quantity + bonus_quantity
+                # Проверяем наличие у партнёра (ровно столько сколько везёт)
                 has_inventory = PartnerInventoryService.check_availability(
                     partner=partner,
                     product=product,
-                    quantity=total_needed,
+                    quantity=quantity,
                     is_bonus=False
                 )
                 if not has_inventory:
-                    # Хватает только на платную часть — бонусов нет
-                    has_paid_only = PartnerInventoryService.check_availability(
-                        partner=partner,
-                        product=product,
-                        quantity=quantity,
-                        is_bonus=False
+                    raise ValidationError(
+                        f'Недостаточно товара {product.name} в инвентаре партнёра'
                     )
-                    if not has_paid_only:
-                        raise ValidationError(
-                            f'Недостаточно товара {product.name} в инвентаре партнёра'
-                        )
-                    bonus_quantity = Decimal('0')
 
-                # Списываем из платного инвентаря: основной товар + бонус
+                # Списываем из инвентаря ровно столько сколько везёт (quantity)
                 PartnerInventoryService.remove_from_inventory(
                     partner=partner,
                     product=product,
-                    quantity=quantity + bonus_quantity,
+                    quantity=quantity,
                     is_bonus=False
                 )
 
@@ -1702,7 +1695,7 @@ class ManualOrderService:
                 StoreInventoryService.add_to_inventory(
                     store=store,
                     product=product,
-                    quantity=quantity,
+                    quantity=paid_quantity,
                     is_bonus=False,
                 )
                 if bonus_quantity > 0:
@@ -1713,14 +1706,14 @@ class ManualOrderService:
                         is_bonus=True,
                     )
 
-                # Собираем позицию заказа (платная часть)
+                # Собираем позицию заказа (только платная часть считается в сумму)
                 price = item_data.price or product.final_price
-                item_total = price * quantity
+                item_total = price * paid_quantity
 
                 order_items_to_create.append(StoreOrderItem(
                     order=order,
                     product=product,
-                    quantity=quantity,
+                    quantity=paid_quantity,
                     price=price,
                     total=item_total,
                     is_bonus=False,

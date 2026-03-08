@@ -170,38 +170,37 @@ class PartnerBonusTest(TestCase):
             items=order_items_data
         )
 
-        # Verify Order Items
-        # 25 платных → 1 бонус (формула: 4*(25//50) + (25%50)//20 = 0+1 = 1)
-        # Бонус берётся из платного инвентаря партнёра (25 платных + 1 бонус = 26 списано)
+        # quantity=25 — это ИТОГО везёт партнёр
+        # Бонус из 25: 4*(25//50) + (25%50)//20 = 0+1 = 1
+        # Платных: 25 - 1 = 24, бонусных: 1, списано с инвентаря: 25
         self.assertEqual(order.items.count(), 2)
         item_paid = order.items.get(is_bonus=False)
         item_bonus = order.items.get(is_bonus=True)
 
-        self.assertEqual(item_paid.quantity, Decimal('25'))
+        self.assertEqual(item_paid.quantity, Decimal('24'))   # 25 - 1 бонус
         self.assertEqual(item_bonus.quantity, Decimal('1'))
 
-        # Verify Inventory Deduction: 100 - 26 = 74 (платный инвентарь)
+        # С инвентаря списано ровно 25 (что везёт)
         inv_paid = PartnerInventory.objects.get(partner=self.partner_user, product=self.product_bonus, is_bonus=False)
-        self.assertEqual(inv_paid.quantity, Decimal('74'))  # 100 - 25 - 1(bonus)
+        self.assertEqual(inv_paid.quantity, Decimal('75'))  # 100 - 25
 
     def test_manual_order_auto_bonus_insufficient(self):
         """
-        Бонус не выдаётся если у партнёра ровно столько товара сколько заказано (нет остатка под бонус).
-        25 заказано → нужно 25+1=26, но в инвентаре ровно 25 → бонуса нет.
+        Партнёр везёт 19 штук — меньше 20, бонус не положен (формула даёт 0).
+        Инвентарь списывается на 19, платных 19, бонусов нет.
         """
 
-        # Ровно на платную часть, без запаса для бонуса
         PartnerInventoryService.add_to_inventory(
             partner=self.partner_user,
             product=self.product_bonus,
-            quantity=Decimal('25'),
+            quantity=Decimal('19'),
             is_bonus=False
         )
 
         order_items_data = [
             OrderItemData(
                 product_id=self.product_bonus.id,
-                quantity=Decimal('25'),
+                quantity=Decimal('19'),
                 is_bonus=False
             )
         ]
@@ -212,10 +211,10 @@ class PartnerBonusTest(TestCase):
             items=order_items_data
         )
 
-        # Только платная позиция, бонуса нет
+        # 19 < 20 — бонуса нет, только платная позиция
         self.assertEqual(order.items.count(), 1)
         item_paid = order.items.get(is_bonus=False)
-        self.assertEqual(item_paid.quantity, Decimal('25'))
+        self.assertEqual(item_paid.quantity, Decimal('19'))
 
         # Инвентарь полностью списан
         self.assertFalse(
