@@ -1663,20 +1663,6 @@ class ManualOrderService:
                         f'Недостаточно товара {product.name} в инвентаре партнёра'
                     )
                 
-                # Проверяем наличие бонусного товара (Bonus) если он начислен автоматически
-                if bonus_quantity > 0:
-                    has_bonus_inventory = PartnerInventoryService.check_availability(
-                        partner=partner,
-                        product=product,
-                        quantity=bonus_quantity,
-                        is_bonus=True
-                    )
-                    # Если у партнёра нет бонусного товара для выдачи бонуса магазину,
-                    # мы можем либо запретить, либо списать с платного, либо не выдавать бонус.
-                    # Решение: Не выдавать автоматический бонус, если нет бонусного инвентаря.
-                    if not has_bonus_inventory:
-                        bonus_quantity = Decimal('0') 
-                
                 # Списываем основной товар
                 PartnerInventoryService.remove_from_inventory(
                     partner=partner,
@@ -1684,15 +1670,6 @@ class ManualOrderService:
                     quantity=quantity,
                     is_bonus=False
                 )
-                
-                # Списываем бонусный товар (если есть)
-                if bonus_quantity > 0:
-                    PartnerInventoryService.remove_from_inventory(
-                        partner=partner,
-                        product=product,
-                        quantity=bonus_quantity,
-                        is_bonus=True
-                    )
 
                 # Добавляем платную и бонусную части в инвентарь раздельно
                 StoreInventoryService.add_to_inventory(
