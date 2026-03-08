@@ -273,7 +273,7 @@ class ReportService:
             paid_debt_qs = paid_debt_qs.filter(order__store_id=filters.store_id)
 
         if filters.partner_id:
-            paid_debt_qs = paid_debt_qs.filter(received_by_id=filters.partner_id)
+            paid_debt_qs = paid_debt_qs.filter(order__partner_id=filters.partner_id)
 
         paid_debt_data = paid_debt_qs.aggregate(total=Sum('amount'))
         debt_payments_total = paid_debt_data['total'] or Decimal('0')
@@ -343,6 +343,11 @@ class ReportService:
 
         defect_data = defect_qs.aggregate(total=Sum('total_amount'))
         defect_amount = defect_data['total'] or Decimal('0')
+
+        # Корректируем долг с учётом дефектов:
+        # report_defect уменьшает Store.debt, но не StoreOrder.debt_amount,
+        # поэтому вычитаем дефекты здесь вручную
+        debt = max(Decimal('0'), debt - defect_amount)
 
         # =========================================================================
         # 8. РАСХОДЫ (разделённые)
@@ -943,8 +948,9 @@ class PartnerStatisticsService:
             total=Sum('amount')
         )['total'] or Decimal('0')
 
-        # Оставшийся долг = исходный - погашения
-        unpaid_debt = original_debt - debt_payments_in_period
+        # Оставшийся долг = исходный - погашения - дефекты
+        # (дефекты уменьшают Store.debt, но не StoreOrder.debt_amount)
+        unpaid_debt = original_debt - debt_payments_in_period - defective_total
         if unpaid_debt < Decimal('0'):
             unpaid_debt = Decimal('0')
 
