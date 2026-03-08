@@ -112,12 +112,15 @@ class StandardPagination(PageNumberPagination):
     max_page_size = 100
 
 
-def _build_inventory_items(inventory_qs):
+def _build_inventory_items(inventory_qs, use_available_quantity=False):
     """
     Построить список items и totals из queryset инвентаря.
 
     Используется в basket, partner-inventory, store-inventory.
     Queryset должен иметь select_related('product') и prefetch_related('product__images').
+
+    use_available_quantity: если True, показывать available_quantity вместо quantity
+    (для PartnerInventory чтобы учесть зарезервированные товары).
     """
     items = []
     piece_count = 0
@@ -134,16 +137,19 @@ def _build_inventory_items(inventory_qs):
             if cached_images and cached_images[0].image:
                 main_image = cached_images[0].image.url
 
+        # Для PartnerInventory показываем available_quantity (доступное, без резерва)
+        display_qty = inv.available_quantity if use_available_quantity and hasattr(inv, 'available_quantity') else inv.quantity
+
         price = product.final_price
-        total = inv.quantity * price
+        total = display_qty * price
 
         if product.is_weight_based:
-            qty = inv.quantity
+            qty = display_qty
             quantity_display = f"{int(qty) if qty == int(qty) else qty} кг"
-            weight_total += inv.quantity
+            weight_total += display_qty
         else:
-            quantity_display = f"{int(inv.quantity)} шт"
-            piece_count += int(inv.quantity)
+            quantity_display = f"{int(display_qty)} шт"
+            piece_count += int(display_qty)
 
         total_amount += total
 
@@ -154,7 +160,7 @@ def _build_inventory_items(inventory_qs):
             'is_weight_based': product.is_weight_based,
             'is_bonus_product': product.is_bonus,
             'unit': product.unit,
-            'quantity': str(inv.quantity),
+            'quantity': str(display_qty),
             'quantity_display': quantity_display,
             'price': str(price),
             'total': str(total),
@@ -163,6 +169,9 @@ def _build_inventory_items(inventory_qs):
         # Дополнительные поля для PartnerInventory
         if hasattr(inv, 'is_bonus'):
             item['is_bonus'] = inv.is_bonus
+        if use_available_quantity and hasattr(inv, 'reserved_quantity'):
+            item['reserved_quantity'] = str(inv.reserved_quantity)
+            item['total_quantity'] = str(inv.quantity)
 
         items.append(item)
 
@@ -2337,7 +2346,7 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
 
         inventory_qs = PartnerInventory.objects.filter(
             partner=partner,
-            quantity__gt=0
+            quantity__gt=F('reserved_quantity')
         ).select_related('product').prefetch_related('product__images')
 
         if not inventory_qs.exists():
@@ -2353,7 +2362,7 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
                 }
             })
 
-        items, totals = _build_inventory_items(inventory_qs)
+        items, totals = _build_inventory_items(inventory_qs, use_available_quantity=True)
         paginated_items, pagination = _paginate_items(items, request)
 
         return Response({
