@@ -144,7 +144,7 @@ if FORCE_SQLITE:
     }
 elif DATABASE_URL:
     DATABASES = {
-        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=0)
+        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=None)
     }
 else:
     DATABASES = {
