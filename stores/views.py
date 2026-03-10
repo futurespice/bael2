@@ -1210,7 +1210,10 @@ class StoreViewSet(viewsets.ModelViewSet):
         # 4. ВОЗВРАЩАЕМ ОБНОВЛЁННУЮ КОРЗИНУ
         # =====================================================================
         # Перезагружаем заказы после всех изменений
-        orders = orders.prefetch_related('items__product__images')
+        orders = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.IN_TRANSIT
+        ).prefetch_related('items__product__images')
 
         # Агрегируем товары
         items_map = {}
