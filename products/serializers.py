@@ -762,7 +762,7 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = [
-            'id', 'final_price', 'price_per_100g', 'created_at'
+            'id', 'final_price', 'price_per_100g', 'is_available', 'created_at'
         ]
 
     @extend_schema_field(serializers.ListSerializer(child=serializers.DictField()))

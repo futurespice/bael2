@@ -30,5 +30,5 @@ RUN mkdir -p /app/staticfiles /app/media /app/logs && \
 # Expose port
 EXPOSE 8000
 
-# Default command — Daphne (ASGI: HTTP + WebSocket)
-CMD ["daphne", "-b", "0.0.0.0", "-p", "8000", "config.asgi:application"]
+# Default command — Gunicorn + Uvicorn workers (ASGI: HTTP + WebSocket)
+CMD ["gunicorn", "config.asgi:application", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]

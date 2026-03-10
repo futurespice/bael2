@@ -53,7 +53,7 @@ services:
     command: >
       sh -c "python manage.py migrate --noinput &&
              python manage.py collectstatic --noinput &&
-             daphne -b 0.0.0.0 -p 8000 config.asgi:application"
+             gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000 --timeout 120 --graceful-timeout 30 --keep-alive 5"
     volumes:
       - /home/myprojects/bael2/staticfiles:/app/staticfiles
       - /home/myprojects/bael2/media:/app/media

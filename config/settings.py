@@ -144,7 +144,7 @@ if FORCE_SQLITE:
     }
 elif DATABASE_URL:
     DATABASES = {
-        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
+        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=0)
     }
 else:
     DATABASES = {
@@ -365,10 +365,10 @@ REST_FRAMEWORK = {
         'rest_framework.filters.OrderingFilter',
     ],
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
-    'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
-    ],
+    # Throttle применяется ТОЛЬКО на конкретных эндпоинтах (login, register и т.д.)
+    # через throttle_classes = [...] в view. Глобальный throttle убран — он вызывал
+    # 2 лишних обращения к Redis на КАЖДЫЙ запрос, тормозя весь API.
+    'DEFAULT_THROTTLE_CLASSES': [],
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
         'user': '1000/hour',
