@@ -19,7 +19,7 @@ from datetime import datetime
 # НАСТРОЙКИ
 # ============================================================================
 BASE_URL = "https://baielapp.com.kg/api"
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzgwOTE0NDg2LCJpYXQiOjE3NzMxMzg0ODYsImp0aSI6ImNmMWNjMjlhY2NmZjQ2ZDNhYTNiNzYyYzMwNDYxODBlIiwidXNlcl9pZCI6IjQifQ.scvb3CgMDxMMEVcqTWCwX9a8DQpnE_Ht3Gf2mWrqMMQ"
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzczMjAwNDk5LCJpYXQiOjE3NzMxOTY4OTksImp0aSI6IjgxNzkwNDIzMDFlMDQ3MGVhZTZiYzYyNTRlNDgyYmFkIiwidXNlcl9pZCI6IjQifQ.uijhrEbtN6jsLkcnLraGTmpjRwBP_yOiTYtH0YB-V5M"
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
