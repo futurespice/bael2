@@ -55,7 +55,11 @@ class ChatSerializer(serializers.ModelSerializer):
         return None
 
     def get_last_message(self, obj):
-        last = obj.messages.last()
+        # Используем кеш из ChatListCreateView если есть
+        if hasattr(obj, '_last_message_cache'):
+            last = obj._last_message_cache
+        else:
+            last = obj.messages.order_by('-id').first()
         if last:
             return {
                 'id': last.id,
@@ -67,13 +71,14 @@ class ChatSerializer(serializers.ModelSerializer):
         return None
 
     def get_unread_count(self, obj):
+        # Используем аннотацию из ChatListCreateView если есть
+        if hasattr(obj, 'annotated_unread_count'):
+            return obj.annotated_unread_count
         request = self.context.get('request')
         if request:
-            # messages prefetch_related уже загружен в get_queryset — фильтруем в Python
-            return sum(
-                1 for m in obj.messages.all()
-                if not m.is_read and m.sender_id != request.user.id
-            )
+            return obj.messages.filter(
+                is_read=False
+            ).exclude(sender=request.user).count()
         return 0
 
 

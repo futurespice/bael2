@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.contrib.auth import get_user_model
+from django.db.models import Count, Q, Max
 from django.shortcuts import get_object_or_404
 
 from .models import Chat, Message
@@ -46,19 +47,43 @@ class ChatListCreateView(APIView):
                 if participant.id != user.id:
                     chat_id_map[participant.id] = chat.id
 
-        # Авто-создаём чаты для тех, у кого их ещё нет
-        for other_user in available_users:
-            if other_user.id not in chat_id_map:
-                chat = Chat.objects.create()
+        # Батчевое создание чатов для тех, у кого их ещё нет
+        users_without_chat = [u for u in available_users if u.id not in chat_id_map]
+        if users_without_chat:
+            new_chats = Chat.objects.bulk_create([Chat() for _ in users_without_chat])
+            for chat, other_user in zip(new_chats, users_without_chat):
                 chat.participants.add(user, other_user)
                 chat_id_map[other_user.id] = chat.id
 
-        # Загружаем все чаты с prefetch
-        chats_by_id = {
-            c.id: c
-            for c in Chat.objects.filter(id__in=chat_id_map.values())
-            .prefetch_related('participants', 'messages')
+        # Загружаем все чаты с аннотацией unread_count (вместо загрузки всех сообщений)
+        chats_qs = (
+            Chat.objects.filter(id__in=chat_id_map.values())
+            .prefetch_related('participants')
+            .annotate(
+                annotated_unread_count=Count(
+                    'messages',
+                    filter=Q(messages__is_read=False) & ~Q(messages__sender=user)
+                )
+            )
+        )
+
+        # Получаем последнее сообщение для каждого чата — одним запросом
+        last_msg_ids = (
+            Message.objects.filter(chat_id__in=chat_id_map.values())
+            .values('chat_id')
+            .annotate(last_id=Max('id'))
+            .values_list('last_id', flat=True)
+        )
+        last_messages = {
+            m.chat_id: m
+            for m in Message.objects.filter(id__in=last_msg_ids).select_related('sender')
         }
+
+        chats_by_id = {c.id: c for c in chats_qs}
+
+        # Инжектим кеш в объекты для ChatSerializer
+        for chat in chats_by_id.values():
+            chat._last_message_cache = last_messages.get(chat.id)
 
         # Группируем по роли собеседника (все 3 ключа всегда присутствуют)
         role_key_map = {'admin': 'admins', 'partner': 'partners', 'store': 'stores'}
@@ -153,11 +178,12 @@ class AvailableUsersView(APIView):
                 if participant.id != user.id:
                     chat_map[participant.id] = chat.id
 
-        # Авто-создаём чаты для тех, у кого их ещё нет
+        # Батчевое создание чатов для тех, у кого их ещё нет
         users_list = list(qs)
-        for other_user in users_list:
-            if other_user.id not in chat_map:
-                chat = Chat.objects.create()
+        users_without_chat = [u for u in users_list if u.id not in chat_map]
+        if users_without_chat:
+            new_chats = Chat.objects.bulk_create([Chat() for _ in users_without_chat])
+            for chat, other_user in zip(new_chats, users_without_chat):
                 chat.participants.add(user, other_user)
                 chat_map[other_user.id] = chat.id
 
