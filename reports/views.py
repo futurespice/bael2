@@ -16,7 +16,8 @@ from rest_framework.response import Response
 from stores.models import Store
 from .serializers import ReportFiltersSerializer, StoreHistoryFiltersSerializer, PartnerStoreSerializer, PartnerTrackerOrderSerializer, PartnerStatisticsSerializer, PartnerProfileSerializer
 from .services import ReportService, ReportFilters, TimePeriod, PartnerProfileService, PartnerStatisticsService
-from users.permissions import IsPartnerUser
+from users.permissions import IsPartnerUser, IsAdminUser
+from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
 from django.db.models import Q, Max, Count
 
@@ -630,3 +631,153 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
             })
 
         return Response(data)
+
+
+# =============================================================================
+# ADMIN: PARTNER STATISTICS (просмотр статистики партнёра админом)
+# =============================================================================
+
+User = get_user_model()
+
+
+class AdminPartnerStatisticsViewSet(viewsets.ViewSet):
+    """
+    ViewSet для просмотра статистики конкретного партнёра администратором.
+
+    **Endpoint:**
+    - GET /api/reports/admin/partner-statistics/{partner_id}/
+
+    **Описание:**
+    Те же 10 показателей что и /api/reports/partners/statistics/,
+    но доступно только админу и с добавочным полем `partner_name`.
+
+    **Фильтры (все опциональны):**
+    - date: конкретная дата (YYYY-MM-DD), по умолчанию — сегодня
+    - date_from + date_to: диапазон дат
+    - period: day/week/month/year
+
+    **Приоритет фильтров:** date > date_from/date_to > period > default (сегодня)
+    """
+
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    @extend_schema(
+        summary="Статистика партнёра для админа",
+        description="Просмотр статистики конкретного партнёра (доступно только админу)",
+        parameters=[
+            OpenApiParameter(
+                name='date',
+                type=str,
+                description='Конкретная дата (YYYY-MM-DD). По умолчанию — сегодня.',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date_from',
+                type=str,
+                description='Начало периода (YYYY-MM-DD)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='date_to',
+                type=str,
+                description='Конец периода (YYYY-MM-DD)',
+                required=False
+            ),
+            OpenApiParameter(
+                name='period',
+                type=str,
+                enum=['day', 'week', 'month', 'year'],
+                description='Период (игнорируется если указаны date или date_from/date_to)',
+                required=False
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Статистика партнёра с partner_name"),
+            404: OpenApiResponse(description="Партнёр не найден"),
+        }
+    )
+    def retrieve(self, request, pk=None):
+        """Получить статистику конкретного партнёра."""
+        from datetime import datetime as dt
+        from django.utils import timezone
+
+        # Проверяем что партнёр существует
+        try:
+            partner = User.objects.get(pk=pk, role='partner')
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'Партнёр не найден'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Парсим фильтры дат
+        date_str = request.query_params.get('date')
+        date_from_str = request.query_params.get('date_from')
+        date_to_str = request.query_params.get('date_to')
+        period = request.query_params.get('period')
+
+        date_from = None
+        date_to = None
+
+        try:
+            if date_str:
+                # Конкретный день
+                specific_date = dt.strptime(date_str, '%Y-%m-%d')
+                date_from = timezone.make_aware(dt.combine(specific_date.date(), dt.min.time()))
+                date_to = timezone.make_aware(dt.combine(specific_date.date(), dt.max.time()))
+                period = 'day'
+            elif date_from_str and date_to_str:
+                # Диапазон дат
+                date_from = timezone.make_aware(dt.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = timezone.make_aware(dt.combine(
+                    dt.strptime(date_to_str, '%Y-%m-%d').date(),
+                    dt.max.time()
+                ))
+            elif date_from_str:
+                date_from = timezone.make_aware(dt.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = timezone.now()
+            elif date_to_str:
+                date_from = timezone.make_aware(dt(2020, 1, 1))
+                date_to = timezone.make_aware(dt.combine(
+                    dt.strptime(date_to_str, '%Y-%m-%d').date(),
+                    dt.max.time()
+                ))
+            elif period:
+                # Используем period
+                if period not in ['day', 'week', 'month', 'year']:
+                    return Response(
+                        {'error': 'Неверный период. Используйте: day, week, month, year'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:
+                # По умолчанию — сегодня
+                today = timezone.localdate()
+                date_from = timezone.make_aware(dt.combine(today, dt.min.time()))
+                date_to = timezone.make_aware(dt.combine(today, dt.max.time()))
+                period = 'day'
+        except ValueError as e:
+            return Response(
+                {'error': f'Неверный формат даты. Используйте YYYY-MM-DD. {e}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Получаем статистику через тот же сервис
+        try:
+            stats = PartnerStatisticsService.calculate_statistics(
+                partner_id=partner.id,
+                period=period or 'day',
+                date_from=date_from,
+                date_to=date_to
+            )
+
+            # Добавляем partner_name
+            stats['partner_name'] = partner.get_full_name()
+            stats['partner_id'] = partner.id
+
+            return Response(stats)
+
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

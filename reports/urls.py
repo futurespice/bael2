@@ -21,5 +21,11 @@ urlpatterns = [
     # История магазина
     path('store-history/<int:store_id>/', views.get_store_history, name='store-history'),
 
+    # Админ: статистика конкретного партнёра
+    path(
+        'admin/partner-statistics/<int:pk>/',
+        views.AdminPartnerStatisticsViewSet.as_view({'get': 'retrieve'}),
+        name='admin-partner-statistics'
+    ),
 
 ]
