@@ -444,12 +444,15 @@ class StoreViewSet(viewsets.ModelViewSet):
             ).values_list('store_id', flat=True).distinct()
             queryset = queryset.exclude(id__in=stores_with_active_orders)
 
-        queryset = queryset.annotate(
-            total_orders_count=Count('orders', distinct=True),
-            accepted_orders_count=Count('orders', filter=Q(orders__status='accepted'), distinct=True),
-            inventory_items_count=Count('inventory', distinct=True),
-            users_count=Count('selections', filter=Q(selections__is_current=True), distinct=True),
-        )
+        # Аннотации COUNT — только для retrieve (StoreSerializer их использует)
+        # Для list (StoreListSerializer) не нужны — экономим 4 подзапроса
+        if self.action == 'retrieve':
+            queryset = queryset.annotate(
+                total_orders_count=Count('orders', distinct=True),
+                accepted_orders_count=Count('orders', filter=Q(orders__status='accepted'), distinct=True),
+                inventory_items_count=Count('inventory', distinct=True),
+                users_count=Count('selections', filter=Q(selections__is_current=True), distinct=True),
+            )
         return queryset.select_related('region', 'city').order_by('-created_at')
 
     def get_serializer_class(self):

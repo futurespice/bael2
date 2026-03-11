@@ -172,61 +172,65 @@ class StoreOrderListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at']
 
-    def get_items_summary(self, obj: StoreOrder) -> str:
+    def _compute_items_stats(self, obj: StoreOrder) -> dict:
         """
-        Генерация сводки по товарам.
+        Один проход по items — кешируем результат на объекте.
+        Экономит 3 лишних итерации на каждый заказ.
+        """
+        cache_attr = '_items_stats_cache'
+        if hasattr(obj, cache_attr):
+            return getattr(obj, cache_attr)
 
-        Формат: "Запрос на 900 шт 20кг"
-        """
         items = obj.items.all()  # использует prefetch_related из get_queryset
-
         piece_count = 0
         weight_total = Decimal('0')
+        count = 0
 
         for item in items:
+            count += 1
             if item.product.is_weight_based:
                 weight_total += item.quantity
             else:
                 piece_count += int(item.quantity)
 
-        parts = []
-        if piece_count > 0:
-            parts.append(f"{piece_count} шт")
-        if weight_total > 0:
-            # Форматируем вес
-            if weight_total == int(weight_total):
-                parts.append(f"{int(weight_total)}кг")
-            else:
-                parts.append(f"{weight_total}кг")
+        result = {
+            'piece_count': piece_count,
+            'weight_total': weight_total,
+            'items_count': count,
+        }
+        setattr(obj, cache_attr, result)
+        return result
 
+    def get_items_summary(self, obj: StoreOrder) -> str:
+        """Генерация сводки по товарам. Формат: "Запрос на 900 шт 20кг" """
+        stats = self._compute_items_stats(obj)
+        parts = []
+        if stats['piece_count'] > 0:
+            parts.append(f"{stats['piece_count']} шт")
+        if stats['weight_total'] > 0:
+            wt = stats['weight_total']
+            if wt == int(wt):
+                parts.append(f"{int(wt)}кг")
+            else:
+                parts.append(f"{wt}кг")
         if parts:
             return f"Запрос на {' '.join(parts)}"
         return "Пустой запрос"
 
     def get_piece_count(self, obj: StoreOrder) -> int:
         """Количество штучных товаров."""
-        items = obj.items.all()  # использует prefetch_related из get_queryset
-        return sum(
-            int(item.quantity)
-            for item in items
-            if not item.product.is_weight_based
-        )
+        return self._compute_items_stats(obj)['piece_count']
 
     def get_weight_total(self, obj: StoreOrder) -> str:
         """Общий вес весовых товаров."""
-        items = obj.items.all()  # использует prefetch_related из get_queryset
-        total = sum(
-            item.quantity
-            for item in items
-            if item.product.is_weight_based
-        )
-        if total == int(total):
-            return f"{int(total)}"
-        return str(total)
+        wt = self._compute_items_stats(obj)['weight_total']
+        if wt == int(wt):
+            return f"{int(wt)}"
+        return str(wt)
 
     def get_items_count(self, obj: StoreOrder) -> int:
         """Общее количество позиций в заказе."""
-        return len(obj.items.all())  # использует prefetch_related, не делает COUNT запрос
+        return self._compute_items_stats(obj)['items_count']
 
 
 class StoreOrderDetailSerializer(serializers.ModelSerializer):
@@ -451,54 +455,62 @@ class StoreOrderForStoreListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at']
 
-    def get_items_summary(self, obj: StoreOrder) -> str:
-        """Генерация сводки по товарам."""
-        items = obj.items.all()  # использует prefetch_related из my_orders queryset
+    def _compute_items_stats(self, obj: StoreOrder) -> dict:
+        """Один проход по items — кешируем результат."""
+        cache_attr = '_items_stats_cache'
+        if hasattr(obj, cache_attr):
+            return getattr(obj, cache_attr)
 
+        items = obj.items.all()
         piece_count = 0
         weight_total = Decimal('0')
+        count = 0
 
         for item in items:
+            count += 1
             if item.product.is_weight_based:
                 weight_total += item.quantity
             else:
                 piece_count += int(item.quantity)
 
-        parts = []
-        if piece_count > 0:
-            parts.append(f"{piece_count} шт")
-        if weight_total > 0:
-            if weight_total == int(weight_total):
-                parts.append(f"{int(weight_total)}кг")
-            else:
-                parts.append(f"{weight_total}кг")
+        result = {
+            'piece_count': piece_count,
+            'weight_total': weight_total,
+            'items_count': count,
+        }
+        setattr(obj, cache_attr, result)
+        return result
 
+    def get_items_summary(self, obj: StoreOrder) -> str:
+        """Генерация сводки по товарам."""
+        stats = self._compute_items_stats(obj)
+        parts = []
+        if stats['piece_count'] > 0:
+            parts.append(f"{stats['piece_count']} шт")
+        if stats['weight_total'] > 0:
+            wt = stats['weight_total']
+            if wt == int(wt):
+                parts.append(f"{int(wt)}кг")
+            else:
+                parts.append(f"{wt}кг")
         if parts:
             return f"Запрос на {' '.join(parts)}"
         return "Пустой запрос"
 
     def get_piece_count(self, obj: StoreOrder) -> int:
         """Количество штучных товаров."""
-        return sum(
-            int(item.quantity)
-            for item in obj.items.all()  # использует prefetch_related
-            if not item.product.is_weight_based
-        )
+        return self._compute_items_stats(obj)['piece_count']
 
     def get_weight_total(self, obj: StoreOrder) -> str:
         """Общий вес весовых товаров."""
-        total = sum(
-            item.quantity
-            for item in obj.items.all()  # использует prefetch_related
-            if item.product.is_weight_based
-        )
-        if total == int(total):
-            return f"{int(total)}"
-        return str(total)
+        wt = self._compute_items_stats(obj)['weight_total']
+        if wt == int(wt):
+            return f"{int(wt)}"
+        return str(wt)
 
     def get_items_count(self, obj: StoreOrder) -> int:
         """Общее количество позиций."""
-        return len(obj.items.all())  # использует prefetch_related, не делает COUNT запрос
+        return self._compute_items_stats(obj)['items_count']
 
 
 class StoreOrderDetailForStoreSerializer(serializers.ModelSerializer):

@@ -56,7 +56,7 @@ class RegionSerializer(serializers.ModelSerializer):
 
     def get_stores_count(self, obj: Region) -> int:
         """Количество магазинов в регионе."""
-        return len(obj.stores.all())  # использует prefetch_related из RegionViewSet
+        return obj.stores.count()
 
 
 class CitySerializer(serializers.ModelSerializer):
@@ -80,7 +80,7 @@ class CitySerializer(serializers.ModelSerializer):
 
     def get_stores_count(self, obj: City) -> int:
         """Количество магазинов в городе."""
-        return len(obj.stores.all())  # использует prefetch_related из CityViewSet
+        return obj.stores.count()
 
 
 # =============================================================================

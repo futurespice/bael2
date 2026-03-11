@@ -384,16 +384,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         """Фильтрация."""
         queryset = super().get_queryset()
 
-        # Сортировка по популярности (количество принятых заказов)
-        queryset = queryset.annotate(
-            order_count=models.Count(
-                'store_order_items',
-                filter=models.Q(
-                    store_order_items__order__status='accepted',
-                    store_order_items__is_bonus=False,
-                )
-            )
-        ).order_by('-order_count', 'name')
+        # Сортировка по популярности (предвычисленный вес из celery-task update_product_popularity)
+        queryset = queryset.order_by('-popularity_weight', 'name')
 
         # Prefetch только нужных связей в зависимости от action
         if self.action == 'list':
