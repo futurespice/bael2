@@ -66,7 +66,7 @@ from .filters import ReturnedItemFilter
 
 class StandardPagination(PageNumberPagination):
     """Стандартная пагинация."""
-    page_size = 20
+    page_size = 30
     page_size_query_param = 'page_size'
     max_page_size = 100
 
@@ -794,6 +794,7 @@ class PartnerRequestViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [IsAuthenticated, IsPartner]
+    pagination_class = StandardPagination
 
     def get_queryset(self):
         """Получить запросы ТОЛЬКО текущего партнёра."""
@@ -941,6 +942,7 @@ class PartnerRequestAdminViewSet(viewsets.ReadOnlyModelViewSet):
 
     permission_classes = [IsAuthenticated, IsAdmin]
     serializer_class = PartnerRequestSerializer
+    pagination_class = StandardPagination
 
     def get_queryset(self):
         """Получить все запросы."""
@@ -1093,6 +1095,7 @@ class ManualOrderViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     permission_classes = [IsAuthenticated, IsPartner]
+    pagination_class = StandardPagination
     lookup_field = 'id'
 
     def get_queryset(self):
@@ -1240,6 +1243,7 @@ class ReturnedItemViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
     filterset_class = ReturnedItemFilter
     ordering_fields = ['returned_at', 'price_at_return']
     ordering = ['-returned_at']

@@ -107,7 +107,7 @@ from orders.models import (
 
 class StandardPagination(PageNumberPagination):
     """Стандартная пагинация."""
-    page_size = 50
+    page_size = 30
     page_size_query_param = 'page_size'
     max_page_size = 100
 
@@ -184,7 +184,7 @@ def _build_inventory_items(inventory_qs, use_available_quantity=False):
     return items, totals
 
 
-def _paginate_items(items, request, page_size=20):
+def _paginate_items(items, request, page_size=30):
     """Пагинировать список items вручную."""
     page = int(request.query_params.get('page', 1))
     page_size = int(request.query_params.get('page_size', page_size))
@@ -2369,7 +2369,7 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
             })
 
         items, totals = _build_inventory_items(inventory_qs, use_available_quantity=True)
-        paginated_items, pagination = _paginate_items(items, request, page_size=50)
+        paginated_items, pagination = _paginate_items(items, request)
 
         return Response({
             'partner_id': partner.id,

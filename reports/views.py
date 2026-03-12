@@ -8,6 +8,7 @@ API ENDPOINTS:
 """
 
 from rest_framework import status, viewsets
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
@@ -20,6 +21,13 @@ from users.permissions import IsPartnerUser, IsAdminUser
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiResponse
 from django.db.models import Q, Max, Count
+
+
+class StandardPagination(PageNumberPagination):
+    """Стандартная пагинация."""
+    page_size = 30
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
 
 @extend_schema(
@@ -544,6 +552,7 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
 
     permission_classes = [IsAuthenticated, IsPartnerUser]
     serializer_class = PartnerStoreSerializer
+    pagination_class = StandardPagination
 
     def get_queryset(self):
         """Получить магазины партнёра."""
@@ -618,8 +627,12 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
             ).values_list('order__store_id', 'last_paid')
         )
 
+        # Пагинация
+        page = self.paginate_queryset(queryset)
+        paginated_stores = page if page is not None else queryset
+
         data = []
-        for store in queryset:
+        for store in paginated_stores:
             data.append({
                 'id': store.id,
                 'name': store.name,
@@ -630,6 +643,8 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
                 'orders_count': orders_counts.get(store.id, 0),
             })
 
+        if page is not None:
+            return self.get_paginated_response(data)
         return Response(data)
 
 
