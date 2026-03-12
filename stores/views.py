@@ -2369,7 +2369,7 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
             })
 
         items, totals = _build_inventory_items(inventory_qs, use_available_quantity=True)
-        paginated_items, pagination = _paginate_items(items, request)
+        paginated_items, pagination = _paginate_items(items, request, page_size=50)
 
         return Response({
             'partner_id': partner.id,
