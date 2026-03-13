@@ -93,6 +93,18 @@ class OrderWorkflowService:
             ).first()
             if existing:
                 return existing
+        else:
+            # Fallback: проверка дубликата по store + время (30 сек)
+            from datetime import timedelta
+            cutoff = timezone.now() - timedelta(seconds=30)
+            duplicate = StoreOrder.objects.filter(
+                store=store,
+                created_by=created_by,
+                status=StoreOrderStatus.PENDING,
+                created_at__gte=cutoff
+            ).first()
+            if duplicate:
+                return duplicate
 
         # Проверка магазина
         if not store.can_interact:
@@ -1091,6 +1103,23 @@ class PartnerRequestService:
         from .models import PartnerRequestItem
         import logging
         logger = logging.getLogger(__name__)
+        
+        # Защита от двойной отправки (30 сек окно)
+        from datetime import timedelta
+        cutoff = timezone.now() - timedelta(seconds=30)
+        duplicate = PartnerRequest.objects.filter(
+            partner=partner,
+            request_type=request_type,
+            status=PartnerRequestStatus.PENDING,
+            created_at__gte=cutoff
+        ).first()
+        if duplicate:
+            logger.info(
+                f"Дубликат запроса партнёра (30с окно) | "
+                f"Partner: {partner.id} | Type: {request_type} | "
+                f"Existing: #{duplicate.id}"
+            )
+            return duplicate
         
         # Валидация
         if partner.role != 'partner':
