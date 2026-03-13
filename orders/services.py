@@ -94,9 +94,9 @@ class OrderWorkflowService:
             if existing:
                 return existing
         else:
-            # Fallback: проверка дубликата по store + время (30 сек)
+            # Fallback: проверка дубликата по store + время (60 сек)
             from datetime import timedelta
-            cutoff = timezone.now() - timedelta(seconds=30)
+            cutoff = timezone.now() - timedelta(seconds=60)
             duplicate = StoreOrder.objects.filter(
                 store=store,
                 created_by=created_by,
@@ -1104,9 +1104,9 @@ class PartnerRequestService:
         import logging
         logger = logging.getLogger(__name__)
         
-        # Защита от двойной отправки (30 сек окно)
+        # Защита от двойной отправки (60 сек окно)
         from datetime import timedelta
-        cutoff = timezone.now() - timedelta(seconds=30)
+        cutoff = timezone.now() - timedelta(seconds=60)
         duplicate = PartnerRequest.objects.filter(
             partner=partner,
             request_type=request_type,
@@ -1115,7 +1115,7 @@ class PartnerRequestService:
         ).first()
         if duplicate:
             logger.info(
-                f"Дубликат запроса партнёра (30с окно) | "
+                f"Дубликат запроса партнёра (60с окно) | "
                 f"Partner: {partner.id} | Type: {request_type} | "
                 f"Existing: #{duplicate.id}"
             )
@@ -1613,9 +1613,9 @@ class ManualOrderService:
                 logger.info(f"Дубликат ручного заказа по idempotency_key: {idempotency_key}")
                 return existing
         else:
-            # Fallback: проверка дубликата по partner + store + время (30 сек)
+            # Fallback: проверка дубликата по partner + store + время (60 сек)
             from datetime import timedelta
-            cutoff = timezone.now() - timedelta(seconds=30)
+            cutoff = timezone.now() - timedelta(seconds=60)
             duplicate = StoreOrder.objects.filter(
                 partner=partner,
                 store=store,
@@ -1624,7 +1624,7 @@ class ManualOrderService:
             ).first()
             if duplicate:
                 logger.info(
-                    f"Дубликат ручного заказа (30с окно) | "
+                    f"Дубликат ручного заказа (60с окно) | "
                     f"Partner: {partner.id} | Store: {store.id} | "
                     f"Existing order: #{duplicate.id}"
                 )
