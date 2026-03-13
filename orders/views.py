@@ -1187,7 +1187,8 @@ class ManualOrderViewSet(viewsets.ReadOnlyModelViewSet):
                 store=store,
                 items=items_data,
                 prepayment_amount=serializer.validated_data.get('prepayment', Decimal('0')),
-                notes=serializer.validated_data.get('notes', '')
+                notes=serializer.validated_data.get('notes', ''),
+                idempotency_key=serializer.validated_data.get('idempotency_key')
             )
 
             # Возвращаем созданный заказ

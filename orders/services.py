@@ -1551,7 +1551,8 @@ class ManualOrderService:
         store: Store,
         items: List[OrderItemData],
         prepayment_amount: Decimal = Decimal('0'),
-        notes: str = ''
+        notes: str = '',
+        idempotency_key: Optional[str] = None
     ) -> StoreOrder:
         """
         Создать ручной заказ партнёром.
@@ -1562,6 +1563,7 @@ class ManualOrderService:
             items: Список товаров
             prepayment_amount: Сумма предоплаты
             notes: Примечания
+            idempotency_key: Ключ идемпотентности (защита от двойной отправки)
             
         Returns:
             StoreOrder
@@ -1572,6 +1574,32 @@ class ManualOrderService:
         from stores.services import PartnerInventoryService
         import logging
         logger = logging.getLogger(__name__)
+        
+        # Защита от двойной отправки (idempotency_key)
+        if idempotency_key:
+            existing = StoreOrder.objects.filter(
+                idempotency_key=idempotency_key
+            ).first()
+            if existing:
+                logger.info(f"Дубликат ручного заказа по idempotency_key: {idempotency_key}")
+                return existing
+        else:
+            # Fallback: проверка дубликата по partner + store + время (30 сек)
+            from datetime import timedelta
+            cutoff = timezone.now() - timedelta(seconds=30)
+            duplicate = StoreOrder.objects.filter(
+                partner=partner,
+                store=store,
+                order_type='manual',
+                created_at__gte=cutoff
+            ).first()
+            if duplicate:
+                logger.info(
+                    f"Дубликат ручного заказа (30с окно) | "
+                    f"Partner: {partner.id} | Store: {store.id} | "
+                    f"Existing order: #{duplicate.id}"
+                )
+                return duplicate
         
         # Валидация
         if partner.role != 'partner':
@@ -1595,7 +1623,8 @@ class ManualOrderService:
             confirmed_by=partner,
             confirmed_at=timezone.now(),
             prepayment_amount=prepayment_amount,
-            notes=notes
+            notes=notes,
+            idempotency_key=idempotency_key or None
         )
         
         total_amount = Decimal('0')

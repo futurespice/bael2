@@ -1183,6 +1183,14 @@ class ManualOrderCreateSerializer(serializers.Serializer):
         help_text="Примечания к заказу"
     )
 
+    idempotency_key = serializers.CharField(
+        max_length=64,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text="Ключ идемпотентности (защита от двойной отправки)"
+    )
+
     def validate_store(self, value):
         """Проверка существования магазина."""
         try:
