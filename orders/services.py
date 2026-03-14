@@ -1329,8 +1329,13 @@ class PartnerRequestService:
                 product = item.product
                 quantity = item.quantity
 
-                # Удаляем из инвентаря партнёра
-                PartnerInventoryService.remove_from_inventory(
+                # ИСПРАВЛЕНИЕ: при создании возврата товары были зарезервированы
+                # через reserve_quantity(), поэтому available_quantity = 0.
+                # remove_from_inventory() проверяет available_quantity → ошибка
+                # "Доступно: 0.000, запрошено: N.000".
+                # complete_reservation() проверяет reserved_quantity и атомарно
+                # уменьшает и quantity, и reserved_quantity — корректный путь.
+                PartnerInventoryService.complete_reservation(
                     partner=partner,
                     product=product,
                     quantity=quantity,
