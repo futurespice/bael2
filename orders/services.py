@@ -147,9 +147,21 @@ class OrderWorkflowService:
             paid_quantity = quantity
             if product.is_bonus and not product.is_weight_based:
                 qty_int = int(quantity)
-                bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
+                # quantity = ИТОГО (платные + бонусные).
+                # Формула применяется к платному кол-ву, поэтому ищем paid
+                # бинарным поиском: paid + formula(paid) == qty_int.
+                lo, hi = 0, qty_int
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    b = 4 * (mid // 50) + (mid % 50) // 20
+                    if mid + b <= qty_int:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                paid_int = lo
+                bonus_count = qty_int - paid_int
                 bonus_quantity = Decimal(str(bonus_count))
-                paid_quantity = quantity - bonus_quantity
+                paid_quantity = Decimal(str(paid_int))
 
             # Проверка наличия на складе (total = quantity)
             if product.stock_quantity < quantity:
@@ -1730,9 +1742,21 @@ class ManualOrderService:
                 paid_quantity = quantity
                 if product.is_bonus and not product.is_weight_based:
                     qty_int = int(quantity)
-                    bonus_count = 4 * (qty_int // 50) + (qty_int % 50) // 20
+                    # quantity = ИТОГО (платные + бонусные).
+                    # Формула применяется к платному кол-ву, поэтому ищем paid
+                    # бинарным поиском: paid + formula(paid) == qty_int.
+                    lo, hi = 0, qty_int
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        b = 4 * (mid // 50) + (mid % 50) // 20
+                        if mid + b <= qty_int:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    paid_int = lo
+                    bonus_count = qty_int - paid_int
                     bonus_quantity = Decimal(str(bonus_count))
-                    paid_quantity = quantity - bonus_quantity
+                    paid_quantity = Decimal(str(paid_int))
 
                 # Проверяем наличие у партнёра (ровно столько сколько везёт)
                 has_inventory = PartnerInventoryService.check_availability(
