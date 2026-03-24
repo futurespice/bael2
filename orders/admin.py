@@ -166,14 +166,31 @@ class DefectiveProductAdmin(admin.ModelAdmin):
     actions = ['approve_defects', 'reject_defects']
 
     def approve_defects(self, request, queryset):
-        """Массовое подтверждение брака."""
+        """Массовое подтверждение брака с уменьшением долга магазина."""
         from .models import DefectiveProduct
-        updated = queryset.filter(
-            status=DefectiveProduct.DefectStatus.PENDING
-        ).update(
-            status=DefectiveProduct.DefectStatus.APPROVED,
-            reviewed_by=request.user
-        )
+        from stores.models import Store
+        from django.db.models import F, Case, When, Value, DecimalField
+        from django.db import transaction
+        from decimal import Decimal
+
+        pending = queryset.filter(status=DefectiveProduct.DefectStatus.PENDING).select_related('order__store')
+        updated = 0
+        with transaction.atomic():
+            for defect in pending:
+                defect.status = DefectiveProduct.DefectStatus.APPROVED
+                defect.reviewed_by = request.user
+                defect.save(update_fields=['status', 'reviewed_by'])
+
+                store = defect.order.store
+                defect_amount = defect.total_amount
+                Store.objects.filter(pk=store.pk).update(
+                    debt=Case(
+                        When(debt__gte=defect_amount, then=F('debt') - defect_amount),
+                        default=Value(Decimal('0')),
+                        output_field=DecimalField(max_digits=14, decimal_places=2),
+                    )
+                )
+                updated += 1
         self.message_user(request, f'Подтверждено {updated} записей о браке')
 
     approve_defects.short_description = 'Подтвердить выбранный брак'

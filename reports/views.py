@@ -575,7 +575,7 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
 
         # Сортировка
         if sort_by == 'debt_desc':
-            queryset = queryset.order_by('-total_debt')
+            queryset = queryset.order_by('-debt')
         elif sort_by == 'paid_date_desc':
             # Сортировка по последней дате погашения
             queryset = queryset.annotate(
@@ -637,8 +637,8 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
                 'id': store.id,
                 'name': store.name,
                 'inn': store.inn,
-                'total_debt': str(store.total_debt),
-                'paid_debt': str(store.paid_debt),
+                'total_debt': str(store.debt),
+                'paid_debt': str(store.total_paid),
                 'last_payment_date': last_payments.get(store.id),
                 'orders_count': orders_counts.get(store.id, 0),
             })
