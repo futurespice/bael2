@@ -811,29 +811,30 @@ class PartnerStatisticsService:
         # =========================================================================
         inventory = PartnerInventory.objects.filter(
             partner_id=partner_id,
-            quantity__gt=0
+            quantity__gt=F('reserved_quantity')
         ).select_related('product')
-        
+
         inventory_total = Decimal('0')
         inventory_piece_count = 0
         inventory_weight_total = Decimal('0')
         inventory_list = []
-        
+
         for item in inventory:
             product = item.product
-            item_total = item.quantity * product.final_price
+            available = item.available_quantity
+            item_total = available * product.final_price
             inventory_total += item_total
-            
+
             if product.is_weight_based:
-                inventory_weight_total += item.quantity
+                inventory_weight_total += available
                 unit = 'кг'
             else:
-                inventory_piece_count += int(item.quantity)
+                inventory_piece_count += int(available)
                 unit = 'шт'
-            
+
             inventory_list.append({
                 'name': product.name,
-                'quantity': float(item.quantity),
+                'quantity': float(available),
                 'unit': unit,
                 'price': str(product.final_price),
                 'total': str(item_total)
