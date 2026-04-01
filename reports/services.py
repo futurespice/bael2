@@ -1216,7 +1216,13 @@ class PartnerProfileService:
             store = order.store
             order_date = order.confirmed_at.strftime('%d.%m.%y')
             
-            for item in order.items.all():
+            # Считаем итог по заказу один раз (items уже prefetch)
+            order_items_cached = list(order.items.all())
+            order_piece_qty = sum(
+                int(i.quantity) for i in order_items_cached if not i.product.is_weight_based
+            )
+
+            for item in order_items_cached:
                 product = item.product
 
                 if product.is_weight_based:
@@ -1229,6 +1235,9 @@ class PartnerProfileService:
                 total_amount += item.total
 
                 sales.append({
+                    'order_id': order.id,
+                    'order_total': str(order.total_amount),
+                    'order_quantity': order_piece_qty,
                     'date': order_date,
                     'store_id': store.id,
                     'store_name': store.name,

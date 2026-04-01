@@ -9,9 +9,10 @@ app_name = 'reports'
 
 router = DefaultRouter()
 
-router.register(r'partners/statistics',views.PartnerStatisticsViewSet, basename='partner-statistics')
-router.register(r'partners/profile',views.PartnerProfileViewSet,basename='partner-profile')
-router.register( r'partners/tracker',views.PartnerTrackerViewSet,basename='partner-tracker')
+router.register(r'partners/statistics', views.PartnerStatisticsViewSet, basename='partner-statistics')
+router.register(r'partners/profile', views.PartnerProfileViewSet, basename='partner-profile')
+router.register(r'partners/tracker', views.PartnerTrackerViewSet, basename='partner-tracker')
+router.register(r'admin/partner-profile', views.AdminPartnerProfileViewSet, basename='admin-partner-profile')
 
 urlpatterns = [
     path('', include(router.urls)),

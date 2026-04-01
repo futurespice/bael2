@@ -1054,3 +1054,297 @@ class PartnerProfileAPITest(ReportsBaseTest):
         self._auth_partner()
         response = self.client.get(self.URL, {'date': '01-13-2026'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+# =============================================================================
+# 5. GET /api/reports/admin/partner-statistics/{pk}/
+# =============================================================================
+
+class AdminPartnerStatisticsViewTest(ReportsBaseTest):
+    """Тесты GET /api/reports/admin/partner-statistics/{pk}/"""
+
+    def _url(self, pk=None):
+        pk = pk if pk is not None else self.partner.id
+        return f'/api/reports/admin/partner-statistics/{pk}/'
+
+    def _auth_admin(self):
+        self.client.force_authenticate(user=self.admin)
+
+    # --- Авторизация ---
+
+    def test_requires_authentication(self):
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_partner_forbidden(self):
+        """Партнёр не имеет доступа к этому эндпоинту"""
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_store_user_forbidden(self):
+        self.client.force_authenticate(user=self.store_owner)
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_has_access(self):
+        self._auth_admin()
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_404_for_nonexistent_partner(self):
+        self._auth_admin()
+        response = self.client.get(self._url(pk=99999))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_404_for_non_partner_role(self):
+        """pk существует, но роль не partner → 404"""
+        self._auth_admin()
+        response = self.client.get(self._url(pk=self.admin.id))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # --- Структура ответа ---
+
+    def test_response_contains_partner_name(self):
+        self._auth_admin()
+        response = self.client.get(self._url())
+        self.assertIn('partner_name', response.data)
+        self.assertIn('partner_id', response.data)
+
+    def test_partner_name_matches(self):
+        self._auth_admin()
+        response = self.client.get(self._url())
+        self.assertEqual(response.data['partner_id'], self.partner.id)
+        self.assertEqual(response.data['partner_name'], self.partner.get_full_name())
+
+    def test_response_keys_present(self):
+        self._auth_admin()
+        response = self.client.get(self._url(), {'date': timezone.localdate().isoformat()})
+        data = response.data
+        for key in ['sold', 'inventory', 'expenses', 'defective', 'bonus', 'debt', 'paid_debt', 'grand_total']:
+            self.assertIn(key, data, msg=f'Ключ {key!r} отсутствует')
+
+    # --- Данные совпадают с данными партнёра ---
+
+    def test_sold_total_amount(self):
+        """sold.total_amount = 1800 (как у партнёра за год)"""
+        self._auth_admin()
+        response = self.client.get(self._url(), {'period': 'year'})
+        self.assertAlmostEqual(float(response.data['sold']['total_amount']), 1800.0, places=1)
+
+    def test_bonus_count(self):
+        """bonus.count = 5"""
+        self._auth_admin()
+        response = self.client.get(self._url(), {'period': 'year'})
+        self.assertEqual(response.data['bonus']['count'], 5)
+
+    def test_defective_total_amount(self):
+        """defective.total_amount = 200"""
+        self._auth_admin()
+        response = self.client.get(self._url(), {'period': 'year'})
+        self.assertAlmostEqual(float(response.data['defective']['total_amount']), 200.0, places=1)
+
+    def test_expenses_total_amount(self):
+        """expenses.total_amount = 600"""
+        self._auth_admin()
+        response = self.client.get(self._url(), {'period': 'year'})
+        self.assertAlmostEqual(float(response.data['expenses']['total_amount']), 600.0, places=1)
+
+    def test_grand_total(self):
+        """grand_total = paid_debt(900) - expenses(600) - bonus(500) = -200"""
+        self._auth_admin()
+        response = self.client.get(self._url(), {'period': 'year'})
+        self.assertAlmostEqual(float(response.data['grand_total']), -200.0, places=1)
+
+    # --- Фильтры ---
+
+    def test_specific_date_filter(self):
+        self._auth_admin()
+        today = timezone.localdate().isoformat()
+        response = self.client.get(self._url(), {'date': today})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_date_range_filter(self):
+        self._auth_admin()
+        today = timezone.localdate().isoformat()
+        response = self.client.get(self._url(), {'date_from': today, 'date_to': today})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_invalid_date_returns_400(self):
+        self._auth_admin()
+        response = self.client.get(self._url(), {'date': '13-01-2026'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_period_returns_400(self):
+        self._auth_admin()
+        response = self.client.get(self._url(), {'period': 'bad_value'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_future_range_returns_zeros(self):
+        self._auth_admin()
+        future = (timezone.localdate() + timedelta(days=30)).isoformat()
+        response = self.client.get(self._url(), {'date_from': future, 'date_to': future})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertAlmostEqual(float(response.data['sold']['total_amount']), 0.0, places=1)
+
+    def test_default_period_is_today(self):
+        """Без параметров — статистика за сегодня (заказы есть)"""
+        self._auth_admin()
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Заказы created today → sold > 0
+        self.assertAlmostEqual(float(response.data['sold']['total_amount']), 1800.0, places=1)
+
+
+# =============================================================================
+# 6. GET /api/reports/admin/partner-profile/
+# =============================================================================
+
+class AdminPartnerProfileViewTest(ReportsBaseTest):
+    """Тесты GET /api/reports/admin/partner-profile/?partner_id={id}"""
+
+    URL = '/api/reports/admin/partner-profile/'
+
+    def _auth_admin(self):
+        self.client.force_authenticate(user=self.admin)
+
+    # --- Авторизация ---
+
+    def test_requires_authentication(self):
+        response = self.client.get(self.URL, {'partner_id': self.partner.id})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_partner_forbidden(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.get(self.URL, {'partner_id': self.partner.id})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_store_user_forbidden(self):
+        self.client.force_authenticate(user=self.store_owner)
+        response = self.client.get(self.URL, {'partner_id': self.partner.id})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_has_access(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # --- Валидация partner_id ---
+
+    def test_missing_partner_id_returns_400(self):
+        self._auth_admin()
+        response = self.client.get(self.URL)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_partner_id_type_returns_400(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': 'abc'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_nonexistent_partner_returns_404(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': 99999})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_non_partner_role_returns_404(self):
+        """admin.id существует, но роль не partner → 404"""
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.admin.id})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # --- Структура ответа (совпадает с /partners/profile/) ---
+
+    def test_response_keys(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        data = response.data
+        for key in ['period', 'date_from', 'date_to', 'available_stores', 'filter', 'sales', 'totals']:
+            self.assertIn(key, data, msg=f'Ключ {key!r} отсутствует')
+
+    def test_sales_is_list(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        self.assertIsInstance(response.data['sales'], list)
+
+    def test_available_stores_is_list(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        self.assertIsInstance(response.data['available_stores'], list)
+
+    # --- Данные совпадают с /partners/profile/ ---
+
+    def test_totals_piece_count(self):
+        """totals.piece_count = 23 (как у партнёра)"""
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        self.assertEqual(response.data['totals']['piece_count'], 23)
+
+    def test_totals_total_amount(self):
+        """totals.total_amount = 1800"""
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        self.assertAlmostEqual(float(response.data['totals']['total_amount']), 1800.0, places=1)
+
+    def test_totals_sales_count(self):
+        """totals.sales_count = 3"""
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        self.assertEqual(response.data['totals']['sales_count'], 3)
+
+    def test_available_store_name(self):
+        """available_stores содержит тестовый магазин"""
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'period': 'year'})
+        names = [s['name'] for s in response.data['available_stores']]
+        self.assertIn(self.store.name, names)
+
+    # --- Фильтры ---
+
+    def test_filter_by_store_id(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {
+            'partner_id': self.partner.id,
+            'period': 'year',
+            'store_id': self.store.id,
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for sale in response.data['sales']:
+            self.assertEqual(sale['store_id'], self.store.id)
+
+    def test_filter_by_wrong_store_id_returns_empty_sales(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {
+            'partner_id': self.partner.id,
+            'period': 'year',
+            'store_id': 99999,
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['sales']), 0)
+
+    def test_specific_date_filter(self):
+        self._auth_admin()
+        today = timezone.localdate().isoformat()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'date': today})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_future_date_returns_empty_sales(self):
+        self._auth_admin()
+        future = (timezone.localdate() + timedelta(days=30)).isoformat()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'date': future})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['sales']), 0)
+
+    def test_invalid_date_format_returns_400(self):
+        self._auth_admin()
+        response = self.client.get(self.URL, {'partner_id': self.partner.id, 'date': '13-01-2026'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_date_range_filter(self):
+        self._auth_admin()
+        today = timezone.localdate().isoformat()
+        response = self.client.get(self.URL, {
+            'partner_id': self.partner.id,
+            'date_from': today,
+            'date_to': today,
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)

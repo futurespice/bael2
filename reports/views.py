@@ -298,6 +298,165 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
             )
 
 
+# =============================================================================
+# ADMIN: PARTNER PROFILE (просмотр профиля любого партнёра администратором)
+# =============================================================================
+
+class AdminPartnerProfileViewSet(viewsets.ViewSet):
+    """
+    Профиль партнёра для администратора.
+
+    Идентичен /api/reports/partners/profile/, но:
+    - доступен только админу
+    - партнёр выбирается через query param ?partner_id=<id>
+
+    **Endpoint:**
+    GET /api/reports/admin/partner-profile/?partner_id=1&date=2026-04-01
+
+    **Параметры:**
+    - partner_id (обязательный): ID партнёра
+    - date: конкретный день (YYYY-MM-DD)
+    - date_from + date_to: произвольный диапазон
+    - period: day / week / month / year (по умолчанию month)
+    - store_id: фильтр по магазину (опционально)
+
+    **Response:** совпадает со структурой /api/reports/partners/profile/
+    """
+
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    @extend_schema(
+        summary="Профиль партнёра для админа",
+        description="Просмотр профиля продаж любого партнёра (доступно только администратору)",
+        parameters=[
+            OpenApiParameter(
+                name='partner_id',
+                type=int,
+                description='ID партнёра (обязательный)',
+                required=True,
+            ),
+            OpenApiParameter(
+                name='period',
+                type=str,
+                enum=['day', 'week', 'month', 'year'],
+                description='Период (игнорируется если указаны date или date_from/date_to)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='date',
+                type=str,
+                description='Конкретная дата (YYYY-MM-DD)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='date_from',
+                type=str,
+                description='Начало периода (YYYY-MM-DD)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='date_to',
+                type=str,
+                description='Конец периода (YYYY-MM-DD)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='store_id',
+                type=int,
+                description='Фильтр по магазину (опционально)',
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Профиль партнёра (идентичен /api/reports/partners/profile/)"),
+            400: OpenApiResponse(description="partner_id не передан или невалидная дата"),
+            404: OpenApiResponse(description="Партнёр не найден"),
+        },
+        tags=['Reports'],
+    )
+    def list(self, request):
+        """Получить профиль партнёра."""
+        # --- 1. Получить и валидировать partner_id ---
+        partner_id_raw = request.query_params.get('partner_id')
+        if not partner_id_raw:
+            return Response(
+                {'partner_id': 'Этот параметр обязателен.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            partner_id = int(partner_id_raw)
+        except ValueError:
+            return Response(
+                {'partner_id': 'Должно быть целым числом.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not User.objects.filter(pk=partner_id, role='partner').exists():
+            return Response(
+                {'detail': 'Партнёр не найден.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # --- 2. Парсинг параметров даты (та же логика что у PartnerProfileViewSet) ---
+        from datetime import datetime as _dt
+        from django.utils import timezone as _tz
+
+        period = request.query_params.get('period', 'month')
+        date_str = request.query_params.get('date')
+        date_from_str = request.query_params.get('date_from')
+        date_to_str = request.query_params.get('date_to')
+
+        date_from = None
+        date_to = None
+
+        try:
+            if date_str:
+                specific = _dt.strptime(date_str, '%Y-%m-%d').date()
+                date_from = _tz.make_aware(_dt.combine(specific, _dt.min.time()))
+                date_to = _tz.make_aware(_dt.combine(specific, _dt.max.time()))
+                period = 'day'
+            elif date_from_str and date_to_str:
+                date_from = _tz.make_aware(_dt.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = _tz.make_aware(_dt.combine(
+                    _dt.strptime(date_to_str, '%Y-%m-%d').date(), _dt.max.time()
+                ))
+            elif date_from_str:
+                date_from = _tz.make_aware(_dt.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = _tz.now()
+            elif date_to_str:
+                date_from = _tz.make_aware(_dt(2020, 1, 1))
+                date_to = _tz.make_aware(_dt.combine(
+                    _dt.strptime(date_to_str, '%Y-%m-%d').date(), _dt.max.time()
+                ))
+            else:
+                if period not in ['day', 'week', 'month', 'year']:
+                    return Response(
+                        {'period': 'Неверный период. Используйте: day, week, month, year'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+        except ValueError as exc:
+            return Response(
+                {'date': f'Неверный формат даты. Используйте YYYY-MM-DD. {exc}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --- 3. store_id (опционально) ---
+        store_id = request.query_params.get('store_id')
+        if store_id:
+            store_id = int(store_id)
+
+        # --- 4. Переиспользуем ту же бизнес-логику что и у партнёра ---
+        profile = PartnerProfileService.get_profile_data(
+            partner_id=partner_id,
+            period=period,
+            store_id=store_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        return Response(profile)
+
+
 class PartnerProfileViewSet(viewsets.ViewSet):
     """
     ViewSet для профиля партнёра с историей продаж.
@@ -796,3 +955,161 @@ class AdminPartnerStatisticsViewSet(viewsets.ViewSet):
                 {'error': str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+# =============================================================================
+# ADMIN: PARTNER PROFILE (просмотр профиля любого партнёра администратором)
+# =============================================================================
+
+class AdminPartnerProfileViewSet(viewsets.ViewSet):
+    """
+    Профиль партнёра для администратора.
+
+    Идентичен /api/reports/partners/profile/, но:
+    - доступен только админу
+    - партнёр выбирается через query param ?partner_id=<id>
+
+    **Endpoint:**
+    GET /api/reports/admin/partner-profile/?partner_id=1&date=2026-04-01
+
+    **Параметры:**
+    - partner_id (обязательный): ID партнёра
+    - date: конкретный день (YYYY-MM-DD)
+    - date_from + date_to: произвольный диапазон
+    - period: day / week / month / year (по умолчанию month)
+    - store_id: фильтр по магазину (опционально)
+
+    **Response:** совпадает со структурой /api/reports/partners/profile/
+    """
+
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    @extend_schema(
+        summary="Профиль партнёра для админа",
+        description="Просмотр профиля продаж любого партнёра (доступно только администратору)",
+        parameters=[
+            OpenApiParameter(
+                name='partner_id',
+                type=int,
+                description='ID партнёра (обязательный)',
+                required=True,
+            ),
+            OpenApiParameter(
+                name='period',
+                type=str,
+                enum=['day', 'week', 'month', 'year'],
+                description='Период (игнорируется если указаны date или date_from/date_to)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='date',
+                type=str,
+                description='Конкретная дата (YYYY-MM-DD)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='date_from',
+                type=str,
+                description='Начало периода (YYYY-MM-DD)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='date_to',
+                type=str,
+                description='Конец периода (YYYY-MM-DD)',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='store_id',
+                type=int,
+                description='Фильтр по магазину (опционально)',
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Профиль партнёра (идентичен /api/reports/partners/profile/)"),
+            400: OpenApiResponse(description="partner_id не передан или невалидная дата"),
+            404: OpenApiResponse(description="Партнёр не найден"),
+        },
+        tags=['Reports'],
+    )
+    def list(self, request):
+        """Получить профиль партнёра."""
+        # --- 1. Валидация partner_id ---
+        partner_id_raw = request.query_params.get('partner_id')
+        if not partner_id_raw:
+            return Response(
+                {'partner_id': 'Этот параметр обязателен.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            partner_id = int(partner_id_raw)
+        except ValueError:
+            return Response(
+                {'partner_id': 'Должно быть целым числом.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not User.objects.filter(pk=partner_id, role='partner').exists():
+            return Response(
+                {'detail': 'Партнёр не найден.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # --- 2. Парсинг дат ---
+        from datetime import datetime as _dt
+        from django.utils import timezone as _tz
+
+        period = request.query_params.get('period', 'month')
+        date_str = request.query_params.get('date')
+        date_from_str = request.query_params.get('date_from')
+        date_to_str = request.query_params.get('date_to')
+        date_from = None
+        date_to = None
+
+        try:
+            if date_str:
+                specific = _dt.strptime(date_str, '%Y-%m-%d').date()
+                date_from = _tz.make_aware(_dt.combine(specific, _dt.min.time()))
+                date_to = _tz.make_aware(_dt.combine(specific, _dt.max.time()))
+                period = 'day'
+            elif date_from_str and date_to_str:
+                date_from = _tz.make_aware(_dt.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = _tz.make_aware(_dt.combine(
+                    _dt.strptime(date_to_str, '%Y-%m-%d').date(), _dt.max.time()
+                ))
+            elif date_from_str:
+                date_from = _tz.make_aware(_dt.strptime(date_from_str, '%Y-%m-%d'))
+                date_to = _tz.now()
+            elif date_to_str:
+                date_from = _tz.make_aware(_dt(2020, 1, 1))
+                date_to = _tz.make_aware(_dt.combine(
+                    _dt.strptime(date_to_str, '%Y-%m-%d').date(), _dt.max.time()
+                ))
+            else:
+                if period not in ['day', 'week', 'month', 'year']:
+                    return Response(
+                        {'period': 'Неверный период. Используйте: day, week, month, year'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+        except ValueError as exc:
+            return Response(
+                {'date': f'Неверный формат даты. Используйте YYYY-MM-DD. {exc}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --- 3. store_id (опционально) ---
+        store_id = request.query_params.get('store_id')
+        if store_id:
+            store_id = int(store_id)
+
+        # --- 4. Переиспользуем PartnerProfileService без изменений ---
+        profile = PartnerProfileService.get_profile_data(
+            partner_id=partner_id,
+            period=period,
+            store_id=store_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        return Response(profile)
