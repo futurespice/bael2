@@ -298,7 +298,9 @@ class OrderWorkflowService:
 
         # Проверка наличия товаров ОТКЛЮЧЕНА для возможности принятия заказа с нехваткой
         # Пользователь имеет возможность удалить недостающие товары из корзины позже
-        order_items = order.items.select_related('product').all()
+        # order_by('product_id') обязателен: детерминированный порядок блокировок
+        # PartnerInventory предотвращает дедлок при параллельных approve одного партнёра.
+        order_items = order.items.select_related('product').order_by('product_id')
 
         # Резервируем товары в PartnerInventory (с перерасходом если нужно)
         for item in order_items:
@@ -947,6 +949,7 @@ class BasketService:
         # 5. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
         # =====================================================================
         confirmed_orders = []
+        confirmed_at = timezone.now()  # Одно время для всех заказов корзины
         orders_list = list(orders)  # Материализуем для корректной работы enumerate
 
         for idx, order in enumerate(orders_list):
@@ -972,7 +975,7 @@ class BasketService:
             order.status = StoreOrderStatus.ACCEPTED
             order.partner = partner_user
             order.confirmed_by = partner_user
-            order.confirmed_at = timezone.now()
+            order.confirmed_at = confirmed_at
             order.prepayment_amount = order_prepayment
             order.debt_amount = order_debt
 

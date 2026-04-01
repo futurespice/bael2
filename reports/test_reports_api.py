@@ -28,7 +28,7 @@
     debt_payments   = 500
     paid_debt       = 400 + 500 = 900
     original_debt   = 1200 + 700 = 1900
-    debt            = 1900 - 500 = 1400
+    debt            = 1900 - 500(payments) - 200(defects) = 1200
     defect_amount   = 200
     partner_expenses= 600
     production_exp  = 0 (нет overhead Expense в тесте)
@@ -37,7 +37,7 @@
     products_count  = 10 + 5 + 8 = 23
     bonus_count     = 5
     profit          = 2300 - 200 - 600 = 1500
-    total_balance   = 2300 - 200 - 600 - 1400 = 100
+    total_balance   = 2300 - 200 - 600 - 1200 = 300
 
   StoreHistory:
     total_amount   = 2300
@@ -50,8 +50,10 @@
     sold.total_amount = 1000 (10 ice_cream) + 800 (8 juice) = 1800
     sold.piece_count  = 18
     bonus.count       = 5
+    bonus.total_amount = 5 × 100 = 500
     defective.total_amount = 200
     expenses.total_amount  = 600
+    grand_total        = paid_debt(900) - expenses(600) - bonus(500) = -200
     debt               = str, > 0
 
   PartnerProfile (flat sales table, all items including bonus):
@@ -343,10 +345,10 @@ class AdminStatisticsTest(ReportsBaseTest):
         self.assertAlmostEqual(response.data['statistics']['paid_debt'], 900.0)
 
     def test_debt(self):
-        """debt = original_debt(1200+700) - paid_via_payments(500) = 1400"""
+        """debt = original_debt(1900) - paid_via_payments(500) - defects(200) = 1200"""
         self._auth_admin()
         response = self.client.get(self.URL, {'period': 'all_time'})
-        self.assertAlmostEqual(response.data['statistics']['debt'], 1400.0)
+        self.assertAlmostEqual(response.data['statistics']['debt'], 1200.0)
 
     def test_defect_amount(self):
         """defect_amount = 200 (APPROVED дефект)"""
@@ -361,16 +363,16 @@ class AdminStatisticsTest(ReportsBaseTest):
         self.assertAlmostEqual(response.data['statistics']['partner_expenses'], 600.0)
 
     def test_profit(self):
-        """profit = income - defect - total_expenses = 2300 - 200 - 600 = 1500"""
+        """profit = income - defect - total_expenses - bonus = 2300 - 200 - 600 - 500 = 1000"""
         self._auth_admin()
         response = self.client.get(self.URL, {'period': 'all_time'})
-        self.assertAlmostEqual(response.data['statistics']['profit'], 1500.0)
+        self.assertAlmostEqual(response.data['statistics']['profit'], 1000.0)
 
     def test_total_balance(self):
-        """total_balance = income - defect - expenses - debt = 2300 - 200 - 600 - 1400 = 100"""
+        """total_balance = income - defect - expenses - debt - bonus = 2300 - 200 - 600 - 1200 - 500 = -200"""
         self._auth_admin()
         response = self.client.get(self.URL, {'period': 'all_time'})
-        self.assertAlmostEqual(response.data['statistics']['total_balance'], 100.0)
+        self.assertAlmostEqual(response.data['statistics']['total_balance'], -200.0)
 
     def test_pending_defect_not_counted(self):
         """PENDING дефект НЕ входит в defect_amount"""
@@ -780,6 +782,24 @@ class PartnerStatisticsAPITest(ReportsBaseTest):
         response = self.client.get(self.URL, {'period': 'year'})
         bonus = response.data['bonus']
         self.assertEqual(bonus['count'], 5)
+
+    def test_bonus_total_amount(self):
+        """bonus.total_amount = quantity × price = 5 × 100 = 500"""
+        self._auth_partner()
+        response = self.client.get(self.URL, {'period': 'year'})
+        bonus = response.data['bonus']
+        self.assertAlmostEqual(float(bonus['total_amount']), 500.0, places=1)
+
+    # --- Итого (grand_total) ---
+
+    def test_grand_total(self):
+        """grand_total = paid_debt(900) - expenses(600) - bonus(500) = -200
+        paid_debt = prepayment(300+100) + DebtPayment(500) = 900
+        Включает только реально полученные деньги, НЕ непогашенный долг магазина.
+        """
+        self._auth_partner()
+        response = self.client.get(self.URL, {'period': 'year'})
+        self.assertAlmostEqual(float(response.data['grand_total']), -200.0, places=1)
 
     # --- Расходы (expenses) ---
 

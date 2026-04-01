@@ -15,7 +15,8 @@ from users.models import User
 from stores.models import Store, Region, City, PartnerInventory, StoreInventory
 from products.models import Product
 from orders.models import StoreOrder, StoreOrderItem, StoreOrderStatus
-from orders.services import OrderWorkflowService, BasketService
+from orders.services import OrderWorkflowService
+from rest_framework.test import APIClient
 
 
 def setup_test_data():
@@ -213,11 +214,15 @@ def test_workflow():
     print("="*60)
     
     try:
-        result = BasketService.confirm_basket(
-            store=store,
-            partner_user=partner,
-            prepayment_amount=Decimal('500'),
+        client = APIClient()
+        client.force_authenticate(user=partner)
+        resp = client.post(
+            f'/api/stores/stores/{store.id}/basket/confirm/',
+            {'prepayment_amount': '500'},
+            format='json',
         )
+        assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.data}"
+        result = resp.data
         print(f"\n✅ Корзина подтверждена!")
         print(f"   Заказов: {len(result['confirmed_orders'])}")
         print(f"   Общая сумма: {result['totals']['total_amount']} сом")

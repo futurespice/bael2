@@ -25,7 +25,8 @@ from users.models import User
 from stores.models import Store, Region, City, PartnerInventory, StoreInventory
 from products.models import Product
 from orders.models import StoreOrder, StoreOrderItem, StoreOrderStatus, DebtPayment
-from orders.services import OrderWorkflowService, BasketService
+from orders.services import OrderWorkflowService
+from rest_framework.test import APIClient
 
 
 # ============================================================================
@@ -254,12 +255,16 @@ def test_preorder_workflow(partner, store_user, store, ice_cream, juice, cheese,
     # 5. Confirm корзины
     print("\n🛒 Шаг 5: Партнёр подтверждает корзину (confirm)...")
     prepayment = Decimal('2000')
-    result = BasketService.confirm_basket(
-        store=store,
-        partner_user=partner,
-        prepayment_amount=prepayment,
+    client = APIClient()
+    client.force_authenticate(user=partner)
+    resp = client.post(
+        f'/api/stores/stores/{store.id}/basket/confirm/',
+        {'prepayment_amount': str(prepayment)},
+        format='json',
     )
-    
+    assert resp.status_code == 200, f"confirm_basket failed: {resp.data}"
+    result = resp.data
+
     print(f"   ✅ Заказов подтверждено: {len(result['confirmed_orders'])}")
     print(f"   💰 Общая сумма: {result['totals']['total_amount']} сом")
     print(f"   💵 Предоплата: {result['totals']['prepayment']} сом")

@@ -4,7 +4,7 @@ from django.test import TestCase
 from django.contrib.auth import get_user_model
 from stores.models import Store, PartnerInventory, Region, City
 from products.models import Product, ProductUnit
-from orders.services import PartnerRequestService, OrderWorkflowService, BasketService, ManualOrderService, OrderItemData
+from orders.services import PartnerRequestService, OrderWorkflowService, ManualOrderService, OrderItemData
 from orders.models import PartnerRequestType, StoreOrderStatus
 from stores.services import PartnerInventoryService
 

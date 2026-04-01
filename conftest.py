@@ -56,7 +56,8 @@ from orders.models import (  # noqa: E402
     ReturnedItem,
     DefectiveProduct,
 )
-from orders.services import OrderWorkflowService, BasketService  # noqa: E402
+from orders.services import OrderWorkflowService  # noqa: E402
+from rest_framework.test import APIClient  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -617,11 +618,16 @@ def _create_preorder(data: Dict[str, Any]) -> StoreOrder:
     # Шаг 2: Admin утверждает (через partner — для тестов)
     OrderWorkflowService.admin_approve_order(order=order, admin_user=partner)
 
-    # Шаг 3: Partner подтверждает доставку
-    BasketService.confirm_basket(
-        store=store,
-        partner_user=partner,
-        prepayment_amount=Decimal('1000'),
+    # Шаг 3: Partner подтверждает доставку через реальный API endpoint
+    client = APIClient()
+    client.force_authenticate(user=partner)
+    response = client.post(
+        f'/api/stores/stores/{store.id}/basket/confirm/',
+        {'prepayment_amount': '1000'},
+        format='json',
+    )
+    assert response.status_code == 200, (
+        f"confirm_basket failed: {getattr(response, 'data', response.content)}"
     )
 
     order.refresh_from_db()

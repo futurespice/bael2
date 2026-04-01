@@ -266,9 +266,11 @@ class ReportService:
         # =========================================================================
 
         # Погашения через DebtPayment (pay-debt)
+        # Фильтруем по дате подтверждения заказа (не по дате платежа),
+        # чтобы debt и paid_debt относились к одному и тому же набору заказов.
         paid_debt_qs = DebtPayment.objects.filter(
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date
+            order__confirmed_at__date__gte=start_date,
+            order__confirmed_at__date__lte=end_date
         )
 
         if filters.store_id:
@@ -290,13 +292,9 @@ class ReportService:
         paid_debt = prepayment_total + debt_payments_total
 
         # =========================================================================
-        # 5. ДОЛГИ (оставшиеся непогашенные)
+        # 5. ДОЛГИ (оставшиеся непогашенные) — считается ПОСЛЕ брака (секция 7)
         # =========================================================================
-
-        # Оставшийся долг = исходный долг - погашения через pay-debt
-        debt = original_debt - debt_payments_total
-        if debt < Decimal('0'):
-            debt = Decimal('0')
+        # debt будет вычислен ниже, после defect_amount
 
         # =========================================================================
         # 6. БОНУСЫ - считаем из заказов (бонус за один заказ)
@@ -337,14 +335,13 @@ class ReportService:
         bonus_amount = bonus_data['total_amount'] or Decimal('0')
 
         # =========================================================================
-        # 7. ✅ БРАК - ИСПРАВЛЕНО v2.1
-        # Фильтруем по дате СОЗДАНИЯ брака, а не по заказам!
+        # 7. БРАК — фильтруем по дате подтверждения заказа (как продажи)
         # =========================================================================
 
         defect_qs = DefectiveProduct.objects.filter(
             status=DefectiveProduct.DefectStatus.APPROVED,
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date
+            order__confirmed_at__date__gte=start_date,
+            order__confirmed_at__date__lte=end_date
         )
 
         # Применяем фильтры
@@ -362,6 +359,16 @@ class ReportService:
 
         defect_data = defect_qs.aggregate(total=Sum('total_amount'))
         defect_amount = defect_data['total'] or Decimal('0')
+
+        # =========================================================================
+        # 5 (продолжение). ДОЛГИ — после вычисления брака
+        # Долг = исходный (sum order.debt_amount) - погашения - брак.
+        # Брак уменьшает Store.debt (view), но не StoreOrder.debt_amount,
+        # поэтому вычитаем вручную.
+        # =========================================================================
+        debt = original_debt - debt_payments_total - defect_amount
+        if debt < Decimal('0'):
+            debt = Decimal('0')
 
         # =========================================================================
         # 8. РАСХОДЫ (разделённые)
@@ -429,11 +436,11 @@ class ReportService:
         # 10. ВЫЧИСЛЯЕМЫЕ ПОКАЗАТЕЛИ
         # =========================================================================
 
-        # Общий баланс = доход - брак - расходы - долг
-        total_balance = income - defect_amount - total_expenses - debt
+        # Общий баланс = доход - брак - расходы - долг - стоимость бонусов
+        total_balance = income - defect_amount - total_expenses - debt - bonus_amount
 
-        # Прибыль (без учёта долга) = доход - брак - расходы
-        profit = income - defect_amount - total_expenses
+        # Прибыль (без учёта долга) = доход - брак - расходы - стоимость бонусов
+        profit = income - defect_amount - total_expenses - bonus_amount
 
         # =========================================================================
         # 11. ВОЗВРАЩАЕМ РЕЗУЛЬТАТ
@@ -822,7 +829,7 @@ class PartnerStatisticsService:
         for item in inventory:
             product = item.product
             available = item.available_quantity
-            item_total = available * product.final_price
+            item_total = (available * product.final_price).quantize(Decimal('0.01'))
             inventory_total += item_total
 
             if product.is_weight_based:
@@ -864,7 +871,7 @@ class PartnerStatisticsService:
         defective_qs = DefectiveProduct.objects.filter(
             order__partner_id=partner_id,
             status=DefectiveProduct.DefectStatus.APPROVED,
-            created_at__range=[date_from, date_to]
+            order__confirmed_at__range=[date_from, date_to]
         ).select_related('product')
         
         defective_total = Decimal('0')
@@ -899,7 +906,7 @@ class PartnerStatisticsService:
         
         for item in bonus_items:
             product = item.product
-            bonus_total += item.total
+            bonus_total += item.quantity * item.price  # item.total всегда 0 для бонусов
             bonus_count += int(item.quantity)
             
             bonus_list.append({
@@ -956,10 +963,12 @@ class PartnerStatisticsService:
         original_debt = orders_agg['total_debt'] or Decimal('0')
         prepayment_in_period = orders_agg['total_prepayment'] or Decimal('0')
 
-        # Погашения долга по заказам партнёра за период (один запрос вместо двух)
+        # Погашения долга по заказам партнёра за период.
+        # Фильтруем по дате подтверждения заказа (не по дате платежа),
+        # чтобы debt и paid_debt относились к одному и тому же набору заказов.
         debt_payments_in_period = DebtPayment.objects.filter(
             order__partner_id=partner_id,
-            created_at__range=[date_from, date_to]
+            order__confirmed_at__range=[date_from, date_to]
         ).aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')
@@ -975,9 +984,11 @@ class PartnerStatisticsService:
         
         # =========================================================================
         # 9. ОБЩАЯ СУММА
-        # Формула: продажи - расходы - брак - возвраты
+        # Формула: реально полученные деньги (предоплаты) - расходы - бонусы
+        # sold_total НЕ используется: он включает непогашенный долг магазина,
+        # которого партнёр никогда не получит в деньгах.
         # =========================================================================
-        grand_total = sold_total - expenses_total - defective_total - returned_total
+        grand_total = paid_debt - expenses_total - bonus_total
         
         # =========================================================================
         # ФОРМИРУЕМ ОТВЕТ

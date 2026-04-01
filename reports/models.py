@@ -126,7 +126,17 @@ class DailyReport(models.Model):
         default=0,
         validators=[MinValueValidator(0)],
         verbose_name='Бонусы (штук)',
-        help_text='Считаются по количеству, не влияют на сумму'
+        help_text='Считаются по количеству'
+    )
+
+    # Бонусы (финансовая стоимость)
+    bonus_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Стоимость бонусов',
+        help_text='Финансовая стоимость выданных бонусов (количество × цена)'
     )
 
     # Брак (убыток)
@@ -210,7 +220,7 @@ class DailyReport(models.Model):
     @property
     def total_balance(self) -> Decimal:
         """
-        Общий баланс: доход - брак - расходы - долг.
+        Общий баланс: доход - брак - расходы - долг - стоимость бонусов.
 
         ТЗ: "При нуле или минусе — выводить отрицательную прибыль"
         """
@@ -219,12 +229,13 @@ class DailyReport(models.Model):
                 - self.defect_amount
                 - self.expenses
                 - self.debt
+                - self.bonus_amount
         )
 
     @property
     def profit(self) -> Decimal:
         """Прибыль (без учёта долга)."""
-        return self.income - self.defect_amount - self.expenses
+        return self.income - self.defect_amount - self.expenses - self.bonus_amount
 
     def get_chart_data(self) -> Dict[str, Decimal]:
         """

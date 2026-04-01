@@ -200,7 +200,8 @@ def test_preorder_workflow(partner, store_user, store, products):
     print("ТЕСТ 1: ПРЕДЗАКАЗ (включая БОНУСНЫЙ товар)")
     print("="*70)
     
-    from orders.services import OrderWorkflowService, BasketService
+    from orders.services import OrderWorkflowService
+    from rest_framework.test import APIClient
     
     # Создаём заказ с обычными и бонусными товарами
     order = StoreOrder.objects.create(
@@ -250,12 +251,16 @@ def test_preorder_workflow(partner, store_user, store, products):
     # Confirm
     print("\n🛒 Подтверждение корзины...")
     prepayment = Decimal('1000')
-    result = BasketService.confirm_basket(
-        store=store,
-        partner_user=partner,
-        prepayment_amount=prepayment,
+    client = APIClient()
+    client.force_authenticate(user=partner)
+    resp = client.post(
+        f'/api/stores/stores/{store.id}/basket/confirm/',
+        {'prepayment_amount': str(prepayment)},
+        format='json',
     )
-    
+    assert resp.status_code == 200, f"confirm_basket failed: {resp.data}"
+    result = resp.data
+
     print(f"   ✅ Подтверждено")
     print(f"   💰 Сумма: {result['totals']['total_amount']} сом")
     print(f"   💵 Предоплата: {result['totals']['prepayment']} сом")

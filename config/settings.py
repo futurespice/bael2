@@ -145,9 +145,17 @@ if FORCE_SQLITE:
     }
 elif DATABASE_URL:
     DATABASES = {
-        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=None)
+        # conn_max_age=600: постоянные соединения — снижает накладные расходы под нагрузкой.
+        # None давало бы новое соединение на каждый запрос → исчерпание пула при 50+ RPS.
+        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
     }
 else:
+    if not DEBUG:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured(
+            "DATABASE_URL must be set in production (DEBUG=False). "
+            "For local development use FORCE_SQLITE=True."
+        )
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',

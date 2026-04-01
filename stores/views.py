@@ -1051,7 +1051,7 @@ class StoreViewSet(viewsets.ModelViewSet):
             deleted_items = StoreOrderItem.objects.filter(
                 order__in=orders,
                 product_id=product_id
-            ).select_related('product')
+            ).select_related('product').select_for_update()
 
             for item in deleted_items:
                 # ✅ Создаём запись о возврате
@@ -1071,6 +1071,13 @@ class StoreViewSet(viewsets.ModelViewSet):
                     'quantity_removed': float(item.quantity),
                     'order_id': item.order_id,
                 })
+                # Освобождаем резерв в PartnerInventory
+                PartnerInventoryService.release_reserved(
+                    partner=user,
+                    product=item.product,
+                    quantity=item.quantity,
+                    is_bonus=item.is_bonus,
+                )
                 # Возвращаем товар на склад атомарно
                 Product.objects.filter(pk=item.product_id).update(
                     stock_quantity=F('stock_quantity') + item.quantity
@@ -1101,7 +1108,7 @@ class StoreViewSet(viewsets.ModelViewSet):
             items = StoreOrderItem.objects.filter(
                 order__in=orders,
                 product_id=product_id
-            ).select_related('product').order_by('id')
+            ).select_related('product').order_by('id').select_for_update()
 
             if not items.exists():
                 continue
@@ -1139,6 +1146,14 @@ class StoreViewSet(viewsets.ModelViewSet):
                         returned_by=user,
                     )
 
+                    # Освобождаем резерв в PartnerInventory
+                    PartnerInventoryService.release_reserved(
+                        partner=user,
+                        product=product,
+                        quantity=removed_qty,
+                        is_bonus=item.is_bonus,
+                    )
+
                     # Возвращаем на склад атомарно
                     Product.objects.filter(pk=product.pk).update(
                         stock_quantity=F('stock_quantity') + removed_qty
@@ -1174,6 +1189,14 @@ class StoreViewSet(viewsets.ModelViewSet):
                         price_at_return=item.price,
                         reason='Частично удалено из корзины партнёром',
                         returned_by=user,
+                    )
+
+                    # Освобождаем резерв в PartnerInventory
+                    PartnerInventoryService.release_reserved(
+                        partner=user,
+                        product=product,
+                        quantity=removed_qty,
+                        is_bonus=item.is_bonus,
                     )
 
                     # Возвращаем на склад атомарно
@@ -1396,6 +1419,12 @@ class StoreViewSet(viewsets.ModelViewSet):
         # =====================================================================
         total_amount = sum(order.total_amount for order in orders)
 
+        if total_amount == Decimal('0'):
+            return Response(
+                {'error': 'Корзина пуста — все товары были удалены'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         if prepayment_amount > total_amount:
             return Response(
                 {
@@ -1411,65 +1440,93 @@ class StoreViewSet(viewsets.ModelViewSet):
         # 2. ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И ПЕРЕНОС В ИНВЕНТАРЬ
         # =====================================================================
         confirmed_orders = []
+        confirmed_at = timezone.now()  # Одно время для всех заказов
+        remaining_prepayment = prepayment_amount
 
-        for order in orders:
-            # Пропорциональное распределение предоплаты
-            if total_amount > 0:
-                order_prepayment = (order.total_amount / total_amount) * prepayment_amount
-            else:
-                order_prepayment = Decimal('0')
+        try:
+            for idx, order in enumerate(orders):
+                # Пропорциональное распределение предоплаты.
+                # Последний заказ получает остаток, чтобы sum(prepayment_amount) == prepayment_amount.
+                if total_amount > 0:
+                    is_last = (idx == len(orders) - 1)
+                    if is_last:
+                        order_prepayment = remaining_prepayment
+                    else:
+                        order_prepayment = (
+                            (order.total_amount / total_amount) * prepayment_amount
+                        ).quantize(Decimal('0.01'))
+                        remaining_prepayment -= order_prepayment
+                else:
+                    order_prepayment = Decimal('0')
 
-            order_debt = order.total_amount - order_prepayment
+                order_debt = (order.total_amount - order_prepayment).quantize(Decimal('0.01'))
 
-            old_status = order.status
-            order.status = StoreOrderStatus.ACCEPTED
-            order.partner = user
-            order.confirmed_by = user
-            order.confirmed_at = timezone.now()
-            order.prepayment_amount = order_prepayment
-            order.debt_amount = order_debt
+                old_status = order.status
+                order.status = StoreOrderStatus.ACCEPTED
+                order.partner = user
+                order.confirmed_by = user
+                order.confirmed_at = confirmed_at
+                order.prepayment_amount = order_prepayment
+                order.debt_amount = order_debt
 
-            order.save(update_fields=[
-                'status', 'partner', 'confirmed_by', 'confirmed_at',
-                'prepayment_amount', 'debt_amount'
-            ])
+                order.save(update_fields=[
+                    'status', 'partner', 'confirmed_by', 'confirmed_at',
+                    'prepayment_amount', 'debt_amount'
+                ])
 
-            # ✅ КРИТИЧНО: Переносим товары в инвентарь ЗДЕСЬ
-            for item in order.items.all():
-                StoreInventoryService.add_to_inventory(
-                    store=store,
-                    product=item.product,
-                    quantity=item.quantity,
-                    is_bonus=item.is_bonus,
+                # ✅ КРИТИЧНО: Списываем из PartnerInventory и переносим в StoreInventory
+                # order_by('product_id') обязателен: детерминированный порядок блокировок
+                # PartnerInventory предотвращает дедлок при параллельных подтверждениях.
+                for item in order.items.select_related('product').order_by('product_id'):
+                    PartnerInventoryService.complete_reservation(
+                        partner=user,
+                        product=item.product,
+                        quantity=item.quantity,
+                        is_bonus=item.is_bonus,
+                    )
+                    StoreInventoryService.add_to_inventory(
+                        store=store,
+                        product=item.product,
+                        quantity=item.quantity,
+                        is_bonus=item.is_bonus,
+                    )
+
+                # История
+                OrderHistory.objects.create(
+                    order_type=OrderType.STORE,
+                    order_id=order.id,
+                    old_status=old_status,
+                    new_status=StoreOrderStatus.ACCEPTED,
+                    changed_by=user,
+                    comment=(
+                        f'Заказ подтверждён партнёром. '
+                        f'Сумма: {order.total_amount} сом. '
+                        f'Предоплата: {order_prepayment} сом. '
+                        f'Долг: {order_debt} сом.'
+                    )
                 )
 
-            # История
-            OrderHistory.objects.create(
-                order_type=OrderType.STORE,
-                order_id=order.id,
-                old_status=old_status,
-                new_status=StoreOrderStatus.ACCEPTED,
-                changed_by=user,
-                comment=(
-                    f'Заказ подтверждён партнёром. '
-                    f'Сумма: {order.total_amount} сом. '
-                    f'Предоплата: {order_prepayment} сом. '
-                    f'Долг: {order_debt} сом.'
-                )
+                confirmed_orders.append({
+                    'order_id': order.id,
+                    'total_amount': float(order.total_amount),
+                    'prepayment': float(order_prepayment),
+                    'debt': float(order_debt),
+                })
+
+            # =================================================================
+            # 3. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
+            # =================================================================
+            Store.objects.filter(pk=store.pk).update(debt=F('debt') + total_debt)
+            store.refresh_from_db()
+
+        except ValidationError as e:
+            # Гарантируем откат транзакции (исключение поймано внутри atomic-блока)
+            transaction.set_rollback(True)
+            message = ', '.join(e.messages) if e.messages else str(e)
+            return Response(
+                {'error': message},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-
-            confirmed_orders.append({
-                'order_id': order.id,
-                'total_amount': float(order.total_amount),
-                'prepayment': float(order_prepayment),
-                'debt': float(order_debt),
-            })
-
-        # =====================================================================
-        # 3. ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
-        # =====================================================================
-        Store.objects.filter(pk=store.pk).update(debt=F('debt') + total_debt)
-        store.refresh_from_db()
 
         return Response({
             'success': True,
@@ -1818,11 +1875,12 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         price = product.final_price
 
-        # Находим последний ACCEPTED заказ для привязки брака (технически)
-        last_order = StoreOrder.objects.filter(
-            store=store,
-            status=StoreOrderStatus.ACCEPTED
-        ).order_by('-confirmed_at').first()
+        # Находим последний ACCEPTED заказ для привязки брака.
+        # Фильтруем по партнёру: брак атрибутируется его заказам в статистике.
+        order_qs = StoreOrder.objects.filter(store=store, status=StoreOrderStatus.ACCEPTED)
+        if user.role == 'partner':
+            order_qs = order_qs.filter(partner=user)
+        last_order = order_qs.order_by('-confirmed_at').first()
 
         if not last_order:
             return Response(
@@ -1981,12 +2039,12 @@ class StoreViewSet(viewsets.ModelViewSet):
         # ПОИСК ЗАКАЗА ДЛЯ СВЯЗИ
         # =========================================================================
 
-        # Находим последний подтверждённый заказ для технической связи
-        # (DebtPayment привязан к order по структуре БД)
-        last_order = StoreOrder.objects.filter(
-            store=store,
-            status=StoreOrderStatus.ACCEPTED
-        ).order_by('-confirmed_at').first()
+        # Находим последний подтверждённый заказ для технической связи.
+        # Фильтруем по партнёру: платёж атрибутируется его заказам в статистике.
+        order_qs = StoreOrder.objects.filter(store=store, status=StoreOrderStatus.ACCEPTED)
+        if request.user.role == 'partner':
+            order_qs = order_qs.filter(partner=request.user)
+        last_order = order_qs.order_by('-confirmed_at').first()
 
         if not last_order:
             return Response(
