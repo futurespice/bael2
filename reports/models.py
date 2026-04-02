@@ -159,6 +159,16 @@ class DailyReport(models.Model):
         help_text='Ручной ввод от партнёров'
     )
 
+    # Сумма продаж (total товаров с is_bonus=False)
+    sold_total = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
+        verbose_name='Сумма продаж',
+        help_text='Общая сумма проданных товаров (без бонусов)'
+    )
+
     # === КОЛИЧЕСТВЕННЫЕ ПОКАЗАТЕЛИ ===
 
     orders_count = models.IntegerField(

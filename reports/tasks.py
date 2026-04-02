@@ -133,15 +133,17 @@ def generate_daily_report(report_date: str = None):
 
         # Агрегаты по магазину
         income = sum(o.total_amount for o in store_orders)
-        debt = sum(o.debt_amount for o in store_orders)
+        original_debt = sum(o.debt_amount for o in store_orders)
         orders_count = len(store_orders)
 
-        # paid_debt: предоплата + погашения за этот день (через DebtPayment).
-        # Методология совпадает с ReportService.calculate_statistics для согласованности.
+        # paid_debt: предоплата + погашения по заказам, подтверждённым в этот день.
+        # Фильтруем по order__confirmed_at (не по created_at платежа),
+        # чтобы debt и paid_debt относились к одному набору заказов
+        # (консистентно с ReportService.calculate_statistics).
         prepayment = sum(o.prepayment_amount for o in store_orders)
         day_payments = (
             DebtPayment.objects
-            .filter(order_id__in=order_ids, created_at__date=target_date)
+            .filter(order_id__in=order_ids)
             .aggregate(total=Sum('amount'))['total'] or Decimal('0')
         )
         paid_debt = prepayment + day_payments
@@ -170,6 +172,24 @@ def generate_daily_report(report_date: str = None):
             .aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
         )
 
+        # Долг = исходный - погашения(DebtPayment) - дефекты
+        # (консистентно с ReportService: debt = original_debt - debt_payments - defect_amount)
+        debt = original_debt - day_payments - defect_amount
+        if debt < Decimal('0'):
+            debt = Decimal('0')
+
+        # Продано (без бонусов): количество и сумма
+        sold_agg = (
+            StoreOrderItem.objects
+            .filter(order_id__in=order_ids, is_bonus=False)
+            .aggregate(
+                total_qty=Sum('quantity'),
+                total_amount=Sum('total')
+            )
+        )
+        products_sold_count = int(sold_agg['total_qty'] or 0)
+        sold_total = sold_agg['total_amount'] or Decimal('0')
+
         _upsert_daily_report(
             date=target_date,
             store=store,
@@ -184,6 +204,8 @@ def generate_daily_report(report_date: str = None):
                 'bonus_amount': bonus_amount,
                 'defect_amount': defect_amount,
                 'orders_count': orders_count,
+                'products_sold_count': products_sold_count,
+                'sold_total': sold_total,
             }
         )
 
@@ -195,18 +217,43 @@ def generate_daily_report(report_date: str = None):
 
     # Общий отчёт (без привязки к магазину) — из уже загруженных данных
     total_income = all_day_agg['total_income'] or Decimal('0')
-    total_debt = all_day_agg['total_debt'] or Decimal('0')
+    original_total_debt = all_day_agg['total_debt'] or Decimal('0')
     total_prepayment = all_day_agg['total_prepayment'] or Decimal('0')
+
+    # Погашения по заказам, подтверждённым в этот день (все DebtPayment).
+    # Фильтруем по order__confirmed_at (не по created_at платежа),
+    # чтобы debt и paid_debt были консистентны (как в ReportService).
+    all_order_ids = [o.pk for o in all_day_orders]
     global_day_payments = (
         DebtPayment.objects
-        .filter(created_at__date=target_date)
+        .filter(order_id__in=all_order_ids)
         .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    )
+    ) if all_order_ids else Decimal('0')
+
     total_paid_debt = total_prepayment + global_day_payments
     total_bonus_count = int(all_day_bonus['total_qty'] or 0)
     total_bonus_amount = all_day_bonus['total_amount'] or Decimal('0')
     total_defect_amount = all_day_defects['total'] or Decimal('0')
     total_orders_count = all_day_orders.count()
+
+    # Долг = исходный - погашения - дефекты (консистентно с ReportService)
+    total_debt = original_total_debt - global_day_payments - total_defect_amount
+    if total_debt < Decimal('0'):
+        total_debt = Decimal('0')
+
+    # Продано (без бонусов): количество и сумма
+    global_sold_agg = (
+        StoreOrderItem.objects
+        .filter(order__confirmed_at__date=target_date,
+                order__status=StoreOrderStatus.ACCEPTED,
+                is_bonus=False)
+        .aggregate(
+            total_qty=Sum('quantity'),
+            total_amount=Sum('total')
+        )
+    )
+    total_products_sold_count = int(global_sold_agg['total_qty'] or 0)
+    total_sold_total = global_sold_agg['total_amount'] or Decimal('0')
 
     _upsert_daily_report(
         date=target_date,
@@ -223,6 +270,8 @@ def generate_daily_report(report_date: str = None):
             'defect_amount': total_defect_amount,
             'expenses': total_expenses,
             'orders_count': total_orders_count,
+            'products_sold_count': total_products_sold_count,
+            'sold_total': total_sold_total,
         }
     )
 

@@ -535,37 +535,30 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            with transaction.atomic():
-                if markup_percent is not None:
-                    # Вариант 1: процент наценки
-                    product.markup_percentage = Decimal(str(markup_percent))
-                    product.manual_price = None  # Сбрасываем ручную цену
-                elif markup_amount is not None:
-                    # Вариант 2: сумма наценки
-                    markup_amount = Decimal(str(markup_amount))
-                    new_price = product.average_cost_price + markup_amount
-                    product.manual_price = new_price
-                    # Рассчитываем process от себестоимости
-                    if product.average_cost_price > 0:
-                        product.markup_percentage = (markup_amount / product.average_cost_price * 100).quantize(Decimal('0.01'))
+        with transaction.atomic():
+            if markup_percent is not None:
+                # Вариант 1: процент наценки
+                product.markup_percentage = Decimal(str(markup_percent))
+                product.manual_price = None  # Сбрасываем ручную цену
+            elif markup_amount is not None:
+                # Вариант 2: сумма наценки
+                markup_amount = Decimal(str(markup_amount))
+                new_price = product.average_cost_price + markup_amount
+                product.manual_price = new_price
+                # Рассчитываем process от себестоимости
+                if product.average_cost_price > 0:
+                    product.markup_percentage = (markup_amount / product.average_cost_price * 100).quantize(Decimal('0.01'))
 
-                product.save()
+            product.save()
 
-            return Response({
-                'id': product.id,
-                'name': product.name,
-                'average_cost_price': str(product.average_cost_price),
-                'markup_percentage': str(product.markup_percentage),
-                'final_price': str(product.final_price),
-                'profit_per_unit': str(product.final_price - product.average_cost_price)
-            })
-
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        return Response({
+            'id': product.id,
+            'name': product.name,
+            'average_cost_price': str(product.average_cost_price),
+            'markup_percentage': str(product.markup_percentage),
+            'final_price': str(product.final_price),
+            'profit_per_unit': str(product.final_price - product.average_cost_price)
+        })
 
     @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated, IsAdmin])
     def pricing_analytics(self, request, pk=None):
@@ -1390,17 +1383,11 @@ class ProductViewSet(viewsets.ModelViewSet):
         serializer = AccountingDataSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        try:
-            save_results = AccountingService.save_accounting_data(
-                mechanical_expenses_data=serializer.validated_data.get('mechanical_expenses', []),
-                recipe_items_data=serializer.validated_data.get('recipe_items', []),
-                production_batches_data=serializer.validated_data.get('production_batches', [])
-            )
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        save_results = AccountingService.save_accounting_data(
+            mechanical_expenses_data=serializer.validated_data.get('mechanical_expenses', []),
+            recipe_items_data=serializer.validated_data.get('recipe_items', []),
+            production_batches_data=serializer.validated_data.get('production_batches', [])
+        )
 
         # BUG FIX: возвращаем пересчитанные данные по затронутым товарам
         # чтобы мобильный клиент не делал дополнительный запрос
@@ -1524,32 +1511,25 @@ class ProductionBatchViewSet(viewsets.ModelViewSet):
         date_val = serializer.validated_data['date']
         notes = serializer.validated_data.get('notes', '')
 
-        try:
-            if input_type == 'quantity':
-                quantity = serializer.validated_data['quantity']
-                batch = ProductionService.create_batch_from_quantity(
-                    product_id=product_id,
-                    quantity=quantity,
-                    date=date_val,
-                    notes=notes
-                )
-            else:
-                suzerain_quantity = serializer.validated_data['suzerain_quantity']
-                batch = ProductionService.create_batch_from_suzerain(
-                    product_id=product_id,
-                    suzerain_quantity=suzerain_quantity,
-                    date=date_val,
-                    notes=notes
-                )
-
-            output = ProductionBatchSerializer(batch)
-            return Response(output.data, status=status.HTTP_201_CREATED)
-
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
+        if input_type == 'quantity':
+            quantity = serializer.validated_data['quantity']
+            batch = ProductionService.create_batch_from_quantity(
+                product_id=product_id,
+                quantity=quantity,
+                date=date_val,
+                notes=notes
             )
+        else:
+            suzerain_quantity = serializer.validated_data['suzerain_quantity']
+            batch = ProductionService.create_batch_from_suzerain(
+                product_id=product_id,
+                suzerain_quantity=suzerain_quantity,
+                date=date_val,
+                notes=notes
+            )
+
+        output = ProductionBatchSerializer(batch)
+        return Response(output.data, status=status.HTTP_201_CREATED)
 
 
 # =============================================================================

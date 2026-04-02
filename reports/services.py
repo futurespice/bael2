@@ -86,6 +86,7 @@ class StatisticsData:
     bonus_amount: Decimal  # Сумма бонусов (кол-во × цена товара)
     orders_count: int  # Заказов
     products_count: int  # Товаров продано
+    sold_total: Decimal  # Сумма продаж (без бонусов)
 
     # Вычисляемые
     total_balance: Decimal  # Общий баланс
@@ -108,6 +109,7 @@ class StatisticsData:
             'bonus_amount': float(self.bonus_amount),
             'orders_count': self.orders_count,
             'products_count': self.products_count,
+            'sold_total': float(self.sold_total),
             'total_balance': float(self.total_balance),
             'profit': float(self.profit),
         }
@@ -428,9 +430,17 @@ class ReportService:
         orders_count = orders_qs.count()
 
         products_count_data = StoreOrderItem.objects.filter(
-            order__in=orders_qs
+            order__in=orders_qs,
+            is_bonus=False
         ).aggregate(total=Sum('quantity'))
         products_count = int(products_count_data['total'] or 0)
+
+        # Сумма продаж (товары без бонусов)
+        sold_total_data = StoreOrderItem.objects.filter(
+            order__in=orders_qs,
+            is_bonus=False
+        ).aggregate(total=Sum('total'))
+        sold_total = sold_total_data['total'] or Decimal('0')
 
         # =========================================================================
         # 10. ВЫЧИСЛЯЕМЫЕ ПОКАЗАТЕЛИ
@@ -461,6 +471,7 @@ class ReportService:
             bonus_amount=bonus_amount,
             orders_count=orders_count,
             products_count=products_count,
+            sold_total=sold_total,
             total_balance=total_balance,
             profit=profit,
         )
@@ -815,11 +826,20 @@ class PartnerStatisticsService:
         
         # =========================================================================
         # 3. ОСТАТОК ТОВАРА В ИНВЕНТАРЕ (с детализацией)
+        #
+        # ВАЖНО: инвентарь отражает ТЕКУЩИЙ остаток на момент запроса, а не
+        # на конец выбранного периода. PartnerInventory не хранит историческую
+        # хронологию — мы не можем восстановить, сколько было на складе
+        # в конкретную прошедшую дату без отдельных snapshot-записей.
+        #
+        # В ответ добавляется поле inventory.is_current_snapshot=True, чтобы
+        # мобильное приложение могло показать соответствующую подсказку
+        # пользователю ("Остаток актуален на сейчас").
         # =========================================================================
         inventory = PartnerInventory.objects.filter(
             partner_id=partner_id,
             quantity__gt=F('reserved_quantity')
-        ).select_related('product')
+        ).select_related('product').order_by('product__name', 'is_bonus')
 
         inventory_total = Decimal('0')
         inventory_piece_count = 0
@@ -844,7 +864,8 @@ class PartnerStatisticsService:
                 'quantity': float(available),
                 'unit': unit,
                 'price': str(product.final_price),
-                'total': str(item_total)
+                'total': str(item_total),
+                'is_bonus': item.is_bonus,
             })
         
         # =========================================================================
@@ -984,11 +1005,12 @@ class PartnerStatisticsService:
         
         # =========================================================================
         # 9. ОБЩАЯ СУММА
-        # Формула: реально полученные деньги (предоплаты) - расходы - бонусы
-        # sold_total НЕ используется: он включает непогашенный долг магазина,
-        # которого партнёр никогда не получит в деньгах.
+        # Формула: реально полученные деньги - расходы.
+        # Бонусы НЕ вычитаются: они уже исключены из debt_amount
+        # (StoreOrderItem.total=0 для is_bonus=True), поэтому магазин
+        # за них не платит и они не входят в paid_debt.
         # =========================================================================
-        grand_total = paid_debt - expenses_total - bonus_total
+        grand_total = paid_debt - expenses_total
         
         # =========================================================================
         # ФОРМИРУЕМ ОТВЕТ
@@ -1018,12 +1040,17 @@ class PartnerStatisticsService:
                 'items': sold_list
             },
             
-            # Остаток товара
+            # Остаток товара (ТЕКУЩИЙ снимок, не за период)
             'inventory': {
                 'total_amount': str(inventory_total),
                 'piece_count': inventory_piece_count,
                 'weight_total': str(inventory_weight_total),
-                'items': inventory_list
+                'items': inventory_list,
+                # is_current_snapshot=True — цифры актуальны на сейчас, а не на date_to.
+                # Мобильное приложение должно показывать подсказку:
+                # "Остаток актуален на сегодня, а не за выбранный период".
+                'is_current_snapshot': True,
+                'snapshot_at': timezone.now().isoformat(),
             },
             
             # Расходы
@@ -1056,7 +1083,10 @@ class PartnerStatisticsService:
             # Долги
             'debt': str(unpaid_debt),
             'paid_debt': str(paid_debt),
-            
+
+            # Сумма продаж (без бонусов)
+            'sold_total': str(sold_total),
+
             # Итого
             'grand_total': str(grand_total),
             

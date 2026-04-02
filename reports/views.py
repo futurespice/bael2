@@ -281,21 +281,14 @@ class PartnerStatisticsViewSet(viewsets.ViewSet):
             )
 
         # Получаем статистику через сервис
-        try:
-            stats = PartnerStatisticsService.calculate_statistics(
-                partner_id=request.user.id,
-                period=period,
-                date_from=date_from,
-                date_to=date_to
-            )
+        stats = PartnerStatisticsService.calculate_statistics(
+            partner_id=request.user.id,
+            period=period,
+            date_from=date_from,
+            date_to=date_to
+        )
 
-            return Response(stats)
-
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response(stats)
 
 
 # =============================================================================
@@ -580,27 +573,20 @@ class PartnerProfileViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            # Получаем store_id для фильтрации
-            store_id = request.query_params.get('store_id')
-            if store_id:
-                store_id = int(store_id)
-            
-            profile = PartnerProfileService.get_profile_data(
-                partner_id=request.user.id,
-                period=period,
-                store_id=store_id,
-                date_from=date_from,
-                date_to=date_to
-            )
+        # Получаем store_id для фильтрации
+        store_id = request.query_params.get('store_id')
+        if store_id:
+            store_id = int(store_id)
 
-            return Response(profile)
+        profile = PartnerProfileService.get_profile_data(
+            partner_id=request.user.id,
+            period=period,
+            store_id=store_id,
+            date_from=date_from,
+            date_to=date_to
+        )
 
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response(profile)
 
 
 class PartnerTrackerViewSet(viewsets.ReadOnlyModelViewSet):
@@ -936,25 +922,18 @@ class AdminPartnerStatisticsViewSet(viewsets.ViewSet):
             )
 
         # Получаем статистику через тот же сервис
-        try:
-            stats = PartnerStatisticsService.calculate_statistics(
-                partner_id=partner.id,
-                period=period or 'day',
-                date_from=date_from,
-                date_to=date_to
-            )
+        stats = PartnerStatisticsService.calculate_statistics(
+            partner_id=partner.id,
+            period=period or 'day',
+            date_from=date_from,
+            date_to=date_to
+        )
 
-            # Добавляем partner_name
-            stats['partner_name'] = partner.get_full_name()
-            stats['partner_id'] = partner.id
+        # Добавляем partner_name
+        stats['partner_name'] = partner.get_full_name()
+        stats['partner_id'] = partner.id
 
-            return Response(stats)
-
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response(stats)
 
 
 # =============================================================================

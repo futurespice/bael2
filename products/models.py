@@ -298,24 +298,39 @@ class Expense(models.Model):
 
     def calculate_amount(self, quantity: Decimal = None) -> Decimal:
         """
-        Рассчитать сумму расхода.
+        Рассчитать дневную сумму расхода.
+
+        Логика для накладных расходов:
+        - MECHANICAL: администратор вводит daily_amount вручную.
+          Если daily_amount > 0 — используем напрямую.
+          Если daily_amount == 0, но monthly_amount > 0 — делим на 30
+          (расход настроен только через monthly_amount, напр. аренда 35 000/мес).
+        - AUTOMATIC: daily_amount + monthly_amount / 30.
 
         Args:
-            quantity: Количество (для физических расходов)
+            quantity: Количество (только для физических расходов)
 
         Returns:
-            Сумма расхода
+            Дневная сумма расхода (Decimal)
         """
         if self.expense_type == ExpenseType.PHYSICAL and quantity:
             # Физический: quantity × price_per_unit
             return (quantity * (self.price_per_unit or Decimal('0'))).quantize(Decimal('0.01'))
-        else:
-            # Mechanical: пользователь вручную вводит daily_amount на экране учёта.
-            # monthly_amount НЕ учитывается, чтобы избежать двойного подсчёта.
-            if self.expense_state == ExpenseState.MECHANICAL:
+
+        # Накладной расход
+        if self.expense_state == ExpenseState.MECHANICAL:
+            # Приоритет 1: явно заданный daily_amount
+            if self.daily_amount > Decimal('0'):
                 return self.daily_amount
-            # Automatic: daily_amount + monthly_amount/30
-            return self.daily_amount + (self.monthly_amount / 30).quantize(Decimal('0.01'))
+            # Приоритет 2 (fallback): расход задан только через monthly_amount
+            if self.monthly_amount > Decimal('0'):
+                return (self.monthly_amount / Decimal('30')).quantize(Decimal('0.01'))
+            return Decimal('0')
+
+        # AUTOMATIC: daily_amount + monthly_amount/30
+        return (
+            self.daily_amount + (self.monthly_amount / Decimal('30'))
+        ).quantize(Decimal('0.01'))
 
 
 # =============================================================================

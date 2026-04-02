@@ -274,7 +274,10 @@ class OrderWorkflowService:
             StoreOrder
         """
         from stores.services import PartnerInventoryService
-        
+
+        # Lock the order row to prevent double-approve race condition
+        order = StoreOrder.objects.select_for_update().get(pk=order.pk)
+
         if order.status != StoreOrderStatus.PENDING:
             raise ValidationError(
                 f'Невозможно одобрить заказ в статусе "{order.get_status_display()}"'

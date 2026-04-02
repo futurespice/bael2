@@ -34,7 +34,7 @@
     production_exp  = 0 (нет overhead Expense в тесте)
     total_expenses  = 600
     orders_count    = 2
-    products_count  = 10 + 5 + 8 = 23
+    products_count  = 10 + 8 = 18 (без бонусов)
     bonus_count     = 5
     profit          = 2300 - 200 - 600 = 1500
     total_balance   = 2300 - 200 - 600 - 1200 = 300
@@ -300,7 +300,7 @@ class AdminStatisticsTest(ReportsBaseTest):
         for field in [
             'income', 'debt', 'paid_debt', 'defect_amount',
             'partner_expenses', 'production_expenses', 'total_expenses',
-            'bonus_count', 'orders_count', 'products_count',
+            'bonus_count', 'orders_count', 'products_count', 'sold_total',
             'total_balance', 'profit',
         ]:
             self.assertIn(field, stats, msg=f'Поле {field!r} отсутствует в statistics')
@@ -327,10 +327,10 @@ class AdminStatisticsTest(ReportsBaseTest):
         self.assertEqual(response.data['statistics']['orders_count'], 2)
 
     def test_products_count(self):
-        """products_count = qty всех позиций = 10 + 5 + 8 = 23"""
+        """products_count = qty проданных позиций (без бонусов) = 10 + 8 = 18"""
         self._auth_admin()
         response = self.client.get(self.URL, {'period': 'all_time'})
-        self.assertEqual(response.data['statistics']['products_count'], 23)
+        self.assertEqual(response.data['statistics']['products_count'], 18)
 
     def test_bonus_count(self):
         """bonus_count = qty бонусных позиций = 5"""
@@ -715,7 +715,7 @@ class PartnerStatisticsAPITest(ReportsBaseTest):
         self._auth_partner()
         response = self.client.get(self.URL, {'period': 'year'})
         data = response.data
-        for key in ['sold', 'inventory', 'expenses', 'defective', 'bonus', 'debt', 'paid_debt']:
+        for key in ['sold', 'inventory', 'expenses', 'defective', 'bonus', 'debt', 'paid_debt', 'sold_total']:
             self.assertIn(key, data, msg=f'Ключ {key!r} отсутствует в ответе')
 
     # --- Продажи (sold) ---
@@ -1121,7 +1121,7 @@ class AdminPartnerStatisticsViewTest(ReportsBaseTest):
         self._auth_admin()
         response = self.client.get(self._url(), {'date': timezone.localdate().isoformat()})
         data = response.data
-        for key in ['sold', 'inventory', 'expenses', 'defective', 'bonus', 'debt', 'paid_debt', 'grand_total']:
+        for key in ['sold', 'inventory', 'expenses', 'defective', 'bonus', 'debt', 'paid_debt', 'grand_total', 'sold_total']:
             self.assertIn(key, data, msg=f'Ключ {key!r} отсутствует')
 
     # --- Данные совпадают с данными партнёра ---

@@ -621,15 +621,6 @@ class StoreViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
-        except Exception as e:
-            # Обработка непредвиденных ошибок
-            return Response(
-                {
-                    'success': False,
-                    'error': f'Произошла ошибка при заморозке магазина: {str(e)}'
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
 
     @extend_schema(
         summary="Разморозить магазин",
@@ -686,15 +677,6 @@ class StoreViewSet(viewsets.ModelViewSet):
                     'error': str(e)
                 },
                 status=status.HTTP_400_BAD_REQUEST
-            )
-        except Exception as e:
-            # Обработка непредвиденных ошибок
-            return Response(
-                {
-                    'success': False,
-                    'error': f'Произошла ошибка при разморозке магазина: {str(e)}'
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
     @extend_schema(
@@ -1680,11 +1662,6 @@ class StoreViewSet(viewsets.ModelViewSet):
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
-            )
-        except Exception as e:
-            return Response(
-                {'error': f'Ошибка при передаче товаров: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
     @action(detail=True, methods=['get'], url_path='inventory')
