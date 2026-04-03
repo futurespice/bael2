@@ -763,14 +763,29 @@ class PartnerStoresViewSet(viewsets.ReadOnlyModelViewSet):
             ).values('store_id').annotate(count=Count('id')).values_list('store_id', 'count')
         )
 
-        # Bulk-fetch: 1 запрос вместо N (DebtPayment → order → store)
-        last_payments = dict(
+        # Bulk-fetch: 1 запрос вместо N (DebtPayment → store)
+        # Два типа записей: с привязкой к заказу (старые) и напрямую к магазину (новые)
+        from django.db.models import Q
+        last_payments_via_order = dict(
             DebtPayment.objects.filter(
                 order__store_id__in=store_ids
             ).values('order__store_id').annotate(
                 last_paid=Max('created_at')
             ).values_list('order__store_id', 'last_paid')
         )
+        last_payments_direct = dict(
+            DebtPayment.objects.filter(
+                store_id__in=store_ids, order__isnull=True
+            ).values('store_id').annotate(
+                last_paid=Max('created_at')
+            ).values_list('store_id', 'last_paid')
+        )
+        # Объединяем: берём максимальную дату из двух источников
+        last_payments = {}
+        for sid in store_ids:
+            dates = [d for d in [last_payments_via_order.get(sid), last_payments_direct.get(sid)] if d]
+            if dates:
+                last_payments[sid] = max(dates)
 
         # Пагинация
         page = self.paginate_queryset(queryset)

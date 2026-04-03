@@ -389,9 +389,9 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         # Prefetch только нужных связей в зависимости от action
         if self.action == 'list':
-            queryset = queryset.prefetch_related('images')
+            queryset = queryset.prefetch_related('images', 'additional_prices')
         else:
-            queryset = queryset.prefetch_related('images', 'recipe_items__expense')
+            queryset = queryset.prefetch_related('images', 'recipe_items__expense', 'additional_prices')
 
         # Для не-админов показываем только активные
         if self.request.user.role != 'admin':

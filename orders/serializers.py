@@ -783,6 +783,7 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'order',
+            'store',
             'amount',
             'paid_by',
             'paid_by_name',
@@ -1129,6 +1130,13 @@ class ManualOrderItemSerializer(serializers.Serializer):
     is_bonus = serializers.BooleanField(
         default=False,
         help_text="Бонусный товар"
+    )
+
+    additional_price_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+        help_text="ID доп цены (опционально, приоритет над price и final_price)"
     )
 
 

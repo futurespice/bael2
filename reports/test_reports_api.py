@@ -197,6 +197,7 @@ class ReportsBaseTest(TestCase):
         )
         DebtPayment.objects.create(
             order=self.order1,
+            store=self.order1.store,
             amount=Decimal('500.00'),
             comment='Частичная оплата',
             paid_by=self.store_owner,
@@ -793,13 +794,13 @@ class PartnerStatisticsAPITest(ReportsBaseTest):
     # --- Итого (grand_total) ---
 
     def test_grand_total(self):
-        """grand_total = paid_debt(900) - expenses(600) - bonus(500) = -200
+        """grand_total = paid_debt(900) - expenses(600) = 300
         paid_debt = prepayment(300+100) + DebtPayment(500) = 900
-        Включает только реально полученные деньги, НЕ непогашенный долг магазина.
+        Бонусы НЕ вычитаются из grand_total.
         """
         self._auth_partner()
         response = self.client.get(self.URL, {'period': 'year'})
-        self.assertAlmostEqual(float(response.data['grand_total']), -200.0, places=1)
+        self.assertAlmostEqual(float(response.data['grand_total']), 300.0, places=1)
 
     # --- Расходы (expenses) ---
 
@@ -1151,10 +1152,12 @@ class AdminPartnerStatisticsViewTest(ReportsBaseTest):
         self.assertAlmostEqual(float(response.data['expenses']['total_amount']), 600.0, places=1)
 
     def test_grand_total(self):
-        """grand_total = paid_debt(900) - expenses(600) - bonus(500) = -200"""
+        """grand_total = paid_debt(900) - expenses(600) = 300
+        Бонусы НЕ вычитаются из grand_total.
+        """
         self._auth_admin()
         response = self.client.get(self._url(), {'period': 'year'})
-        self.assertAlmostEqual(float(response.data['grand_total']), -200.0, places=1)
+        self.assertAlmostEqual(float(response.data['grand_total']), 300.0, places=1)
 
     # --- Фильтры ---
 

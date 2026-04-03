@@ -1948,7 +1948,8 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         Body: {
             "amount": 50000000,
-            "comment": "Частичное погашение долга"
+            "comment": "Частичное погашение долга",
+            "partner_id": 5  // опционально, только для админа
         }
 
         ВАЖНО:
@@ -1957,7 +1958,7 @@ class StoreViewSet(viewsets.ModelViewSet):
         - Может погашать:
           * Магазин (себе)
           * Партнёр (за магазин)
-          * Админ (корректировка)
+          * Админ (корректировка, может указать partner_id)
 
         Результат:
         - Долг магазина уменьшается
@@ -2013,56 +2014,37 @@ class StoreViewSet(viewsets.ModelViewSet):
             )
 
         # =========================================================================
-        # ПОИСК ЗАКАЗА ДЛЯ СВЯЗИ
+        # ОПРЕДЕЛЕНИЕ ПОЛУЧАТЕЛЯ
         # =========================================================================
 
-        # Находим последний подтверждённый заказ для технической связи.
-        # Фильтруем по партнёру: платёж атрибутируется его заказам в статистике.
-        order_qs = StoreOrder.objects.filter(store=store, status=StoreOrderStatus.ACCEPTED)
-        if request.user.role == 'partner':
-            order_qs = order_qs.filter(partner=request.user)
-        last_order = order_qs.order_by('-confirmed_at').first()
-
-        if not last_order:
-            return Response(
-                {
-                    'error': 'У магазина нет подтверждённых заказов. '
-                             'Погашение долга возможно только после подтверждения заказов.'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # =========================================================================
-        # ОПРЕДЕЛЕНИЕ УЧАСТНИКОВ ПЛАТЕЖА
-        # =========================================================================
-
-        # Кто платит
         paid_by = request.user
+        received_by = None
 
-        # Кто получает
         if request.user.role == 'partner':
-            # Партнёр платит за магазин - сам себе и получает
+            # Партнёр погашает долг магазина ��� получатель он сам
             received_by = request.user
         elif request.user.role == 'admin':
-            # Админ корректирует - получает партнёр заказа
-            received_by = last_order.partner if last_order.partner else None
-        elif request.user.role == 'store':
-            # Магазин платит - получает партнёр заказа
-            received_by = last_order.partner if last_order.partner else None
-        else:
-            received_by = None
+            # Админ может указат�� партнёра-получателя
+            target_partner_id = request.data.get('partner_id')
+            if target_partner_id:
+                from users.models import User
+                try:
+                    received_by = User.objects.get(pk=target_partner_id, role='partner')
+                except User.DoesNotExist:
+                    return Response(
+                        {'error': f'Партнёр с ID {target_partner_id} не найден'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
 
         # =========================================================================
         # ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
         # =========================================================================
 
-        # ✅ ИСПРАВЛЕНО: Используем update() чтобы избежать ValidationError с F()
         Store.objects.filter(pk=store.pk).update(
             debt=F('debt') - amount,
             total_paid=F('total_paid') + amount
         )
 
-        # Перезагружаем магазин чтобы получить актуальные значения
         store.refresh_from_db()
 
         # =========================================================================
@@ -2070,7 +2052,7 @@ class StoreViewSet(viewsets.ModelViewSet):
         # =========================================================================
 
         payment = DebtPayment.objects.create(
-            order=last_order,  # Связываем с последним заказом (технически)
+            store=store,
             amount=amount,
             paid_by=paid_by,
             received_by=received_by,
@@ -2106,6 +2088,256 @@ class StoreViewSet(viewsets.ModelViewSet):
     # from rest_framework.permissions import IsAuthenticated
     # from orders.models import DebtPayment, StoreOrder, StoreOrderStatus
     # from stores.models import Store
+
+
+# =============================================================================
+# ДОЛГИ ПАРТНЁРА
+# =============================================================================
+
+class PartnerDebtViewSet(viewsets.ViewSet):
+    """
+    Просмотр долгов магазинов перед партнёром.
+
+    **Permissions:** IsAuthenticated (партнёр видит свои, админ — все)
+
+    **Endpoints:**
+    - GET /api/stores/partner-debts/ — список магазинов-должников
+    - GET /api/stores/partner-debts/{store_id}/ — детали долга магазина
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Список магазинов-должников партнёра",
+        description=(
+            "Возвращает список магазинов, у ��оторых есть долг перед партнёром.\n"
+            "Партнёр видит только свои долги. Админ может фильтровать по partner_id."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='partner_id', type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='ID партнёра (только для админа)', required=False,
+            ),
+        ],
+    )
+    def list(self, request: Request) -> Response:
+        """GET /api/stores/partner-debts/"""
+        from django.db.models import Sum, Value
+        from django.db.models.functions import Coalesce
+        from orders.models import DebtPayment
+
+        user = request.user
+
+        # Определяем партнёра
+        if user.role == 'admin':
+            partner_id = request.query_params.get('partner_id')
+            if partner_id:
+                partner_filter = {'partner_id': int(partner_id)}
+            else:
+                # Админ без фильтра — все партнёры
+                partner_filter = {'partner__isnull': False}
+        elif user.role == 'partner':
+            partner_filter = {'partner': user}
+        else:
+            return Response(
+                {'error': 'Доступно только для партнёров и админов'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Агрегируем данные по магазинам
+        store_debts = (
+            StoreOrder.objects.filter(
+                status=StoreOrderStatus.ACCEPTED,
+                **partner_filter,
+            )
+            .values('store_id', 'store__name', 'store__address', 'store__phone')
+            .annotate(
+                total_orders_amount=Coalesce(Sum('total_amount'), Value(Decimal('0'))),
+                total_prepayment=Coalesce(Sum('prepayment_amount'), Value(Decimal('0'))),
+            )
+            .order_by('store__name')
+        )
+
+        results = []
+        for item in store_debts:
+            store_id = item['store_id']
+
+            # Погашения через DebtPayment для этого партнёра и магазина
+            # Два типа: через заказ (старые) и напрямую к магазину (новые)
+            from django.db.models import Q
+            store_q = Q(order__store_id=store_id, order__status=StoreOrderStatus.ACCEPTED)
+            direct_q = Q(order__isnull=True, store_id=store_id)
+
+            if user.role == 'partner':
+                debt_payments_qs = DebtPayment.objects.filter(
+                    (store_q & Q(order__partner=user)) |
+                    (direct_q & Q(received_by=user))
+                )
+            elif 'partner_id' in partner_filter:
+                pid = partner_filter['partner_id']
+                debt_payments_qs = DebtPayment.objects.filter(
+                    (store_q & Q(order__partner_id=pid)) |
+                    (direct_q & Q(received_by_id=pid))
+                )
+            else:
+                debt_payments_qs = DebtPayment.objects.filter(store_q | direct_q)
+
+            total_paid_debt = debt_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), Value(Decimal('0')))
+            )['total']
+
+            total_orders = item['total_orders_amount']
+            total_prepayment = item['total_prepayment']
+            outstanding = total_orders - total_prepayment - total_paid_debt
+            if outstanding < Decimal('0'):
+                outstanding = Decimal('0')
+
+            results.append({
+                'store_id': store_id,
+                'store_name': item['store__name'],
+                'store_address': item['store__address'],
+                'store_phone': item['store__phone'],
+                'total_orders_amount': float(total_orders),
+                'total_prepayment': float(total_prepayment),
+                'total_paid_debt': float(total_paid_debt),
+                'outstanding_debt': float(outstanding),
+            })
+
+        # Фильтруем магазины с 0 долгом (если нет query param show_all)
+        show_all = request.query_params.get('show_all', 'false').lower() == 'true'
+        if not show_all:
+            results = [r for r in results if r['outstanding_debt'] > 0]
+
+        return Response(results)
+
+    @extend_schema(
+        summary="Детали долга магазина перед партнёром",
+        description=(
+            "Возвращает: сумму заказов, предоплату, погашения и остаток долга "
+            "для конкретного магазина перед партнёром."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='partner_id', type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='ID партнёра (только для админа)', required=False,
+            ),
+        ],
+    )
+    def retrieve(self, request: Request, pk=None) -> Response:
+        """GET /api/stores/partner-debts/{store_id}/"""
+        from django.db.models import Sum, Value
+        from django.db.models.functions import Coalesce
+        from orders.models import DebtPayment
+        from orders.serializers import DebtPaymentSerializer
+
+        user = request.user
+        store_id = pk
+
+        # Проверяем магазин
+        try:
+            store = Store.objects.get(pk=store_id)
+        except Store.DoesNotExist:
+            return Response(
+                {'error': f'Магазин с ID {store_id} не найден'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Определяем партнёра
+        if user.role == 'admin':
+            partner_id = request.query_params.get('partner_id')
+            if partner_id:
+                partner_filter = {'partner_id': int(partner_id)}
+            else:
+                partner_filter = {'partner__isnull': False}
+        elif user.role == 'partner':
+            partner_filter = {'partner': user}
+        else:
+            return Response(
+                {'error': 'Доступно только для партнёров и админов'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Заказы
+        orders_qs = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.ACCEPTED,
+            **partner_filter,
+        ).order_by('-confirmed_at')
+
+        totals = orders_qs.aggregate(
+            total_orders_amount=Coalesce(Sum('total_amount'), Value(Decimal('0'))),
+            total_prepayment=Coalesce(Sum('prepayment_amount'), Value(Decimal('0'))),
+        )
+
+        # Погашения (два типа: через заказ и напрямую)
+        from django.db.models import Q
+        store_q = Q(order__store=store, order__status=StoreOrderStatus.ACCEPTED)
+        direct_q = Q(order__isnull=True, store=store)
+
+        if user.role == 'partner':
+            debt_payments_qs = DebtPayment.objects.filter(
+                (store_q & Q(order__partner=user)) |
+                (direct_q & Q(received_by=user))
+            )
+        elif 'partner_id' in partner_filter:
+            pid = partner_filter['partner_id']
+            debt_payments_qs = DebtPayment.objects.filter(
+                (store_q & Q(order__partner_id=pid)) |
+                (direct_q & Q(received_by_id=pid))
+            )
+        else:
+            debt_payments_qs = DebtPayment.objects.filter(store_q | direct_q)
+
+        total_paid_debt = debt_payments_qs.aggregate(
+            total=Coalesce(Sum('amount'), Value(Decimal('0')))
+        )['total']
+
+        outstanding = (
+            totals['total_orders_amount']
+            - totals['total_prepayment']
+            - total_paid_debt
+        )
+        if outstanding < Decimal('0'):
+            outstanding = Decimal('0')
+
+        # Последние погашения
+        recent_payments = debt_payments_qs.select_related(
+            'paid_by', 'received_by'
+        ).order_by('-created_at')[:20]
+
+        payments_data = DebtPaymentSerializer(recent_payments, many=True).data
+
+        # Краткая информация о заказах
+        orders_summary = []
+        for order in orders_qs[:50]:
+            orders_summary.append({
+                'id': order.id,
+                'order_type': order.order_type,
+                'total_amount': float(order.total_amount),
+                'prepayment_amount': float(order.prepayment_amount),
+                'debt_amount': float(order.debt_amount),
+                'paid_amount': float(order.paid_amount),
+                'outstanding_debt': float(order.outstanding_debt),
+                'confirmed_at': order.confirmed_at,
+                'created_at': order.created_at,
+            })
+
+        return Response({
+            'store': {
+                'id': store.id,
+                'name': store.name,
+                'address': store.address,
+                'phone': store.phone,
+            },
+            'total_orders_amount': float(totals['total_orders_amount']),
+            'total_prepayment': float(totals['total_prepayment']),
+            'total_paid_debt': float(total_paid_debt),
+            'outstanding_debt': float(outstanding),
+            'recent_payments': payments_data,
+            'orders': orders_summary,
+        })
 
 
 # =============================================================================
@@ -2371,7 +2603,7 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
 
         return PartnerInventory.objects.filter(
             partner=self.request.user
-        ).select_related('product').prefetch_related('product__images').order_by('product__name')
+        ).select_related('product').prefetch_related('product__images', 'product__additional_prices').order_by('product__name')
 
     def get_serializer_class(self):
         """Выбрать сериализатор в зависимости от действия."""
@@ -2388,7 +2620,7 @@ class PartnerInventoryViewSet(viewsets.ModelViewSet):
         inventory_qs = PartnerInventory.objects.filter(
             partner=partner,
             quantity__gt=F('reserved_quantity')
-        ).select_related('product').prefetch_related('product__images')
+        ).select_related('product').prefetch_related('product__images', 'product__additional_prices')
 
         if not inventory_qs.exists():
             return Response({

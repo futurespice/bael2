@@ -52,6 +52,7 @@ from .models import (
     ProductImage,
     ProductExpenseRelation,
     PartnerExpense,
+    AdditionalPrice,
 )
 
 
@@ -435,11 +436,29 @@ class ProductImageSerializer(serializers.ModelSerializer):
         return validate_image_size(value)
 
 
+class AdditionalPriceSerializer(serializers.ModelSerializer):
+    """Сериализатор доп цены товара."""
+
+    class Meta:
+        model = AdditionalPrice
+        fields = ['id', 'name', 'price', 'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class AdditionalPriceNestedSerializer(serializers.Serializer):
+    """Сериализатор для вложенного создания/обновления доп цен."""
+    id = serializers.IntegerField(required=False)
+    name = serializers.CharField(max_length=200)
+    price = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
+    is_active = serializers.BooleanField(default=True)
+
+
 class ProductListSerializer(serializers.ModelSerializer):
     """Список товаров (для партнёров и магазинов)."""
 
     images = serializers.SerializerMethodField()
     unit_display = serializers.CharField(source='get_unit_display', read_only=True)
+    additional_prices = AdditionalPriceSerializer(many=True, read_only=True)
 
     class Meta:
         model = Product
@@ -456,7 +475,8 @@ class ProductListSerializer(serializers.ModelSerializer):
             'stock_quantity',
             'is_active',
             'is_available',
-            'images'
+            'images',
+            'additional_prices',
         ]
 
     @extend_schema_field(serializers.ListSerializer(child=serializers.DictField()))
@@ -491,6 +511,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     )
     recipe_items = ProductRecipeNestedSerializer(many=True, required=False, write_only=True)
     recipe_items_read = ProductRecipeSerializer(source='recipe_items', many=True, read_only=True)
+    additional_prices = AdditionalPriceNestedSerializer(many=True, required=False)
+    additional_prices_read = AdditionalPriceSerializer(
+        source='additional_prices', many=True, read_only=True
+    )
     unit_display = serializers.CharField(source='get_unit_display', read_only=True)
     profit = serializers.DecimalField(
         source='profit_per_unit',
@@ -523,6 +547,8 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'images_read',
             'recipe_items',
             'recipe_items_read',
+            'additional_prices',
+            'additional_prices_read',
             'created_at',
             'updated_at'
         ]
@@ -552,12 +578,14 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         return images
 
     def to_representation(self, instance):
-        """Переименовываем images_read → images, recipe_items_read → recipe_items в ответе."""
+        """Переименовываем *_read → * в ответе."""
         rep = super().to_representation(instance)
         if 'images_read' in rep:
             rep['images'] = rep.pop('images_read')
         if 'recipe_items_read' in rep:
             rep['recipe_items'] = rep.pop('recipe_items_read')
+        if 'additional_prices_read' in rep:
+            rep['additional_prices'] = rep.pop('additional_prices_read')
         return rep
 
     def validate_name(self, value):
@@ -612,7 +640,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         return value
 
     def to_internal_value(self, data):
-        """Обработка indexed fields для recipe_items."""
+        """Обработка indexed fields для recipe_items и additional_prices."""
         if hasattr(data, 'getlist'):
             new_data = data.dict()
             if 'images' in data:
@@ -637,6 +665,8 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         # 1. Обработка "[]" (строка вместо пустого списка)
         if new_data.get('recipe_items') == '[]':
             new_data['recipe_items'] = []
+        if new_data.get('additional_prices') == '[]':
+            new_data['additional_prices'] = []
 
         # 2. Обработка indexed fields: recipe_items[0][expense]
         if 'recipe_items' not in new_data:
@@ -644,13 +674,20 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             if recipe_items:
                 new_data['recipe_items'] = recipe_items
 
+        # 3. Обработка indexed fields: additional_prices[0][name]
+        if 'additional_prices' not in new_data:
+            additional_prices = parse_indexed_fields(data, 'additional_prices')
+            if additional_prices:
+                new_data['additional_prices'] = additional_prices
+
         return super().to_internal_value(new_data)
 
     def update(self, instance, validated_data):
-        """Обновление товара с изображениями, рецептами и авто-подтягиванием универсальных."""
+        """Обновление товара с изображениями, рецептами, доп ценами и авто-подтягиванием универсальных."""
         from .models import ApplyType, ExpenseType as ET
         images_data = validated_data.pop('images', None)
         recipe_items_data = validated_data.pop('recipe_items', None)
+        additional_prices_data = validated_data.pop('additional_prices', None)
 
         # Обновляем поля товара
         instance = super().update(instance, validated_data)
@@ -705,9 +742,36 @@ class ProductDetailSerializer(serializers.ModelSerializer):
                     quantity_per_unit=expense.default_quantity_per_unit
                 )
 
+        # 3. ДОП ЦЕНЫ (SMART UPSERT)
+        if additional_prices_data is not None:
+            incoming_ids = set()
+            for ap_data in additional_prices_data:
+                ap_id = ap_data.get('id')
+                if ap_id:
+                    # Обновляем существующую
+                    AdditionalPrice.objects.filter(
+                        pk=ap_id, product=instance
+                    ).update(
+                        name=ap_data['name'],
+                        price=ap_data['price'],
+                        is_active=ap_data.get('is_active', True),
+                    )
+                    incoming_ids.add(ap_id)
+                else:
+                    # Создаём новую
+                    new_ap = AdditionalPrice.objects.create(
+                        product=instance,
+                        name=ap_data['name'],
+                        price=ap_data['price'],
+                        is_active=ap_data.get('is_active', True),
+                    )
+                    incoming_ids.add(new_ap.pk)
+            # Удаляем доп цены, которые не пришли в запросе
+            instance.additional_prices.exclude(pk__in=incoming_ids).delete()
+
         # Refresh для корректного ответа
         instance = Product.objects.prefetch_related(
-            'images', 'recipe_items__expense'
+            'images', 'recipe_items__expense', 'additional_prices'
         ).get(pk=instance.pk)
 
         return instance
@@ -723,11 +787,15 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         write_only=True
     )
     recipe_items = ProductRecipeNestedSerializer(many=True, required=False)
+    additional_prices = AdditionalPriceNestedSerializer(many=True, required=False)
 
     # Read-only поля для ответа
     images_read = serializers.SerializerMethodField(read_only=True)
     recipe_items_read = ProductRecipeSerializer(
         source='recipe_items', many=True, read_only=True
+    )
+    additional_prices_read = AdditionalPriceSerializer(
+        source='additional_prices', many=True, read_only=True
     )
     unit_display = serializers.CharField(
         source='get_unit_display', read_only=True
@@ -759,6 +827,8 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             'images_read',
             'recipe_items',
             'recipe_items_read',
+            'additional_prices',
+            'additional_prices_read',
             'created_at',
         ]
         read_only_fields = [
@@ -786,12 +856,14 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return images
 
     def to_representation(self, instance):
-        """Переименовываем images_read → images, recipe_items_read → recipe_items в ответе."""
+        """Переименовываем *_read → * в ответе."""
         rep = super().to_representation(instance)
         if 'images_read' in rep:
             rep['images'] = rep.pop('images_read')
         if 'recipe_items_read' in rep:
             rep['recipe_items'] = rep.pop('recipe_items_read')
+        if 'additional_prices_read' in rep:
+            rep['additional_prices'] = rep.pop('additional_prices_read')
         return rep
 
     def validate_name(self, value):
@@ -809,7 +881,7 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return value
 
     def to_internal_value(self, data):
-        """Обработка indexed fields для recipe_items."""
+        """Обработка indexed fields для recipe_items и additional_prices."""
         if hasattr(data, 'getlist'):
             new_data = data.dict()
             if 'images' in data:
@@ -820,12 +892,20 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         # 1. Обработка "[]"
         if new_data.get('recipe_items') == '[]':
             new_data['recipe_items'] = []
+        if new_data.get('additional_prices') == '[]':
+            new_data['additional_prices'] = []
 
         # 2. Обработка indexed fields
         if 'recipe_items' not in new_data:
             recipe_items = parse_indexed_fields(data, 'recipe_items')
             if recipe_items:
                 new_data['recipe_items'] = recipe_items
+
+        # 3. Обработка indexed fields для additional_prices
+        if 'additional_prices' not in new_data:
+            additional_prices = parse_indexed_fields(data, 'additional_prices')
+            if additional_prices:
+                new_data['additional_prices'] = additional_prices
 
         return super().to_internal_value(new_data)
 
@@ -844,10 +924,11 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        """Создание товара с изображениями, рецептами и авто-подтягиванием универсальных."""
+        """Создание товара с изображениями, рецептами, доп ценами и авто-подтягиванием универсальных."""
         from .models import ApplyType, ExpenseType as ET
         images_data = validated_data.pop('images', [])
         recipe_items_data = validated_data.pop('recipe_items', [])
+        additional_prices_data = validated_data.pop('additional_prices', [])
 
         product = Product.objects.create(**validated_data)
 
@@ -888,9 +969,18 @@ class ProductCreateSerializer(serializers.ModelSerializer):
                 quantity_per_unit=expense.default_quantity_per_unit
             )
 
+        # Создаём доп цены
+        for ap_data in additional_prices_data:
+            AdditionalPrice.objects.create(
+                product=product,
+                name=ap_data['name'],
+                price=ap_data['price'],
+                is_active=ap_data.get('is_active', True),
+            )
+
         # Prefetch для корректного ответа
         product = Product.objects.prefetch_related(
-            'images', 'recipe_items__expense'
+            'images', 'recipe_items__expense', 'additional_prices'
         ).get(pk=product.pk)
 
         return product

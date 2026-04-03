@@ -268,24 +268,41 @@ class ReportService:
         # =========================================================================
 
         # Погашения через DebtPayment (pay-debt)
-        # Фильтруем по дате подтверждения заказа (не по дате платежа),
-        # чтобы debt и paid_debt относились к одному и тому же набору заказов.
+        # Два типа записей:
+        #   1) С привязкой к заказу (order != NULL) — старые записи
+        #   2) Без привязки к заказу (order = NULL, store != NULL) — новые через pay-debt
+        from django.db.models import Q
         paid_debt_qs = DebtPayment.objects.filter(
-            order__confirmed_at__date__gte=start_date,
-            order__confirmed_at__date__lte=end_date
+            Q(order__confirmed_at__date__gte=start_date,
+              order__confirmed_at__date__lte=end_date) |
+            Q(order__isnull=True,
+              created_at__date__gte=start_date,
+              created_at__date__lte=end_date)
         )
 
         if filters.store_id:
-            paid_debt_qs = paid_debt_qs.filter(order__store_id=filters.store_id)
+            paid_debt_qs = paid_debt_qs.filter(
+                Q(order__store_id=filters.store_id) |
+                Q(order__isnull=True, store_id=filters.store_id)
+            )
 
         if filters.partner_id:
-            paid_debt_qs = paid_debt_qs.filter(order__partner_id=filters.partner_id)
+            paid_debt_qs = paid_debt_qs.filter(
+                Q(order__partner_id=filters.partner_id) |
+                Q(order__isnull=True, received_by_id=filters.partner_id)
+            )
 
         if filters.region_id:
-            paid_debt_qs = paid_debt_qs.filter(order__store__region_id=filters.region_id)
+            paid_debt_qs = paid_debt_qs.filter(
+                Q(order__store__region_id=filters.region_id) |
+                Q(order__isnull=True, store__region_id=filters.region_id)
+            )
 
         if filters.city_id:
-            paid_debt_qs = paid_debt_qs.filter(order__store__city_id=filters.city_id)
+            paid_debt_qs = paid_debt_qs.filter(
+                Q(order__store__city_id=filters.city_id) |
+                Q(order__isnull=True, store__city_id=filters.city_id)
+            )
 
         paid_debt_data = paid_debt_qs.aggregate(total=Sum('amount'))
         debt_payments_total = paid_debt_data['total'] or Decimal('0')
@@ -985,11 +1002,14 @@ class PartnerStatisticsService:
         prepayment_in_period = orders_agg['total_prepayment'] or Decimal('0')
 
         # Погашения долга по заказам партнёра за период.
-        # Фильтруем по дате подтверждения заказа (не по дате платежа),
-        # чтобы debt и paid_debt относились к одному и тому же набору заказов.
+        # Два типа: с привязкой к заказу (старые) и без (новые через pay-debt)
+        from django.db.models import Q
         debt_payments_in_period = DebtPayment.objects.filter(
-            order__partner_id=partner_id,
-            order__confirmed_at__range=[date_from, date_to]
+            Q(order__partner_id=partner_id,
+              order__confirmed_at__range=[date_from, date_to]) |
+            Q(order__isnull=True,
+              received_by_id=partner_id,
+              created_at__range=[date_from, date_to])
         ).aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')

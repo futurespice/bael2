@@ -141,9 +141,14 @@ def generate_daily_report(report_date: str = None):
         # чтобы debt и paid_debt относились к одному набору заказов
         # (консистентно с ReportService.calculate_statistics).
         prepayment = sum(o.prepayment_amount for o in store_orders)
+        # Платежи с привязкой к заказу + платежи напрямую к магазину за этот день
+        from django.db.models import Q
         day_payments = (
             DebtPayment.objects
-            .filter(order_id__in=order_ids)
+            .filter(
+                Q(order_id__in=order_ids) |
+                Q(order__isnull=True, store_id=store.pk, created_at__date=target_date)
+            )
             .aggregate(total=Sum('amount'))['total'] or Decimal('0')
         )
         paid_debt = prepayment + day_payments
@@ -220,15 +225,20 @@ def generate_daily_report(report_date: str = None):
     original_total_debt = all_day_agg['total_debt'] or Decimal('0')
     total_prepayment = all_day_agg['total_prepayment'] or Decimal('0')
 
-    # Погашения по заказам, подтверждённым в этот день (все DebtPayment).
-    # Фильтруем по order__confirmed_at (не по created_at платежа),
-    # чтобы debt и paid_debt были консистентны (как в ReportService).
+    # Погашения: по заказам + напрямую к магазинам за этот день
     all_order_ids = [o.pk for o in all_day_orders]
-    global_day_payments = (
+    from django.db.models import Q
+    order_payments = (
         DebtPayment.objects
         .filter(order_id__in=all_order_ids)
         .aggregate(total=Sum('amount'))['total'] or Decimal('0')
     ) if all_order_ids else Decimal('0')
+    direct_payments = (
+        DebtPayment.objects
+        .filter(order__isnull=True, created_at__date=target_date)
+        .aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    )
+    global_day_payments = order_payments + direct_payments
 
     total_paid_debt = total_prepayment + global_day_payments
     total_bonus_count = int(all_day_bonus['total_qty'] or 0)

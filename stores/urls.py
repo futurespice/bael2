@@ -21,6 +21,7 @@ router.register(r'cities', views.CityViewSet, basename='city')
 router.register(r'stores', views.StoreViewSet, basename='store')
 router.register(r'partner-inventory', views.PartnerInventoryViewSet, basename='partner-inventory')
 router.register(r'store-inventory', views.StoreInventoryViewSet, basename='store-inventory')
+router.register(r'partner-debts', views.PartnerDebtViewSet, basename='partner-debt')
 
 # URL patterns
 urlpatterns = [

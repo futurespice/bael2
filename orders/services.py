@@ -48,6 +48,7 @@ class OrderItemData:
     quantity: Decimal
     price: Optional[Decimal] = None
     is_bonus: bool = False
+    additional_price_id: Optional[int] = None
 
 
 class OrderWorkflowService:
@@ -1689,15 +1690,41 @@ class ManualOrderService:
 
         order_items_to_create = []
 
+        # Предварительно загружаем доп цены если нужны
+        ap_ids = [item_data.additional_price_id for item_data in items if item_data.additional_price_id]
+        if ap_ids:
+            from products.models import AdditionalPrice
+            ap_map = {
+                ap.id: ap for ap in AdditionalPrice.objects.filter(pk__in=ap_ids, is_active=True)
+            }
+        else:
+            ap_map = {}
+
         # Обрабатываем товары
         for item_data in items:
             product = products_map.get(item_data.product_id)
             if product is None:
                 raise ValidationError(f'Товар с ID {item_data.product_id} не найден')
 
+            # Валидация доп цены
+            if item_data.additional_price_id:
+                additional_price = ap_map.get(item_data.additional_price_id)
+                if not additional_price:
+                    raise ValidationError(
+                        f'Доп цена с ID {item_data.additional_price_id} не найдена или не активна'
+                    )
+                if additional_price.product_id != product.id:
+                    raise ValidationError(
+                        f'Доп цена "{additional_price.name}" не принадлежит товару "{product.name}"'
+                    )
+                if item_data.is_bonus:
+                    raise ValidationError(
+                        f'Товар с доп ценой не может быть бонусным ({product.name})'
+                    )
+
             quantity = item_data.quantity
             is_bonus_provided = item_data.is_bonus
-            
+
             # 1. Если это явный бонусный товар (выбран партнёром как бонус)
             if is_bonus_provided:
                 # Проверяем наличие в бонусном инвентаре
@@ -1800,7 +1827,11 @@ class ManualOrderService:
                     )
 
                 # Собираем позицию заказа (только платная часть считается в сумму)
-                price = item_data.price or product.final_price
+                # Приоритет: доп цена > ручная цена > final_price
+                if item_data.additional_price_id:
+                    price = ap_map[item_data.additional_price_id].price
+                else:
+                    price = item_data.price or product.final_price
                 item_total = price * paid_quantity
 
                 order_items_to_create.append(StoreOrderItem(

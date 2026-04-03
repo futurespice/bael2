@@ -346,8 +346,19 @@ class DebtPayment(models.Model):
     order = models.ForeignKey(
         'StoreOrder',
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name='debt_payments',
-        verbose_name='Заказ'
+        verbose_name='Заказ',
+        help_text='Может быть null при оплате админом без привязки к заказу'
+    )
+
+    store = models.ForeignKey(
+        'stores.Store',
+        on_delete=models.CASCADE,
+        related_name='debt_payments',
+        verbose_name='Магазин',
+        help_text='Магазин, по которому погашается долг'
     )
 
     amount = models.DecimalField(
@@ -393,10 +404,13 @@ class DebtPayment(models.Model):
         verbose_name_plural = 'Погашения долгов'
         indexes = [
             models.Index(fields=['order', '-created_at']),
+            models.Index(fields=['store', '-created_at']),
         ]
 
     def __str__(self) -> str:
-        return f"Оплата {self.amount} сом по заказу #{self.order.id}"
+        if self.order:
+            return f"Оплата {self.amount} сом по заказу #{self.order.id}"
+        return f"Оплата {self.amount} сом для магазина #{self.store_id}"
 
     def clean(self) -> None:
         """Валидация суммы."""
@@ -622,6 +636,7 @@ class StoreOrder(models.Model):
 
         payment = DebtPayment.objects.create(
             order=self,
+            store=self.store,
             amount=amount,
             paid_by=paid_by,
             received_by=received_by,

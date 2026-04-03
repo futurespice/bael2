@@ -77,6 +77,7 @@ class DebtCalculationTest(TestCase):
         # Create Partial Payment (Today)
         self.payment = DebtPayment.objects.create(
             order=self.order,
+            store=self.order.store,
             amount=Decimal('500.00'),
             paid_by=self.partner
         )

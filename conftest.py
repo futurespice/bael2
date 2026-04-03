@@ -884,6 +884,7 @@ def paid_order(base_data) -> StoreOrder:
     if outstanding > 0:
         DebtPayment.objects.create(
             order=order,
+            store=order.store,
             amount=outstanding,
             comment='Полная оплата ТЕСТ',
             paid_by=base_data['store_user'],

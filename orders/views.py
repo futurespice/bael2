@@ -1172,7 +1172,8 @@ class ManualOrderViewSet(viewsets.ReadOnlyModelViewSet):
                     product_id=item['product'],
                     quantity=Decimal(str(item['quantity'])),
                     price=Decimal(str(item.get('price'))) if item.get('price') else None,
-                    is_bonus=item.get('is_bonus', False)
+                    is_bonus=item.get('is_bonus', False),
+                    additional_price_id=item.get('additional_price_id'),
                 )
                 for item in serializer.validated_data['items']
             ]

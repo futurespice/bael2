@@ -545,6 +545,65 @@ class Product(models.Model):
 
 
 # =============================================================================
+# ДОП ЦЕНЫ ТОВАРОВ
+# =============================================================================
+
+class AdditionalPrice(models.Model):
+    """
+    Дополнительная цена товара.
+
+    Партнёры доставляют товары в регионы, где базовая цена невыгодна.
+    Админ задаёт доп цены при создании/редактировании товара.
+
+    ПРАВИЛА:
+    - Доступна только для ручных заказов (manual orders)
+    - Товар с доп ценой не может быть бонусным в этой позиции
+    - Товар с доп ценой не может быть бракованным
+    - У одного товара может быть несколько доп цен
+    """
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name='additional_prices',
+        verbose_name='Товар'
+    )
+
+    name = models.CharField(
+        max_length=200,
+        verbose_name='Название',
+        help_text='Например: Цена для Ош, Цена для Бишкек'
+    )
+
+    price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))],
+        verbose_name='Цена'
+    )
+
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name='Активна'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'additional_prices'
+        verbose_name = 'Дополнительная цена'
+        verbose_name_plural = 'Дополнительные цены'
+        ordering = ['product', 'price']
+        indexes = [
+            models.Index(fields=['product', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name} — {self.name}: {self.price} сом"
+
+
+# =============================================================================
 # РЕЦЕПТЫ ТОВАРОВ (СВЯЗЬ С РАСХОДАМИ)
 # =============================================================================
 
