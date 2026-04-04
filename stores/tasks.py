@@ -37,15 +37,16 @@ def recalculate_store_debts():
             status=StoreOrderStatus.ACCEPTED
         )
 
-        # Исходный долг из заказов
-        total_debt = orders.aggregate(
-            debt=Sum('debt_amount')
-        )['debt'] or Decimal('0')
-
-        # Предоплата из заказов
-        total_prepayment = orders.aggregate(
-            prepaid=Sum('prepayment_amount')
-        )['prepaid'] or Decimal('0')
+        # Суммы из заказов (total_amount и prepayment_amount)
+        # НЕ используем debt_amount — он может быть 0 у старых заказов.
+        # Вместо этого считаем долг как total_amount - prepayment_amount
+        # (так же, как в PartnerDebtViewSet).
+        order_totals = orders.aggregate(
+            total=Sum('total_amount'),
+            prepaid=Sum('prepayment_amount'),
+        )
+        total_orders_amount = order_totals['total'] or Decimal('0')
+        total_prepayment = order_totals['prepaid'] or Decimal('0')
 
         # Погашения через DebtPayment (pay_store_debt создаёт записи здесь,
         # а НЕ обновляет StoreOrder.paid_amount)
@@ -66,7 +67,7 @@ def recalculate_store_debts():
         )['total'] or Decimal('0')
 
         total_paid = total_prepayment + debt_payments
-        actual_debt = total_debt - debt_payments - defect_amount
+        actual_debt = total_orders_amount - total_prepayment - debt_payments - defect_amount
         if actual_debt < Decimal('0'):
             actual_debt = Decimal('0')
 

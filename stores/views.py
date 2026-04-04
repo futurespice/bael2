@@ -452,6 +452,15 @@ class StoreViewSet(viewsets.ModelViewSet):
             ).values_list('store_id', flat=True).distinct()
             queryset = queryset.exclude(id__in=stores_with_active_orders)
 
+        # Фильтр по долгу (debt__gt=0.0)
+        debt_gt = self.request.query_params.get('debt__gt')
+        if debt_gt is not None:
+            try:
+                queryset = queryset.filter(debt__gt=Decimal(debt_gt))
+            except (ValueError, ArithmeticError):
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({'debt__gt': 'Некорректное числовое значение'})
+
         # Аннотации COUNT — только для retrieve (StoreSerializer их использует)
         # Для list (StoreListSerializer) не нужны — экономим 4 подзапроса
         if self.action == 'retrieve':
@@ -2141,7 +2150,13 @@ class PartnerDebtViewSet(viewsets.ViewSet):
         if user.role == 'admin':
             partner_id = request.query_params.get('partner_id')
             if partner_id:
-                partner_filter = {'partner_id': int(partner_id)}
+                try:
+                    partner_filter = {'partner_id': int(partner_id)}
+                except (ValueError, TypeError):
+                    return Response(
+                        {'error': 'partner_id должен быть числом'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
             else:
                 # Админ без фильтра — все партнёры
                 partner_filter = {'partner__isnull': False}
@@ -2252,20 +2267,26 @@ class PartnerDebtViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Определяем партнёра
-        if user.role == 'admin':
-            partner_id = request.query_params.get('partner_id')
-            if partner_id:
-                partner_filter = {'partner_id': int(partner_id)}
-            else:
-                partner_filter = {'partner__isnull': False}
-        elif user.role == 'partner':
-            partner_filter = {'partner': user}
-        else:
+        # Определяем фильтр партнёра
+        # Партнёр и админ видят долги ВСЕХ партнёров для этого магазина,
+        # но могут фильтровать по partner_id
+        if user.role not in ('admin', 'partner'):
             return Response(
                 {'error': 'Доступно только для партнёров и админов'},
                 status=status.HTTP_403_FORBIDDEN
             )
+
+        partner_id = request.query_params.get('partner_id')
+        if partner_id:
+            try:
+                partner_filter = {'partner_id': int(partner_id)}
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'partner_id должен быть числом'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            partner_filter = {'partner__isnull': False}
 
         # Заказы
         orders_qs = StoreOrder.objects.filter(
@@ -2284,12 +2305,7 @@ class PartnerDebtViewSet(viewsets.ViewSet):
         store_q = Q(order__store=store, order__status=StoreOrderStatus.ACCEPTED)
         direct_q = Q(order__isnull=True, store=store)
 
-        if user.role == 'partner':
-            debt_payments_qs = DebtPayment.objects.filter(
-                (store_q & Q(order__partner=user)) |
-                (direct_q & Q(received_by=user))
-            )
-        elif 'partner_id' in partner_filter:
+        if 'partner_id' in partner_filter:
             pid = partner_filter['partner_id']
             debt_payments_qs = DebtPayment.objects.filter(
                 (store_q & Q(order__partner_id=pid)) |
