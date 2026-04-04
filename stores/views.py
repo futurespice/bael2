@@ -173,6 +173,14 @@ def _build_inventory_items(inventory_qs, use_available_quantity=False):
             item['reserved_quantity'] = str(inv.reserved_quantity)
             item['total_quantity'] = str(inv.quantity)
 
+        # Доп цены (используем prefetch-кэш чтобы избежать N+1)
+        if hasattr(product, '_prefetched_objects_cache') and 'additional_prices' in product._prefetched_objects_cache:
+            item['additional_prices'] = [
+                {'id': ap.id, 'name': ap.name, 'price': str(ap.price), 'is_active': ap.is_active}
+                for ap in product.additional_prices.all()
+                if ap.is_active
+            ]
+
         items.append(item)
 
     totals = {
