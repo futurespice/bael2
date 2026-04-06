@@ -210,10 +210,6 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'notifications.tasks.cleanup_old_notifications',
         'schedule': 86400,
     },
-    'recalculate-store-debts': {
-        'task': 'stores.tasks.recalculate_store_debts',
-        'schedule': 3600,  # Каждый час
-    },
     # ТЗ Бахрам акя: пересчёт себестоимости раз в 1.5 недели (11 дней)
     'recalculate-costs-by-sales': {
         'task': 'products.tasks.recalculate_costs_by_sales',
