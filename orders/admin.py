@@ -110,17 +110,17 @@ class StoreOrderAdmin(admin.ModelAdmin):
 class DebtPaymentAdmin(admin.ModelAdmin):
     """Admin для погашений долга."""
 
-    list_display = ['id', 'order', 'amount', 'paid_by', 'received_by', 'created_at']
+    list_display = ['id', 'store', 'order', 'amount', 'paid_by', 'received_by', 'created_at']
 
-    list_filter = ['created_at']
+    list_filter = ['created_at', 'received_by']
 
-    search_fields = ['order__id', 'order__store__name', 'comment']
+    search_fields = ['store__name', 'store__inn', 'order__id', 'comment']
 
     readonly_fields = ['created_at']
 
     fieldsets = [
         ('Основное', {
-            'fields': ['order', 'amount', 'comment']
+            'fields': ['store', 'order', 'amount', 'comment']
         }),
         ('Участники', {
             'fields': ['paid_by', 'received_by']
