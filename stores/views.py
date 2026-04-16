@@ -2062,6 +2062,28 @@ class StoreViewSet(viewsets.ModelViewSet):
             total_paid=F('total_paid') + amount
         )
 
+        # Распределяем платёж по непогашенным заказам магазина (FIFO).
+        # Why: outstanding_debt каждого заказа считается как debt_amount - paid_amount.
+        # Если не обновлять paid_amount, то после погашения через pay-debt заказы
+        # продолжают показывать полный долг, и ту же сумму собирают повторно.
+        remaining = amount
+        unpaid_orders = (
+            StoreOrder.objects
+            .select_for_update()
+            .filter(store=store, status=StoreOrderStatus.ACCEPTED)
+            .filter(debt_amount__gt=F('paid_amount'))
+            .order_by('confirmed_at', 'id')
+        )
+        for order in unpaid_orders:
+            if remaining <= Decimal('0'):
+                break
+            outstanding = order.debt_amount - order.paid_amount
+            apply = min(outstanding, remaining)
+            StoreOrder.objects.filter(pk=order.pk).update(
+                paid_amount=F('paid_amount') + apply,
+            )
+            remaining -= apply
+
         store.refresh_from_db()
 
         # =========================================================================
