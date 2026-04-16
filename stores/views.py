@@ -2062,7 +2062,6 @@ class StoreViewSet(viewsets.ModelViewSet):
             total_paid=F('total_paid') + amount
         )
 
-        # Распределяем платёж по непогашенным заказам магазина (FIFO).
         # Why: outstanding_debt каждого заказа считается как debt_amount - paid_amount.
         # Если не обновлять paid_amount, то после погашения через pay-debt заказы
         # продолжают показывать полный долг, и ту же сумму собирают повторно.
