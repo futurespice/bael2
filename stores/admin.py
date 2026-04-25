@@ -98,6 +98,32 @@ class CityAdmin(admin.ModelAdmin):
     stores_count_display.short_description = 'Статистика магазинов'
 
 
+class DebtStatusFilter(admin.SimpleListFilter):
+    """Фильтр магазинов по статусу долга."""
+    title = 'Статус долга'
+    parameter_name = 'debt_status'
+
+    def lookups(self, request, model_admin):
+        return [
+            ('with_debt', 'С долгом (>0)'),
+            ('no_debt', 'Без долга (=0)'),
+            ('overpaid', 'Переплата (<0)'),
+            ('big_debt', 'Большой долг (>5000)'),
+        ]
+
+    def queryset(self, request, queryset):
+        from decimal import Decimal
+        if self.value() == 'with_debt':
+            return queryset.filter(debt__gt=Decimal('0'))
+        if self.value() == 'no_debt':
+            return queryset.filter(debt=Decimal('0'))
+        if self.value() == 'overpaid':
+            return queryset.filter(debt__lt=Decimal('0'))
+        if self.value() == 'big_debt':
+            return queryset.filter(debt__gt=Decimal('5000'))
+        return queryset
+
+
 class StoreInventoryInline(admin.TabularInline):
     """Инлайн для инвентаря."""
     model = StoreInventory
@@ -134,6 +160,7 @@ class StoreAdmin(admin.ModelAdmin):
     ]
 
     list_filter = [
+        DebtStatusFilter,
         'approval_status',
         'is_active',
         'city__region',
@@ -220,6 +247,7 @@ class StoreAdmin(admin.ModelAdmin):
         )
 
     total_debt_display.short_description = 'Долг'
+    total_debt_display.admin_order_field = 'debt'
 
     def inventory_summary(self, obj):
         """Сводка по инвентарю."""
