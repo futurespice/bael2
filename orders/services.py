@@ -139,28 +139,18 @@ class OrderWorkflowService:
                 cls._validate_weight_quantity(product, quantity)
 
             # Рассчитываем бонус для штучных бонусных товаров.
-            # Формула: за каждые 50 платных → 4 бонуса (milestone),
-            # плюс внутри каждого отрезка 50 за каждые 20 → 1 бонус.
-            # Примеры: 20→1, 40→2, 50→4, 70→5, 90→6, 100→8
-            # quantity = ИТОГО (платные + бонусные включены)
-            # 75 итого → бонус=5 → платных=70, списывается 75 со склада
+            # Формула применяется к ИТОГО (total): bonus = 4*(total//54) + (total%54)//21.
+            # Логика: каждые 54 шт = +4 бонуса (макро-цикл 50 платных + 4 бесплатных),
+            # внутри — каждые 21 шт = +1 бесплатный.
+            # Примеры (total → paid, bonus):
+            #   21→20,1   42→40,2   54→50,4   75→70,5   96→90,6
+            #   108→100,8 129→120,9 150→140,10 162→150,12 216→200,16
             bonus_quantity = Decimal('0')
             paid_quantity = quantity
             if product.is_bonus and not product.is_weight_based:
                 qty_int = int(quantity)
-                # quantity = ИТОГО (платные + бонусные).
-                # Формула применяется к платному кол-ву, поэтому ищем paid
-                # бинарным поиском: paid + formula(paid) == qty_int.
-                lo, hi = 0, qty_int
-                while lo < hi:
-                    mid = (lo + hi + 1) // 2
-                    b = 4 * (mid // 50) + (mid % 50) // 20
-                    if mid + b <= qty_int:
-                        lo = mid
-                    else:
-                        hi = mid - 1
-                paid_int = lo
-                bonus_count = qty_int - paid_int
+                bonus_count = 4 * (qty_int // 54) + (qty_int % 54) // 21
+                paid_int = qty_int - bonus_count
                 bonus_quantity = Decimal(str(bonus_count))
                 paid_quantity = Decimal(str(paid_int))
 
@@ -1771,23 +1761,14 @@ class ManualOrderService:
                 # quantity = ИТОГО везёт партнёр (платные + бонусные включены)
                 # Бонус рассчитывается ОТ этого количества и уже входит в него:
                 # 54 итого → 4 бонуса → 50 платных (списывается 54 из инвентаря)
+                # Формула на ИТОГО (total): bonus = 4*(total//54) + (total%54)//21
+                # См. подробности в create_preorder.
                 bonus_quantity = Decimal('0')
                 paid_quantity = quantity
                 if product.is_bonus and not product.is_weight_based:
                     qty_int = int(quantity)
-                    # quantity = ИТОГО (платные + бонусные).
-                    # Формула применяется к платному кол-ву, поэтому ищем paid
-                    # бинарным поиском: paid + formula(paid) == qty_int.
-                    lo, hi = 0, qty_int
-                    while lo < hi:
-                        mid = (lo + hi + 1) // 2
-                        b = 4 * (mid // 50) + (mid % 50) // 20
-                        if mid + b <= qty_int:
-                            lo = mid
-                        else:
-                            hi = mid - 1
-                    paid_int = lo
-                    bonus_count = qty_int - paid_int
+                    bonus_count = 4 * (qty_int // 54) + (qty_int % 54) // 21
+                    paid_int = qty_int - bonus_count
                     bonus_quantity = Decimal(str(bonus_count))
                     paid_quantity = Decimal(str(paid_int))
 
