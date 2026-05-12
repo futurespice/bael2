@@ -255,37 +255,35 @@ class ReportService:
             total=Sum('total_amount'),
             total_prepayment=Sum('prepayment_amount'),
             total_debt=Sum('debt_amount'),
+            total_paid=Sum('paid_amount'),
         )
         orders_income = orders_data['total'] or Decimal('0')
         prepayment_total = orders_data['total_prepayment'] or Decimal('0')
         original_debt = orders_data['total_debt'] or Decimal('0')
+        orders_paid_amount = orders_data['total_paid'] or Decimal('0')
 
         # Доход = сумма заказов (стоимость проданных товаров)
         income = orders_income
 
         # =========================================================================
         # 4. ПОГАШЕННЫЕ ДОЛГИ (предоплата + погашения через pay-debt)
+        # ВАЖНО: фильтруем DebtPayments по ДАТЕ ОПЛАТЫ (created_at), а не по
+        # дате подтверждения заказа. Это "сколько денег получено за период".
         # =========================================================================
-
-        # Погашения через DebtPayment (pay-debt)
-        # Два типа записей:
-        #   1) С привязкой к заказу (order != NULL) — старые записи
-        #   2) Без привязки к заказу (order = NULL, store != NULL) — новые через pay-debt
         from django.db.models import Q
         paid_debt_qs = DebtPayment.objects.filter(
-            Q(order__confirmed_at__date__gte=start_date,
-              order__confirmed_at__date__lte=end_date) |
-            Q(order__isnull=True,
-              created_at__date__gte=start_date,
-              created_at__date__lte=end_date)
+            created_at__date__gte=start_date,
+            created_at__date__lte=end_date,
         )
 
+        # Магазин: либо через привязанный заказ, либо через прямую связь со store
         if filters.store_id:
             paid_debt_qs = paid_debt_qs.filter(
                 Q(order__store_id=filters.store_id) |
                 Q(order__isnull=True, store_id=filters.store_id)
             )
 
+        # Партнёр: либо через заказ (order.partner), либо как получатель прямого платежа
         if filters.partner_id:
             paid_debt_qs = paid_debt_qs.filter(
                 Q(order__partner_id=filters.partner_id) |
@@ -307,7 +305,7 @@ class ReportService:
         paid_debt_data = paid_debt_qs.aggregate(total=Sum('amount'))
         debt_payments_total = paid_debt_data['total'] or Decimal('0')
 
-        # Погашено = предоплата + погашения долга
+        # Погашено = предоплата (по заказам периода) + погашения долга (по дате платежа)
         paid_debt = prepayment_total + debt_payments_total
 
         # =========================================================================
@@ -380,12 +378,15 @@ class ReportService:
         defect_amount = defect_data['total'] or Decimal('0')
 
         # =========================================================================
-        # 5 (продолжение). ДОЛГИ — после вычисления брака
-        # Долг = исходный (sum order.debt_amount) - погашения - брак.
-        # Брак уменьшает Store.debt (view), но не StoreOrder.debt_amount,
-        # поэтому вычитаем вручную.
+        # 5 (продолжение). ДОЛГИ — непогашенный остаток по заказам периода
+        # Используем привязанные платежи (DebtPayment с order != NULL для заказов
+        # периода) — их учёт идёт через order.paid_amount. Прямые платежи
+        # (order = NULL) не атрибутируются конкретным заказам, поэтому в этой
+        # формуле не вычитаются.
+        # Брак уменьшает Store.debt (view), но не StoreOrder.debt_amount /
+        # paid_amount, поэтому вычитаем вручную.
         # =========================================================================
-        debt = original_debt - debt_payments_total - defect_amount
+        debt = original_debt - orders_paid_amount - defect_amount
         if debt < Decimal('0'):
             debt = Decimal('0')
 
@@ -553,6 +554,8 @@ class ReportService:
         from orders.models import StoreOrderItem, OrderHistory, OrderType
 
         # Получаем заказы магазина с prefetch для устранения N+1
+        # debt_payments вытягиваются отдельным запросом ниже — они
+        # группируются по дате платежа (включая прямые погашения без order_id).
         orders_qs = StoreOrder.objects.filter(
             store=store,
             status=StoreOrderStatus.ACCEPTED
@@ -561,8 +564,6 @@ class ReportService:
             Prefetch('defective_products', queryset=DefectiveProduct.objects.filter(
                 status=DefectiveProduct.DefectStatus.APPROVED
             ).select_related('product')),
-            Prefetch('debt_payments', queryset=DebtPayment.objects.order_by('created_at')
-                     .select_related('paid_by', 'received_by')),
         ).order_by('confirmed_at')
 
         # Применяем фильтр по датам
@@ -582,17 +583,11 @@ class ReportService:
         for h in all_histories:
             histories_by_order[h.order_id].append(h)
 
-        # Группируем заказы по дням (dict для O(1) lookup вместо O(N) linear scan)
-        history = []
-        history_by_date: dict = {}
-
-        for order in orders_list:
-            order_date = str(order.confirmed_at.date())
-            day_data = history_by_date.get(order_date)
-
-            if not day_data:
-                day_data = {
-                    'date': order_date,
+        def _ensure_day(date_str: str) -> dict:
+            day = history_by_date.get(date_str)
+            if day is None:
+                day = {
+                    'date': date_str,
                     'orders': [],
                     'products': [],
                     'bonus_products': [],
@@ -605,8 +600,17 @@ class ReportService:
                     'total_paid_debt': 0.0,
                     'remaining_debt': 0.0,
                 }
-                history_by_date[order_date] = day_data
-                history.append(day_data)
+                history_by_date[date_str] = day
+                history.append(day)
+            return day
+
+        # Группируем заказы по дням (dict для O(1) lookup вместо O(N) linear scan)
+        history: list = []
+        history_by_date: dict = {}
+
+        for order in orders_list:
+            order_date = str(order.confirmed_at.date())
+            day_data = _ensure_day(order_date)
 
             # Добавляем информацию о заказе
             day_data['orders'].append({
@@ -646,25 +650,9 @@ class ReportService:
                 })
                 defect_total += defect.total_amount
 
-            # Вычитаем одобренный брак из долга
+            # Брак уменьшает Store.debt (источник правды), поэтому также
+            # уменьшаем дневной total_debt, чтобы отображать «фактический» долг.
             day_data['total_debt'] -= float(defect_total)
-
-            # Погашения долга по этому заказу (уже prefetch, отсортированы)
-            debt_payments_list = day_data.get('debt_payments', [])
-            order_paid_debt = Decimal('0')
-            for payment in order.debt_payments.all():
-                debt_payments_list.append({
-                    'payment_id': payment.id,
-                    'amount': float(payment.amount),
-                    'created_at': payment.created_at.isoformat(),
-                    'paid_by': payment.paid_by.get_full_name() if payment.paid_by else None,
-                    'received_by': payment.received_by.get_full_name() if payment.received_by else None,
-                    'comment': payment.comment or '',
-                })
-                order_paid_debt += payment.amount
-
-            day_data['debt_payments'] = debt_payments_list
-            day_data['total_paid_debt'] += float(order_paid_debt)
 
             # История статусов заказа (из bulk fetch)
             status_history_list = []
@@ -679,10 +667,41 @@ class ReportService:
 
             day_data['status_history'] = status_history_list
 
+        # =========================================================================
+        # ВСЕ погашения долга магазина (привязанные к заказу + прямые)
+        # Группируем по дате платежа (created_at), а не по дате заказа.
+        # Это правильно отражает «когда деньги поступили».
+        # =========================================================================
+        payments_qs = DebtPayment.objects.filter(store=store).select_related(
+            'paid_by', 'received_by', 'order'
+        )
+        if start_date:
+            payments_qs = payments_qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            payments_qs = payments_qs.filter(created_at__date__lte=end_date)
+
+        for payment in payments_qs:
+            payment_date = str(payment.created_at.date())
+            day_data = _ensure_day(payment_date)
+
+            day_data['debt_payments'].append({
+                'payment_id': payment.id,
+                'order_id': payment.order_id,
+                'amount': float(payment.amount),
+                'created_at': payment.created_at.isoformat(),
+                'paid_by': payment.paid_by.get_full_name() if payment.paid_by else None,
+                'received_by': payment.received_by.get_full_name() if payment.received_by else None,
+                'comment': payment.comment or '',
+            })
+            day_data['total_paid_debt'] += float(payment.amount)
+
         # Рассчитываем оставшийся долг для каждого дня
         for day_data in history:
             remaining = day_data['total_debt'] - day_data['total_paid_debt']
             day_data['remaining_debt'] = max(remaining, 0.0)
+
+        # Сортируем по дате (после добавления дней через платежи порядок мог сбиться)
+        history.sort(key=lambda d: d['date'])
 
         return history
 
@@ -988,7 +1007,14 @@ class PartnerStatisticsService:
             })
         
         # =========================================================================
-        # 7 & 8. ДОЛГИ — два aggregate с одинаковыми фильтрами объединены в один запрос
+        # 7 & 8. ДОЛГИ
+        # paid_debt — деньги, ПОСТУПИВШИЕ за период:
+        #   = prepayment по заказам, подтверждённым в периоде
+        #   + DebtPayment, СОЗДАННЫЕ в периоде (по дате платежа)
+        # unpaid_debt — остаток по заказам периода:
+        #   = sum(order.debt_amount) − sum(order.paid_amount) − дефекты
+        # Прямые погашения (order=NULL) не атрибутируются конкретным заказам,
+        # поэтому не вычитаются из unpaid_debt (но попадают в paid_debt).
         # =========================================================================
         orders_agg = StoreOrder.objects.filter(
             partner_id=partner_id,
@@ -997,30 +1023,31 @@ class PartnerStatisticsService:
         ).aggregate(
             total_debt=Sum('debt_amount'),
             total_prepayment=Sum('prepayment_amount'),
+            total_paid=Sum('paid_amount'),
         )
         original_debt = orders_agg['total_debt'] or Decimal('0')
         prepayment_in_period = orders_agg['total_prepayment'] or Decimal('0')
+        orders_paid_amount = orders_agg['total_paid'] or Decimal('0')
 
-        # Погашения долга по заказам партнёра за период.
-        # Два типа: с привязкой к заказу (старые) и без (новые через pay-debt)
+        # Погашения долга, СОЗДАННЫЕ в периоде (для paid_debt).
+        # Два типа: с привязкой к заказу партнёра и прямые на этого партнёра.
         from django.db.models import Q
         debt_payments_in_period = DebtPayment.objects.filter(
-            Q(order__partner_id=partner_id,
-              order__confirmed_at__range=[date_from, date_to]) |
-            Q(order__isnull=True,
-              received_by_id=partner_id,
-              created_at__range=[date_from, date_to])
+            created_at__range=[date_from, date_to]
+        ).filter(
+            Q(order__partner_id=partner_id) |
+            Q(order__isnull=True, received_by_id=partner_id)
         ).aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')
 
-        # Оставшийся долг = исходный - погашения - дефекты
-        # (дефекты уменьшают Store.debt, но не StoreOrder.debt_amount)
-        unpaid_debt = original_debt - debt_payments_in_period - defective_total
+        # Оставшийся долг по заказам периода (привязанные платежи уже отражены
+        # в order.paid_amount, дефекты вычитаем вручную)
+        unpaid_debt = original_debt - orders_paid_amount - defective_total
         if unpaid_debt < Decimal('0'):
             unpaid_debt = Decimal('0')
 
-        # Всего погашено = предоплата + погашения долга
+        # Всего получено партнёром за период = предоплата + погашения
         paid_debt = prepayment_in_period + debt_payments_in_period
         
         # =========================================================================
