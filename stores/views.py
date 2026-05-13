@@ -1985,7 +1985,7 @@ class StoreViewSet(viewsets.ModelViewSet):
         from decimal import Decimal
         from django.db.models import F
         from rest_framework import status
-        from orders.models import DebtPayment
+        from orders.models import DebtPayment, StoreOrder, StoreOrderStatus
         from stores.models import Store
 
         store = self.get_object()
@@ -1996,6 +1996,7 @@ class StoreViewSet(viewsets.ModelViewSet):
 
         amount = request.data.get('amount')
         comment = request.data.get('comment', '')
+        comment_clean = comment.strip() if comment else ''
 
         if not amount:
             return Response(
@@ -2031,27 +2032,92 @@ class StoreViewSet(viewsets.ModelViewSet):
             )
 
         # =========================================================================
-        # ОПРЕДЕЛЕНИЕ ПОЛУЧАТЕЛЯ
+        # ОПРЕДЕЛЕНИЕ ПОЛУЧАТЕЛЯ И ФИЛЬТРА ПАРТНЁРА
         # =========================================================================
 
         paid_by = request.user
         received_by = None
+        partner_filter_id = None  # None = FIFO по всем заказам магазина
 
         if request.user.role == 'partner':
-            # Партнёр погашает долг магазина ��� получатель он сам
+            # Партнёр погашает долг магазина — получатель он сам,
+            # FIFO применяется только к его заказам
             received_by = request.user
+            partner_filter_id = request.user.id
         elif request.user.role == 'admin':
-            # Админ может указат�� партнёра-получателя
+            # Админ может указать партнёра-получателя.
+            # Если указан — FIFO только по заказам этого партнёра.
+            # Если нет — FIFO по всем заказам магазина (received_by заполнится
+            # из order.partner для каждого заказа).
             target_partner_id = request.data.get('partner_id')
             if target_partner_id:
                 from users.models import User
                 try:
                     received_by = User.objects.get(pk=target_partner_id, role='partner')
+                    partner_filter_id = received_by.id
                 except User.DoesNotExist:
                     return Response(
                         {'error': f'Партнёр с ID {target_partner_id} не найден'},
                         status=status.HTTP_400_BAD_REQUEST
                     )
+
+        # =========================================================================
+        # FIFO: РАЗНОСИМ ПЛАТЁЖ ПО ACCEPTED ЗАКАЗАМ
+        # Старые заказы (по confirmed_at) гасятся первыми. Это синхронизирует
+        # Order.paid_amount со Store.debt и убирает рассинхрон в отчётах.
+        # =========================================================================
+
+        orders_qs = StoreOrder.objects.filter(
+            store=store,
+            status=StoreOrderStatus.ACCEPTED,
+            debt_amount__gt=F('paid_amount'),
+        )
+        if partner_filter_id is not None:
+            orders_qs = orders_qs.filter(partner_id=partner_filter_id)
+        # select_for_update — в PostgreSQL блокирует строки от параллельных
+        # pay-debt/confirm_basket; в SQLite (тесты) — no-op.
+        candidate_orders = list(
+            orders_qs.select_for_update().order_by('confirmed_at', 'id')
+        )
+
+        created_payments = []
+        remaining = amount
+
+        for order in candidate_orders:
+            if remaining <= Decimal('0'):
+                break
+            outstanding = order.outstanding_debt
+            if outstanding <= Decimal('0'):
+                continue
+            chunk = min(outstanding, remaining)
+            # Для админских платежей без partner_id received_by = партнёр заказа,
+            # это даёт корректную атрибуцию поступлений в отчётах.
+            payment_received_by = received_by or order.partner
+            payment = order.pay_debt(
+                amount=chunk,
+                paid_by=paid_by,
+                received_by=payment_received_by,
+                comment=comment_clean,
+            )
+            created_payments.append(payment)
+            remaining -= chunk
+
+        # =========================================================================
+        # ОСТАТОК → ORPHAN (best-effort fallback)
+        # Если FIFO не покрыл всю сумму (например, Store.debt был выставлен
+        # вручную без подкрепления заказами, либо брак уменьшил Store.debt но
+        # не Order.paid_amount), создаём один orphan-DebtPayment на остаток.
+        # =========================================================================
+
+        if remaining > Decimal('0'):
+            orphan_payment = DebtPayment.objects.create(
+                store=store,
+                amount=remaining,
+                paid_by=paid_by,
+                received_by=received_by,
+                comment=comment_clean,
+            )
+            created_payments.append(orphan_payment)
 
         # =========================================================================
         # ОБНОВЛЕНИЕ ДОЛГА МАГАЗИНА
@@ -2065,28 +2131,17 @@ class StoreViewSet(viewsets.ModelViewSet):
         store.refresh_from_db()
 
         # =========================================================================
-        # СОЗДАНИЕ ЗАПИСИ О ПОГАШЕНИИ
-        # =========================================================================
-
-        payment = DebtPayment.objects.create(
-            store=store,
-            amount=amount,
-            paid_by=paid_by,
-            received_by=received_by,
-            comment=comment.strip() if comment else ''
-        )
-
-        # =========================================================================
         # ОТВЕТ
         # =========================================================================
 
         from orders.serializers import DebtPaymentSerializer
-        payment_serializer = DebtPaymentSerializer(payment)
+        primary_payment = created_payments[0]
 
         return Response({
             'success': True,
             'message': 'Долг успешно погашен',
-            'payment': payment_serializer.data,
+            'payment': DebtPaymentSerializer(primary_payment).data,
+            'payments': DebtPaymentSerializer(created_payments, many=True).data,
             'store_debt_before': float(store.debt + amount),
             'payment_amount': float(amount),
             'store_debt_after': float(store.debt),
