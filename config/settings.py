@@ -145,9 +145,11 @@ if FORCE_SQLITE:
     }
 elif DATABASE_URL:
     DATABASES = {
-        # conn_max_age=600: постоянные соединения — снижает накладные расходы под нагрузкой.
-        # None давало бы новое соединение на каждый запрос → исчерпание пула при 50+ RPS.
-        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
+        # conn_max_age=0: под ASGI (uvicorn/channels) персистентные соединения
+        # привязываются к потокам, которые не переиспользуются, и копятся в
+        # Postgres как idle до исчерпания max_connections
+        # ("FATAL: sorry, too many clients already").
+        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=0)
     }
 else:
     if not DEBUG:
