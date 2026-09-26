@@ -427,8 +427,9 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': '/api/',
-    # Не засорять логи предупреждениями генератора схемы при каждом открытии Swagger
-    'DISABLE_ERRORS_AND_WARNINGS': True,
+    # Не засорять логи предупреждениями генератора схемы при каждом открытии Swagger.
+    # SPECTACULAR_WARNINGS=1 включает их (так делает ./deploy.sh check перед деплоем).
+    'DISABLE_ERRORS_AND_WARNINGS': os.environ.get('SPECTACULAR_WARNINGS', '').lower() not in ('1', 'true', 'yes'),
     # Одинаковое имя поля approval_status у Store и User, но разные подписи
     'ENUM_NAME_OVERRIDES': {
         'StoreApprovalStatusEnum': 'stores.models.Store.ApprovalStatus',

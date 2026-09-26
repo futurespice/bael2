@@ -3,7 +3,7 @@
 # БайЭл - Production Deployment Script
 # =============================================================================
 # Использование: ./deploy.sh [команда]
-# Команды: init, start, stop, restart, logs, ssl, backup, update
+# Команды: init, start, stop, restart, logs, ssl, backup, update, check
 
 set -e
 
@@ -25,6 +25,11 @@ log_warn() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
+
+# docker compose (v2) или docker-compose (v1) — что есть на сервере
+if docker compose version >/dev/null 2>&1; then
+    docker-compose() { docker compose "$@"; }
+fi
 
 # Проверка .env файла
 check_env() {
@@ -62,6 +67,25 @@ init() {
     
     log_info "Инициализация завершена!"
     log_info "Теперь выполните: ./deploy.sh ssl для получения SSL сертификата"
+}
+
+# Проверка схемы API (drf-spectacular) на НОВОМ образе, до перезапуска контейнеров.
+# Любое предупреждение генератора или невалидная схема останавливают деплой,
+# работающие контейнеры при этом не трогаются.
+check() {
+    log_info "Сборка образа web..."
+    docker-compose build web
+
+    log_info "Проверка схемы API (spectacular --validate --fail-on-warn)..."
+    if ! docker-compose run --rm --no-deps -T \
+            -e FORCE_SQLITE=1 \
+            -e SPECTACULAR_WARNINGS=1 \
+            web python manage.py spectacular --validate --fail-on-warn --file /tmp/schema.yml; then
+        log_error "Схема API содержит ошибки или предупреждения (см. вывод выше)."
+        log_error "Деплой остановлен, работающие контейнеры не изменены."
+        exit 1
+    fi
+    log_info "Схема API: OK"
 }
 
 # Получение SSL сертификата
@@ -154,7 +178,10 @@ update() {
     backup
     
     # Получаем новый код
-    git pull origin main
+    git pull origin master
+    
+    # Проверяем схему API до перезапуска (при ошибке — выход, старая версия продолжает работать)
+    check
     
     # Пересобираем и перезапускаем
     docker-compose up -d --build
@@ -218,7 +245,8 @@ help() {
     echo "  restart           Перезапустить сервисы"
     echo "  logs [service]    Показать логи (опционально: web, db, redis, celery)"
     echo "  backup            Создать бэкап базы данных"
-    echo "  update            Обновить приложение"
+    echo "  update            Обновить приложение (с проверкой схемы API)"
+    echo "  check             Проверить схему API без деплоя"
     echo "  createsuperuser   Создать суперпользователя"
     echo "  status            Показать статус контейнеров"
     echo "  health            Проверить здоровье сервисов"
@@ -250,6 +278,9 @@ case "${1:-help}" in
         ;;
     update)
         update
+        ;;
+    check)
+        check
         ;;
     createsuperuser)
         createsuperuser
