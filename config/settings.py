@@ -98,6 +98,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'config.middleware.RequestLoggingMiddleware',  # Лог каждого запроса (должен быть первым)
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',  # Статика в production
     'django.contrib.sessions.middleware.SessionMiddleware',  # Нужен для admin-панели
@@ -426,6 +427,8 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': '/api/',
+    # Не засорять логи предупреждениями генератора схемы при каждом открытии Swagger
+    'DISABLE_ERRORS_AND_WARNINGS': True,
 
     # Настройки Swagger UI
     'SWAGGER_UI_SETTINGS': {
@@ -502,11 +505,11 @@ LOGGING = {
     'disable_existing_loggers': False,
     'formatters': {
         'verbose': {
-            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'format': '{levelname} {asctime} {name} {process:d} {message}',
             'style': '{',
         },
         'simple': {
-            'format': '{levelname} {asctime} {message}',
+            'format': '{levelname} {asctime} {name} {message}',
             'style': '{',
         },
     },
@@ -517,12 +520,15 @@ LOGGING = {
             'formatter': 'simple',
         },
         'file': {
-            'level': 'WARNING',
+            'level': 'INFO',
             'class': 'logging.handlers.RotatingFileHandler',
             'filename': LOGS_DIR / 'django.log',
             'maxBytes': 10485760,  # 10MB
             'backupCount': 5,
             'formatter': 'verbose',
+        },
+        'null': {
+            'class': 'logging.NullHandler',
         },
     },
     'root': {
@@ -530,14 +536,26 @@ LOGGING = {
         'level': 'DEBUG' if DEBUG else 'INFO',
     },
     'loggers': {
-        'django': {
-            'handlers': ['console'],
+        # Каждый HTTP-запрос: метод, путь, статус, время, пользователь, IP (config/middleware.py)
+        'baiel.requests': {
+            'handlers': ['console', 'file'] if not DEBUG else ['console'],
             'level': 'INFO',
             'propagate': False,
         },
+        'django': {
+            'handlers': ['console', 'file'] if not DEBUG else ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        # 4xx уже пишет baiel.requests (с причиной ошибки), здесь оставляем только 5xx с traceback
         'django.request': {
-            'handlers': ['console', 'file'],
-            'level': 'WARNING',
+            'handlers': ['console', 'file'] if not DEBUG else ['console'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+        # Боты подставляют чужие домены в Host — Django их отклоняет, traceback не нужен
+        'django.security.DisallowedHost': {
+            'handlers': ['null'],
             'propagate': False,
         },
         'celery': {

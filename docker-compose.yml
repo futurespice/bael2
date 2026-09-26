@@ -57,7 +57,7 @@ services:
     volumes:
       - /home/myprojects/bael2/staticfiles:/app/staticfiles
       - /home/myprojects/bael2/media:/app/media
-      - logs_volume:/app/logvjs
+      - logs_volume:/app/logs
     ports:
       - "8000:8000"
     environment:
