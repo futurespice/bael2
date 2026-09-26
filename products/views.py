@@ -16,7 +16,8 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import models, transaction
 from django.shortcuts import get_object_or_404
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, inline_serializer
+from rest_framework import serializers as drf_serializers
 from drf_spectacular.types import OpenApiTypes
 
 from .models import (
@@ -152,8 +153,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         ],
         responses={
             200: ProductListSerializer(many=True),
-            400: {'description': 'Wrong expense type or apply type'},
-            404: {'description': 'Expense not found'},
+            400: OpenApiResponse(description='Wrong expense type or apply type'),
+            404: OpenApiResponse(description='Expense not found'),
         },
     )
     @action(detail=True, methods=['get'], url_path='products-without')
@@ -201,7 +202,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     @extend_schema(
         summary="Mechanical expenses for accounting",
         description="Returns all expenses with expense_state=mechanical for the accounting screen.",
-        responses={200: {'description': 'List of mechanical expenses'}},
+        responses={200: OpenApiResponse(description='List of mechanical expenses')},
     )
     @action(detail=False, methods=['get'], url_path='mechanical-accounting')
     def mechanical_accounting(self, request):
@@ -249,13 +250,24 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             "Uses get_or_create to prevent duplicates.\n"
             "Works ONLY for overhead expenses with apply_type='regular'."
         ),
-        request={'type': 'object', 'properties': {
-            'product_ids': {'type': 'array', 'items': {'type': 'integer'}},
-        }},
+        request=inline_serializer(
+            name='ExpenseAddProducts',
+            fields={'product_ids': drf_serializers.ListField(child=drf_serializers.IntegerField())},
+        ),
         responses={
-            200: {'description': 'Products added successfully'},
-            400: {'description': 'Wrong expense type, apply type, or invalid product_ids'},
-            404: {'description': 'Expense not found'},
+            200: OpenApiResponse(
+                response=inline_serializer(
+                    name='ExpenseAddProductsResponse',
+                    fields={
+                        'message': drf_serializers.CharField(),
+                        'created': drf_serializers.IntegerField(),
+                        'skipped': drf_serializers.IntegerField(),
+                    },
+                ),
+                description='Products added successfully',
+            ),
+            400: OpenApiResponse(description='Wrong expense type, apply type, or invalid product_ids'),
+            404: OpenApiResponse(description='Expense not found'),
         },
     )
     @action(detail=True, methods=['post'], url_path='add-products')
