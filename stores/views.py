@@ -46,6 +46,8 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.exceptions import NotFound
+from django.core.paginator import Page as DjangoPage
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 # ✅ ДОБАВЛЕНЫ ИМПОРТЫ drf-spectacular
@@ -106,10 +108,29 @@ from orders.models import (
 # =============================================================================
 
 class StandardPagination(PageNumberPagination):
-    """Стандартная пагинация."""
+    """
+    Стандартная пагинация.
+
+    Страница за пределами списка (?page=5 при 3 страницах) возвращает
+    пустой results с next=null вместо 404 — мобильное приложение при
+    подгрузке списка не получает ошибку, а просто видит конец списка.
+    """
     page_size = 30
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+    def paginate_queryset(self, queryset, request, view=None):
+        try:
+            return super().paginate_queryset(queryset, request, view)
+        except NotFound:
+            page_number = request.query_params.get(self.page_query_param, '')
+            if not page_number.isdigit() or int(page_number) < 1:
+                raise
+            page_size = self.get_page_size(request)
+            paginator = self.django_paginator_class(queryset, page_size)
+            self.request = request
+            self.page = DjangoPage([], paginator.num_pages + 1, paginator)
+            return []
 
 
 def _build_inventory_items(inventory_qs, use_available_quantity=False):
@@ -1961,7 +1982,8 @@ class StoreViewSet(viewsets.ModelViewSet):
         """
         Погашение долга магазина (ТЗ v2.0).
 
-        POST /api/stores/{store_id}/pay-debt/
+        POST /api/stores/stores/{store_id}/pay-debt/
+        (только POST — GET на этот адрес вернёт 405 Method Not Allowed)
 
         Body: {
             "amount": 50000000,
