@@ -28,7 +28,6 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.pagination import PageNumberPagination
 from drf_spectacular.utils import extend_schema_view, extend_schema, OpenApiParameter, OpenApiResponse
 from stores.models import Store
 from stores.services import StoreSelectionService
@@ -64,11 +63,7 @@ from .filters import ReturnedItemFilter
 # PAGINATION
 # =============================================================================
 
-class StandardPagination(PageNumberPagination):
-    """Стандартная пагинация."""
-    page_size = 30
-    page_size_query_param = 'page_size'
-    max_page_size = 100
+from config.pagination import StandardPagination  # noqa: E402  общая пагинация (без 404 за концом списка)
 
 
 # =============================================================================

@@ -8,7 +8,6 @@ API ENDPOINTS:
 """
 
 from rest_framework import status, viewsets
-from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
@@ -23,11 +22,7 @@ from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiPara
 from django.db.models import Q, Max, Count
 
 
-class StandardPagination(PageNumberPagination):
-    """Стандартная пагинация."""
-    page_size = 30
-    page_size_query_param = 'page_size'
-    max_page_size = 100
+from config.pagination import StandardPagination  # noqa: E402  общая пагинация (без 404 за концом списка)
 
 
 @extend_schema(
