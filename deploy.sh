@@ -26,6 +26,10 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# База данных — должны совпадать с POSTGRES_USER / POSTGRES_DB в docker-compose.yml
+DB_USER=beiel2
+DB_NAME=beiel2
+
 # docker compose (v2) или docker-compose (v1) — что есть на сервере
 if docker compose version >/dev/null 2>&1; then
     docker-compose() { docker compose "$@"; }
@@ -158,10 +162,19 @@ backup() {
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     BACKUP_FILE="$BACKUP_DIR/baiel_backup_$TIMESTAMP.sql"
     
-    docker-compose exec -T db pg_dump -U baiel baiel > $BACKUP_FILE
+    if ! docker-compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" > "$BACKUP_FILE"; then
+        rm -f "$BACKUP_FILE"
+        log_error "pg_dump завершился с ошибкой, бэкап не создан"
+        exit 1
+    fi
+    if [ ! -s "$BACKUP_FILE" ]; then
+        rm -f "$BACKUP_FILE"
+        log_error "Бэкап пустой — проверьте, что контейнер db запущен"
+        exit 1
+    fi
     
     # Сжимаем
-    gzip $BACKUP_FILE
+    gzip "$BACKUP_FILE"
     
     log_info "Бэкап создан: ${BACKUP_FILE}.gz"
     
@@ -209,6 +222,7 @@ status() {
 # Проверка здоровья
 health() {
     log_info "Проверка здоровья сервисов..."
+    FAILED=0
     
     # Проверяем web
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/docs/ || echo "000")
@@ -216,6 +230,7 @@ health() {
         log_info "Web: OK ($HTTP_CODE)"
     else
         log_error "Web: FAIL ($HTTP_CODE)"
+        FAILED=1
     fi
     
     # Проверяем Redis
@@ -224,11 +239,18 @@ health() {
         log_info "Redis: OK"
     else
         log_error "Redis: FAIL"
+        FAILED=1
     fi
     
     # Проверяем PostgreSQL
-    PG_STATUS=$(docker-compose exec -T db pg_isready -U baiel 2>/dev/null && echo "OK" || echo "FAIL")
-    log_info "PostgreSQL: $PG_STATUS"
+    if docker-compose exec -T db pg_isready -q -U "$DB_USER" -d "$DB_NAME" 2>/dev/null; then
+        log_info "PostgreSQL: OK"
+    else
+        log_error "PostgreSQL: FAIL"
+        FAILED=1
+    fi
+
+    return $FAILED
 }
 
 # Показать помощь
