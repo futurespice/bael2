@@ -5,6 +5,9 @@ from rest_framework.views import APIView
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q, Max
 from django.shortcuts import get_object_or_404
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
+from rest_framework import serializers
 
 from .models import Chat, Message
 from .serializers import (
@@ -25,6 +28,29 @@ class ChatListCreateView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        tags=['chats'],
+        summary='Список чатов, сгруппированный по роли собеседника',
+        description=(
+            'Без ?role= возвращает {"admins": [...], "partners": [...], "stores": [...]}. '
+            'С ?role=admin|partner|store — плоский список чатов этой категории.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='role', type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                enum=['admin', 'partner', 'store'], required=False,
+                description='Вернуть только чаты с собеседниками этой роли',
+            ),
+        ],
+        responses={200: inline_serializer(
+            name='ChatListGrouped',
+            fields={
+                'admins': ChatSerializer(many=True),
+                'partners': ChatSerializer(many=True),
+                'stores': ChatSerializer(many=True),
+            },
+        )},
+    )
     def get(self, request):
         user = request.user
 
@@ -105,6 +131,12 @@ class ChatListCreateView(APIView):
 
         return Response(result)
 
+    @extend_schema(
+        tags=['chats'],
+        summary='Создать (или получить существующий) чат с пользователем',
+        request=CreateChatSerializer,
+        responses={200: ChatSerializer},
+    )
     def post(self, request):
         serializer = CreateChatSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
@@ -125,6 +157,11 @@ class ChatMessagesView(APIView):
     def _get_chat(self, chat_id, user):
         return get_object_or_404(Chat, id=chat_id, participants=user)
 
+    @extend_schema(
+        tags=['chats'],
+        summary='История сообщений чата (помечает сообщения собеседника прочитанными)',
+        responses={200: MessageSerializer(many=True)},
+    )
     def get(self, request, chat_id):
         chat = self._get_chat(chat_id, request.user)
         # Помечаем сообщения собеседника как прочитанные
@@ -133,6 +170,12 @@ class ChatMessagesView(APIView):
         serializer = MessageSerializer(messages, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        tags=['chats'],
+        summary='Отправить сообщение (REST fallback к WebSocket)',
+        request=MessageSerializer,
+        responses={201: MessageSerializer},
+    )
     def post(self, request, chat_id):
         chat = self._get_chat(chat_id, request.user)
         serializer = MessageSerializer(data=request.data)
@@ -148,6 +191,15 @@ class MarkMessagesReadView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        tags=['chats'],
+        summary='Пометить все сообщения собеседника в чате прочитанными',
+        request=None,
+        responses={200: inline_serializer(
+            name='MarkMessagesReadResponse',
+            fields={'marked_read': serializers.IntegerField()},
+        )},
+    )
     def post(self, request, chat_id):
         chat = get_object_or_404(Chat, id=chat_id, participants=request.user)
         updated = chat.messages.filter(is_read=False).exclude(sender=request.user).update(is_read=True)
@@ -163,6 +215,11 @@ class AvailableUsersView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        tags=['chats'],
+        summary='Пользователи, с которыми можно переписываться (с chat_id)',
+        responses={200: UserWithChatSerializer(many=True)},
+    )
     def get(self, request):
         user = request.user
         qs = User.objects.exclude(id=user.id).filter(is_active=True)

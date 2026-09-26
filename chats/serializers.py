@@ -1,3 +1,5 @@
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from .models import Chat, Message
@@ -12,6 +14,7 @@ class UserShortSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'full_name', 'phone', 'role', 'avatar']
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_full_name(self, obj):
         return obj.get_full_name()
 
@@ -23,6 +26,7 @@ class UserWithChatSerializer(UserShortSerializer):
     class Meta(UserShortSerializer.Meta):
         fields = UserShortSerializer.Meta.fields + ['chat_id']
 
+    @extend_schema_field({'type': 'integer', 'nullable': True})
     def get_chat_id(self, obj):
         chat_map = self.context.get('chat_map', {})
         return chat_map.get(obj.id)
@@ -46,6 +50,7 @@ class ChatSerializer(serializers.ModelSerializer):
         model = Chat
         fields = ['id', 'other_participant', 'last_message', 'unread_count', 'updated_at']
 
+    @extend_schema_field(UserShortSerializer(allow_null=True))
     def get_other_participant(self, obj):
         request = self.context.get('request')
         if request:
@@ -54,6 +59,17 @@ class ChatSerializer(serializers.ModelSerializer):
                 return UserShortSerializer(other).data
         return None
 
+    @extend_schema_field(inline_serializer(
+        name='ChatLastMessage',
+        fields={
+            'id': serializers.IntegerField(),
+            'content': serializers.CharField(),
+            'sender_id': serializers.IntegerField(),
+            'created_at': serializers.DateTimeField(),
+            'is_read': serializers.BooleanField(),
+        },
+        allow_null=True,
+    ))
     def get_last_message(self, obj):
         # Используем кеш из ChatListCreateView если есть
         if hasattr(obj, '_last_message_cache'):
@@ -70,6 +86,7 @@ class ChatSerializer(serializers.ModelSerializer):
             }
         return None
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_unread_count(self, obj):
         # Используем аннотацию из ChatListCreateView если есть
         if hasattr(obj, 'annotated_unread_count'):

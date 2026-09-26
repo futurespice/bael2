@@ -429,6 +429,11 @@ SPECTACULAR_SETTINGS = {
     'SCHEMA_PATH_PREFIX': '/api/',
     # Не засорять логи предупреждениями генератора схемы при каждом открытии Swagger
     'DISABLE_ERRORS_AND_WARNINGS': True,
+    # Одинаковое имя поля approval_status у Store и User, но разные подписи
+    'ENUM_NAME_OVERRIDES': {
+        'StoreApprovalStatusEnum': 'stores.models.Store.ApprovalStatus',
+        'UserApprovalStatusEnum': 'users.models.User.APPROVAL_STATUS_CHOICES',
+    },
 
     # Настройки Swagger UI
     'SWAGGER_UI_SETTINGS': {

@@ -2178,9 +2178,10 @@ class PartnerDebtViewSet(viewsets.ViewSet):
     @extend_schema(
         summary="Список магазинов-должников партнёра",
         description=(
-            "Возвращает список магазинов, у ��оторых есть долг перед партнёром.\n"
+            "Возвращает список магазинов, у которых есть долг перед партнёром.\n"
             "Партнёр видит только свои долги. Админ может фильтровать по partner_id."
         ),
+        operation_id='stores_partner_debts_list',
         parameters=[
             OpenApiParameter(
                 name='partner_id', type=OpenApiTypes.INT,
@@ -2188,6 +2189,7 @@ class PartnerDebtViewSet(viewsets.ViewSet):
                 description='ID партнёра (только для админа)', required=False,
             ),
         ],
+        responses={200: OpenApiTypes.OBJECT},
     )
     def list(self, request: Request) -> Response:
         """GET /api/stores/partner-debts/"""
@@ -2291,13 +2293,20 @@ class PartnerDebtViewSet(viewsets.ViewSet):
             "Возвращает: сумму заказов, предоплату, погашения и остаток долга "
             "для конкретного магазина перед партнёром."
         ),
+        operation_id='stores_partner_debts_retrieve',
         parameters=[
+            OpenApiParameter(
+                name='id', type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description='ID магазина',
+            ),
             OpenApiParameter(
                 name='partner_id', type=OpenApiTypes.INT,
                 location=OpenApiParameter.QUERY,
                 description='ID партнёра (только для админа)', required=False,
             ),
         ],
+        responses={200: OpenApiTypes.OBJECT},
     )
     def retrieve(self, request: Request, pk=None) -> Response:
         """GET /api/stores/partner-debts/{store_id}/"""
@@ -2829,6 +2838,15 @@ class StoreInventoryViewSet(viewsets.ViewSet):
 
     permission_classes = [IsAuthenticated, IsStore]
 
+    @extend_schema(
+        summary="Инвентарь выбранного магазина",
+        description="Товары инвентаря магазина в формате корзины: items + totals + pagination.",
+        parameters=[
+            OpenApiParameter(name='page', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+            OpenApiParameter(name='page_size', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def list(self, request: Request) -> Response:
         """Список товаров инвентаря магазина в формате корзины."""
         store = StoreSelectionService.get_current_store(request.user)
